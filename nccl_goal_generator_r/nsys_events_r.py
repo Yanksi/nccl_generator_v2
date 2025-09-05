@@ -12,9 +12,6 @@ import pandas as pd
 import numpy as np
 import logging
 import pathlib
-from dask.delayed import delayed
-import dask
-import dask.dataframe as dd
 
 logger = logging.getLogger("nsys_events")
 logging.basicConfig(level=logging.INFO)
@@ -26,8 +23,7 @@ def find_all_traces(directory):
 def get_kernel_events(traces: List[os.PathLike]) -> pd.DataFrame:
     logger.info("querying for kernel events")
     kernel_dfs = []
-    @delayed
-    def read_trace_delayed(trace_file):
+    for trace_file in tqdm(traces):
         node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
         conn = sqlite3.connect(trace_file)
         df_tmp = pd.read_sql_query(
@@ -37,25 +33,10 @@ def get_kernel_events(traces: List[os.PathLike]) -> pd.DataFrame:
         )
         conn.close()
         df_tmp["nodeId"] = node_id
-        return df_tmp
-    delayed_dfs = [read_trace_delayed(trace_file) for trace_file in traces]
-    kernel_dfs = dask.compute(*delayed_dfs)
+        df_tmp["collective"] = df_tmp["value"].str.extract(r"ncclDevKernel_([a-zA-Z]+)")
+        kernel_dfs.append(df_tmp)
+
     kernel_df = pd.concat(kernel_dfs, ignore_index=True)
-
-    # for trace_file in tqdm(traces):
-    #     node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
-    #     conn = sqlite3.connect(trace_file)
-    #     df_tmp = pd.read_sql_query(
-    #         "SELECT start, end, value, deviceId, streamId, globalPid / 0x1000000 % 0x1000000 AS pid FROM CUPTI_ACTIVITY_KIND_KERNEL cakk, StringIds si WHERE cakk.demangledName = si.id and si.value LIKE 'nccl%'",
-    #         conn,
-    #         dtype={"start": "Int64", "end": "Int64", "value": "string", "deviceId": "Int64", "streamId": "Int64", "pid": "Int64"}
-    #     )
-    #     conn.close()
-    #     df_tmp["nodeId"] = node_id
-    #     df_tmp["collective"] = df_tmp["value"].str.extract(r"ncclDevKernel_([a-zA-Z]+)")
-    #     kernel_dfs.append(df_tmp)
-
-    # kernel_df = pd.concat(kernel_dfs, ignore_index=True)
     # kernel_df['eventId'] = range(len(kernel_df))  # Add unique ID to each row
     # kernel_df["stream"] = kernel_df[["deviceId", "streamId"]].apply(lambda x: f"{x['deviceId']}-{x['streamId']}", axis=1)
     return kernel_df
