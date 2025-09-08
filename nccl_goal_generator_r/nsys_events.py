@@ -224,7 +224,7 @@ def _get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None)
         ).drop(columns=["eventId_comm"])
     return comm_data, coll_info_data, coll_kernel_data, p2p_kernel_data
 
-def _associate_kernel_to_nvtx(nvtx_events: pd.DataFrame, kernel_events: pd.DataFrame, profiling_interval: pd.DataFrame = None):
+def _associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     if profiling_interval is not None:
         logger.info("filtering kernel events by profiling intervals")
         kernel_events_filtered = _filter_time(kernel_events, profiling_interval)
@@ -294,6 +294,14 @@ def _associate_kernel_to_nvtx(nvtx_events: pd.DataFrame, kernel_events: pd.DataF
 
     return pd.concat(kernels_list, ignore_index=True)
 
+def _update_comm_time(comm_data, kernel_events):
+    logger.info("updating communicator time based on associated kernels")
+    return comm_data.drop(columns=["start", "end"]).merge(
+        kernel_events[["start", "end", "association"]],
+        left_on=["eventId"],
+        right_on=["association"]
+    ).drop(columns=["association"])
+
 if __name__ == "__main__":
     traces = find_all_traces("traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite")
     kernel_events = get_kernel_events(traces)
@@ -301,4 +309,5 @@ if __name__ == "__main__":
     comm_info, comm_ring_info, comm_tree_info = _get_communicator_info(nvtx_events)
     profiling_interval = _get_profiling_interval(nvtx_events)
     comm_data, coll_info, coll_kernels, p2p_kernels = _get_event_info(nvtx_events, profiling_interval)
-    kernel_events = _associate_kernel_to_nvtx(nvtx_events, kernel_events, profiling_interval)
+    kernel_events = _associate_kernel_to_nvtx(comm_data, kernel_events, profiling_interval)
+    comm_data = _update_comm_time(comm_data, kernel_events)
