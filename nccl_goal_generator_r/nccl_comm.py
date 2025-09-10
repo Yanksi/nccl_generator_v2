@@ -253,7 +253,53 @@ class AllReduce(CollectiveOp):
 
 
 class AllGather(CollectiveOp):
-    pass
+    def to_primitives_ring_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
+        comm = self.comm
+        n_ranks = comm.n_ranks
+        ring_topo_node = comm.ring_topo[gpu][chnl_id]
+        prev_gpu = ring_topo_node.prev
+        nxt_gpu = ring_topo_node.nxt
+        
+        coll_chnl_info = self.coll_chnl_infos[chnl_id]
+        chunk_count = coll_chnl_info.chunk_count
+        channel_count = coll_chnl_info.work_count
+        count = coll_chnl_info.count
+        send_buff = coll_chnl_info.send_buff
+        recv_buff = coll_chnl_info.recv_buff
+        ring_ix = self.comm.gpu2rank[gpu]
+
+        result = NCCLPrimitiveParallel()
+        for chunk_offset in range(0, channel_count, chunk_count):
+            n_elems = min(chunk_count, max(0, channel_count - chunk_offset))
+            chunk_comm = NCCLPrimitiveSequantial()
+            # step 0: send the slice of data to next
+            if send_buff == recv_buff + (ring_ix * count): # in place send
+                chunk_comm.append(NCCLSend(
+                    target_gpu=nxt_gpu,
+                    size=n_elems * self.coll_info.type_size
+                ))
+            else: # CopySend
+                chunk_comm.append(NCCLCopySend(
+                    target_gpu=nxt_gpu,
+                    size=n_elems * self.coll_info.type_size
+                ))
+                
+            # step k-2 steps:
+            for _ in range(n_ranks - 2):
+                chunk_comm.append(NCCLRecvCopySend(
+                    source_gpu=prev_gpu,
+                    target_gpu=nxt_gpu,
+                    size=n_elems * self.coll_info.type_size
+                ))
+
+            # step k-1: recv the slice of data from prev
+            chunk_comm.append(NCCLRecv(
+                source_gpu=prev_gpu,
+                size=n_elems * self.coll_info.type_size
+            ))
+            result.add(chunk_comm)
+        return result
+
 
 class ReduceScatter(CollectiveOp):
     def to_primitives_ring_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
@@ -333,7 +379,6 @@ class Reduce(CollectiveOp):
                 ))
         return result
 
-        
 
 class Broadcast(CollectiveOp):
     def to_primitives_ring_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:

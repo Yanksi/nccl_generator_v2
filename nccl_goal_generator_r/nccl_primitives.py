@@ -119,6 +119,10 @@ class NCCLPrimitive(NCCLPrimitiveComm):
 class NCCLSend(NCCLPrimitive):
     def __repr__(self) -> str:
         return f"NCCLSend(target_gpu={self.target_gpu}, size={self.size})"
+    
+class NCCLCopySend(NCCLPrimitive):
+    def __repr__(self) -> str:
+        return f"NCCLCopySend(target_gpu={self.target_gpu}, size={self.size})"
 
 class NCCLRecv(NCCLPrimitive):
     def __repr__(self) -> str:
