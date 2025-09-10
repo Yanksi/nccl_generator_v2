@@ -126,12 +126,6 @@ class CollectiveOp(CommOp):
     def to_primitives_ring_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
         raise NotImplementedError
     
-    def to_primitives_ring(self, gpu: GPUDevice) -> NCCLPrimitiveComm:
-        result = NCCLPrimitiveParallel()
-        for chnl_id in range(len(self.coll_chnl_infos)):
-            result.add(self.to_primitives_ring_chnl(gpu, chnl_id))
-        return result
-    
     def to_primitives_tree_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
         raise NotImplementedError
 
@@ -140,14 +134,26 @@ class CollectiveOp(CommOp):
         for chnl_id in range(len(self.coll_chnl_infos)):
             result.add(self.to_primitives_tree_chnl(gpu, chnl_id))
         return result
-
+    
+    def to_primitives_ring(self, gpu: GPUDevice) -> NCCLPrimitiveComm:
+        result = NCCLPrimitiveParallel()
+        for chnl_id in range(len(self.coll_chnl_infos)):
+            result.add(self.to_primitives_ring_chnl(gpu, chnl_id))
+        return result
+    
     def to_primitives(self, gpu: GPUDevice) -> NCCLPrimitiveComm:
+        result = None
         if self.coll_info.algo == CollAlgo.RING:
-            return self.to_primitives_ring(gpu)
+            result = self.to_primitives_ring(gpu)
         elif self.coll_info.algo == CollAlgo.TREE:
-            return self.to_primitives_tree(gpu)
+            result = self.to_primitives_tree(gpu)
         else:
             raise ValueError(f"Unknown algo: {self.coll_info.algo}")
+        if self.coll_info.proto == NCCLProto.LL:
+            result = result.proto_ll()
+        elif self.coll_info.proto == NCCLProto.SIMPLE:
+            result = result.proto_simple(self.coll_info.chunk_size)
+        return result
             
 
 class AllReduce(CollectiveOp):
@@ -234,8 +240,15 @@ class AllReduce(CollectiveOp):
     def to_primitives_tree_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         tree_topo_node = comm.tree_topo[gpu][chnl_id]
-        # TODO: Implement tree channel communication
-        pass
+        children = (tree_topo_node.child1, tree_topo_node.child2, tree_topo_node.child3)
+        parent = tree_topo_node.parent
+        
+        coll_chnl_info = self.coll_chnl_infos[chnl_id]
+        chunk_count = coll_chnl_info.chunk_count
+        grid_offset = coll_chnl_info.work_offset
+        channel_count = coll_chnl_info.work_count
+        last_chunk_count = coll_chnl_info.last_chunk_count
+        # TODO
 
 
 
@@ -283,5 +296,78 @@ class ReduceScatter(CollectiveOp):
         return result
 
 
+class Reduce(CollectiveOp):
+    def to_primitives_ring_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
+        comm = self.comm
+        ring_topo_node = comm.ring_topo[gpu][chnl_id]
+        prev_gpu = ring_topo_node.prev
+        nxt_gpu = ring_topo_node.nxt
+        
+        coll_chnl_info = self.coll_chnl_infos[chnl_id]
+        chunk_count = coll_chnl_info.chunk_count
+        channel_count = coll_chnl_info.work_count
+
+        coll_info = self.coll_info
+        root_gpu = comm.rank2gpu[coll_info.root_rank]
+        type_size = coll_info.type_size
+
+        result = NCCLPrimitiveParallel()
+        for chunk_offset in range(0, channel_count, chunk_count):
+            n_elems = min(chunk_count, max(0, channel_count - chunk_offset))
+
+            if gpu == root_gpu: # RecvReduceCopy
+                result.add(NCCLRecvReduceCopy(
+                    source_gpu=prev_gpu,
+                    size=n_elems * type_size
+                ))
+            elif prev_gpu == root_gpu: # Send
+                result.add(NCCLSend(
+                    target_gpu=nxt_gpu,
+                    size=n_elems * type_size
+                ))
+            else: # RecvReduceSend
+                result.add(NCCLRecvReduceSend(
+                    source_gpu=prev_gpu,
+                    target_gpu=nxt_gpu,
+                    size=n_elems * type_size
+                ))
+        return result
+
+        
+
 class Broadcast(CollectiveOp):
-    pass
+    def to_primitives_ring_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
+        comm = self.comm
+        ring_topo_node = comm.ring_topo[gpu][chnl_id]
+        prev_gpu = ring_topo_node.prev
+        nxt_gpu = ring_topo_node.nxt
+
+        coll_chnl_info = self.coll_chnl_infos[chnl_id]
+        chunk_count = coll_chnl_info.chunk_count
+        channel_count = coll_chnl_info.work_count
+
+        coll_info = self.coll_info
+        root_gpu = comm.rank2gpu[coll_info.root_rank]
+        type_size = coll_info.type_size
+
+        result = NCCLPrimitiveParallel()
+        for chunk_offset in range(0, channel_count, chunk_count):
+            n_elems = min(chunk_count, max(0, channel_count - chunk_offset))
+
+            if gpu == root_gpu: # Send
+                result.add(NCCLSend(
+                    target_gpu=nxt_gpu,
+                    size=n_elems * type_size
+                ))
+            elif nxt_gpu == root_gpu: # Recv
+                result.add(NCCLRecv(
+                    source_gpu=prev_gpu,
+                    size=n_elems * type_size
+                ))
+            else: # RecvCopySend
+                result.add(NCCLRecvCopySend(
+                    source_gpu=prev_gpu,
+                    target_gpu=nxt_gpu,
+                    size=n_elems * type_size
+                ))
+        return result

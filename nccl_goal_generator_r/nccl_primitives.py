@@ -13,6 +13,10 @@ class GPUDevice:
         self.id = id
     def __repr__(self):
         return f"GPUDevice(id={self.id})"
+    def __eq__(self, value):
+        if not isinstance(value, GPUDevice):
+            return False
+        return self.id == value.id
 
 class NCCLPrimitiveComm(ABC):    
     @abstractmethod
