@@ -38,9 +38,9 @@ class Communicator:
         self.rank2gpu = gpus
         self.gpu2rank = {gpu: i for i, gpu in enumerate(gpus)}
         self.n_ranks = len(gpus)
-        self.rank2gpu.append(None) # when query rank -1, return None
         self.tree_topo = {gpu: [] for gpu in gpus}
         self.ring_topo = {gpu: [] for gpu in gpus}
+        self.rank2gpu.append(None) # when query rank -1, return None
     
     def add_tree_topo(self, gpu_rank: int, parent_rank: int, children_ranks: List[int]):
         gpu = self.rank2gpu[gpu_rank]

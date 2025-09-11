@@ -13,6 +13,7 @@ import numpy as np
 import logging
 import pathlib
 
+
 logger = logging.getLogger("nsys_events")
 logging.basicConfig(level=logging.INFO)
 
@@ -85,8 +86,8 @@ def _get_communicator_info(data: pd.DataFrame):
     logger.info("extracting communicator trees")
     comm_tree_pattern = r"commHash (0x[0-9a-f]+) Trees \[(\d+)\] (-?\d+)/(-?\d+)/(-?\d+)->(-?\d+)->(-?\d+) pid (\d+)"
     comm_tree_info = data[data['text'].str.match(comm_tree_pattern)].copy()
-    comm_tree_info[["commHash", "channelId", "child_1_rank", "child_2_rank", "child_3_rank", "my_rank", "parent_rank", "pid"]] = comm_tree_info["text"].str.extract(comm_tree_pattern)
-    comm_tree_info[["channelId", "child_1_rank", "child_2_rank", "child_3_rank", "my_rank", "parent_rank", "pid"]] = comm_tree_info[["channelId", "child_1_rank", "child_2_rank", "child_3_rank", "my_rank", "parent_rank", "pid"]].astype("Int64")
+    comm_tree_info[["commHash", "channelId", "child1Rank", "child2Rank", "child3Rank", "myRank", "parentRank", "pid"]] = comm_tree_info["text"].str.extract(comm_tree_pattern)
+    comm_tree_info[["channelId", "child1Rank", "child2Rank", "child3Rank", "myRank", "parentRank", "pid"]] = comm_tree_info[["channelId", "child1Rank", "child2Rank", "child3Rank", "myRank", "parentRank", "pid"]].astype("Int64")
     comm_tree_info = comm_tree_info.merge(
         comm_hash2id,
         on=["nodeId", "commHash"],
@@ -301,6 +302,7 @@ def _update_comm_time(comm_data, kernel_events):
         left_on=["eventId"],
         right_on=["association"]
     ).drop(columns=["association"])
+
 
 if __name__ == "__main__":
     traces = find_all_traces("traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite")
