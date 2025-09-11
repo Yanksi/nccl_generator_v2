@@ -1,10 +1,10 @@
+from __future__ import annotations
 from typing import List, Dict, Type, Union, Optional
 from dataclasses import dataclass
 from enum import Enum
 from math import ceil
 from abc import ABC, abstractmethod
-from nccl_primitives import *
-from __future__ import annotations
+from .nccl_primitives import *
 
 
 class CollAlgo(Enum):
@@ -37,22 +37,25 @@ class Communicator:
         self.comm_id = comm_id
         self.rank2gpu = gpus
         self.gpu2rank = {gpu: i for i, gpu in enumerate(gpus)}
+        self.n_ranks = len(gpus)
         self.rank2gpu.append(None) # when query rank -1, return None
         self.tree_topo = {gpu: [] for gpu in gpus}
         self.ring_topo = {gpu: [] for gpu in gpus}
-        self.n_ranks = len(gpus)
     
-    def add_tree_topo(self, gpu_rank: int, parent_rank, children_ranks: List[int]):
+    def add_tree_topo(self, gpu_rank: int, parent_rank: int, children_ranks: List[int]):
         gpu = self.rank2gpu[gpu_rank]
         parent = self.rank2gpu[parent_rank]
         children = [self.rank2gpu[child_rank] for child_rank in children_ranks]
         self.tree_topo[gpu].append(TreeTopoNode(parent, children))
 
-    def add_ring_topo(self, gpu_rank: int, prev_rank, nxt_rank):
+    def add_ring_topo(self, gpu_rank: int, prev_rank: int, nxt_rank: int):
         gpu = self.rank2gpu[gpu_rank]
         prev = self.rank2gpu[prev_rank]
         nxt = self.rank2gpu[nxt_rank]
         self.ring_topo[gpu].append(RingTopoNode(prev, nxt))
+    
+    def __repr__(self) -> str:
+        return f"Communicator(id={self.comm_id}, n_ranks={self.n_ranks})"
 
 
 class CommOp:

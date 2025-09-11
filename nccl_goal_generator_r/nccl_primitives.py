@@ -1,5 +1,5 @@
-from abc import ABC, abstractmethod
 from __future__ import annotations
+from abc import ABC, abstractmethod
 from typing import List, Dict, Type, Union, Optional
 from math import ceil
 
@@ -17,6 +17,8 @@ class GPUDevice:
         if not isinstance(value, GPUDevice):
             return False
         return self.id == value.id
+    def __hash__(self):
+        return hash(self.id)
 
 class NCCLPrimitiveComm(ABC):    
     @abstractmethod
