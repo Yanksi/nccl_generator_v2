@@ -33,19 +33,24 @@ class NCCLPrimitiveComm(ABC):
 
 class NCCLPrimitiveParallel(NCCLPrimitiveComm):
     primitives: List[NCCLPrimitiveComm] = []
+    single_executer: bool = False
+
+    def __init__(self, single_executer: bool = False):
+        self.single_executer = single_executer
+
     def add(self, primitive: Union[NCCLPrimitiveComm]) -> None:
         self.primitives.append(primitive)
     
     def proto_ll(self) -> NCCLPrimitiveComm:
-        result = NCCLPrimitiveParallel()
+        result = NCCLPrimitiveParallel(self.single_executer)
         for p in self.primitives:
             result.add(p.proto_ll())
         return result
-    
-    def proto_simple(self, chunk_size: int) -> NCCLPrimitiveComm:
-        result = NCCLPrimitiveParallel()
+
+    def proto_simple(self) -> NCCLPrimitiveComm:
+        result = NCCLPrimitiveParallel(self.single_executer)
         for p in self.primitives:
-            result.add(p.proto_simple(chunk_size))
+            result.add(p.proto_simple(p.chunk_size))
         return result
     
     def __repr__(self) -> str:
@@ -62,10 +67,10 @@ class NCCLPrimitiveSequantial(NCCLPrimitiveComm):
             result.append(p.proto_ll())
         return result
     
-    def proto_simple(self, chunk_size: int) -> NCCLPrimitiveComm:
+    def proto_simple(self) -> NCCLPrimitiveComm:
         result = NCCLPrimitiveSequantial()
         for p in self.primitives:
-            result.append(p.proto_simple(chunk_size))
+            result.append(p.proto_simple(p.chunk_size))
         return result
     
     def __repr__(self) -> str:
@@ -75,11 +80,13 @@ class NCCLPrimitive(NCCLPrimitiveComm):
     """Base class for NCCL primitives."""
     
     def __init__(self, *, source_gpu: Optional[GPUDevice] = None, 
-                 target_gpu: Optional[GPUDevice] = None, size: int = 0, __reduced__=False):
+                 target_gpu: Optional[GPUDevice] = None, size: int = 0, chunk_size: int = 0, __reduced__=False):
         self.source_gpu = source_gpu
         self.target_gpu = target_gpu
         self.size = size
-    
+        self.chunk_size = chunk_size if chunk_size > 0 else size
+        self.__reduced__ = __reduced__
+
     def proto_ll(self) -> NCCLPrimitiveComm:
         """Convert to Low-Latency protocol primitives."""
         if self.__reduced__:
@@ -92,21 +99,21 @@ class NCCLPrimitive(NCCLPrimitiveComm):
             __reduced__=True
         )
     
-    def proto_simple(self, chunk_size: int) -> NCCLPrimitiveComm:
+    def proto_simple(self) -> NCCLPrimitiveComm:
         """Convert to Simple protocol primitives."""
         if self.__reduced__:
             raise ValueError("Reduced operations cannot be converted to Simple protocol.")
-        n_chunks = self.size // chunk_size
-        result = NCCLPrimitiveParallel()
+        n_chunks = self.size // self.chunk_size
+        result = NCCLPrimitiveParallel(single_executer=True)
         for _ in range(n_chunks):
             result.add(self.__class__(
                 source_gpu=self.source_gpu, 
                 target_gpu=self.target_gpu, 
-                size=chunk_size,
+                size=self.chunk_size,
                 __reduced__=True
             ))
-        
-        remaining_size = self.size % chunk_size
+
+        remaining_size = self.size % self.chunk_size
         if remaining_size > 0:
             result.add(self.__class__(
                 source_gpu=self.source_gpu, 
@@ -127,6 +134,10 @@ class NCCLCopySend(NCCLPrimitive):
 class NCCLRecv(NCCLPrimitive):
     def __repr__(self) -> str:
         return f"NCCLRecv(source_gpu={self.source_gpu}, size={self.size})"
+
+class NCCLRecvReduce(NCCLPrimitive):
+    def __repr__(self) -> str:
+        return f"NCCLRecvReduce(source_gpu={self.source_gpu}, size={self.size})"
 
 class NCCLRecvReduceCopy(NCCLPrimitive):
     def __repr__(self) -> str:
