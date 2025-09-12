@@ -61,7 +61,7 @@ def get_nvtx_events(traces: List[os.PathLike]) -> pd.DataFrame:
     nvtx_df['eventId'] = range(len(nvtx_df))  # Add unique ID to each row
     return nvtx_df
 
-def _get_communicator_info(data: pd.DataFrame):
+def get_communicator_info(data: pd.DataFrame):
     logger.info("extracting communicator info")
     # extract available informations from the table
     comm_info_pattern = r"commHash (0x[0-9a-f]+) commId (0x[0-9a-f]+) rank (\d+) nranks (\d+) pid (\d+)"
@@ -95,7 +95,7 @@ def _get_communicator_info(data: pd.DataFrame):
     ).drop(columns=["commHash", "text", "start", "end"])
     return comm_info, comm_ring_info, comm_tree_info
 
-def _get_profiling_interval(data: pd.DataFrame):
+def get_profiling_interval(data: pd.DataFrame):
     logger.info("extracting profiling intervals")
     data = data[["nodeId", "start", "text"]].copy()
     profile_start_pattern = r"nsys profiling start, pid: (\d+)"
@@ -132,7 +132,7 @@ def _filter_time(profiling_interval: pd.DataFrame, data: pd.DataFrame):
             (merged["start"] < merged["end_profile"]) & (merged["end"] > merged["start_profile"])
         ].drop(columns=["start_profile", "end_profile"])
 
-def _get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
+def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     logger.info("extracting event infos")
     comm_pattern = r"nccl([a-zA-Z]+)\(\): commHash (0x[0-9a-f]+), stream (0x[0-9a-f]+), data_size (\d+), type_size (\d+),.* pid (\d+)"
     comm_data = data[data['text'].str.match(comm_pattern)].copy()
@@ -142,7 +142,7 @@ def _get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None)
     coll_info_pattern = r'collType (\d+) root (\d+) redOp (\d+) algo (\d+) proto (\d+) commHash (\S+) stream (\S+) data_size (\d+) type_size (\d+) chunkSize (\d+) chunkCount (\d+) chunkSteps (\d+) sliceSteps (\d+) stepSize (\d+) pid (\d+)'
     coll_info_data = data[data['text'].str.match(coll_info_pattern)].copy()
     coll_info_data[["collType", "root", "redOp", "algo", "proto", "commHash", "stream", "data_size", "type_size", "chunkSize", "chunkCount", "chunkSteps", "sliceSteps", "stepSize", "pid"]] = coll_info_data["text"].str.extract(coll_info_pattern)
-    coll_info_data[["data_size", "type_size", "chunkSize", "chunkCount", "chunkSteps", "sliceSteps", "stepSize", "pid"]] = coll_info_data[["data_size", "type_size", "chunkSize", "chunkCount", "chunkSteps", "sliceSteps", "stepSize", "pid"]].astype("Int64")
+    coll_info_data[["collType", "root", "redOp", "algo", "proto", "data_size", "type_size", "chunkSize", "chunkCount", "chunkSteps", "sliceSteps", "stepSize", "pid"]] = coll_info_data[["collType", "root", "redOp", "algo", "proto", "data_size", "type_size", "chunkSize", "chunkCount", "chunkSteps", "sliceSteps", "stepSize", "pid"]].astype("Int64")
 
     coll_kernel_pattern = r'nWarps (\d+) count (\d+) chunkCount (\d+) workCount (\d+) lastChunkCount (\d+) workOffset (\d+) sendbuff (\d+) recvbuff (\d+) pid (\d+)'
     coll_kernel_data = data[data['text'].str.match(coll_kernel_pattern)].copy()
@@ -152,7 +152,7 @@ def _get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None)
     p2p_kernel_pattern = r'Bytes (\d+) nWarps (\d+) p2pType (\d+) peer (\d+) proto (\d+) countHi32 (\d+) countLo32 (\d+) chunkSize (\d+) pid (\d+)'
     p2p_kernel_data = data[data['text'].str.match(p2p_kernel_pattern)].copy()
     p2p_kernel_data[["Bytes", "nWarps", "p2pType", "peer", "proto", "countHi32", "countLo32", "chunkSize", "pid"]] = p2p_kernel_data["text"].str.extract(p2p_kernel_pattern)
-    p2p_kernel_data[["Bytes", "nWarps", "countHi32", "countLo32", "chunkSize", "pid"]] = p2p_kernel_data[["Bytes", "nWarps", "countHi32", "countLo32", "chunkSize", "pid"]].astype("Int64")
+    p2p_kernel_data[["Bytes", "nWarps", "peer", "proto", "countHi32", "countLo32", "chunkSize", "pid"]] = p2p_kernel_data[["Bytes", "nWarps", "peer", "proto", "countHi32", "countLo32", "chunkSize", "pid"]].astype("Int64")
     
     comm_grouped = {name: group for name, group in comm_data.groupby(['nodeId', 'pid'])}
     coll_info_grouped = {name: group for name, group in coll_info_data.groupby(['nodeId', 'pid'])}
@@ -225,7 +225,7 @@ def _get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None)
         ).drop(columns=["eventId_comm"])
     return comm_data, coll_info_data, coll_kernel_data, p2p_kernel_data
 
-def _associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFrame, profiling_interval: pd.DataFrame = None):
+def associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     if profiling_interval is not None:
         logger.info("filtering kernel events by profiling intervals")
         kernel_events_filtered = _filter_time(kernel_events, profiling_interval)
@@ -292,16 +292,15 @@ def _associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFra
         ).rename(columns={"eventId": "association"})
         
         kernels_list.append(kernels)
-
-    return pd.concat(kernels_list, ignore_index=True)
-
-def _update_comm_time(comm_data, kernel_events):
+        
+    kernel_events = pd.concat(kernels_list, ignore_index=True)
     logger.info("updating communicator time based on associated kernels")
     return comm_data.drop(columns=["start", "end"]).merge(
         kernel_events[["start", "end", "association"]],
         left_on=["eventId"],
         right_on=["association"]
-    ).drop(columns=["association"])
+    ).drop(columns=["association"]), kernel_events
+    
 
 
 if __name__ == "__main__":

@@ -2,15 +2,24 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import List, Dict, Type, Union, Optional
 from math import ceil
+from .nccl_comm import CommOp
 
 class GPUStream:
-    context_info: int = -1
+    
+    def __init__(self, context_info: int = -1):
+        self.context_info: int = -1
+        self.collectives: List[CommOp] = []
+        self.coll_starts: List[int] = []
+        self.coll_ends: List[int] = []
+    def add_collective(self, coll: CommOp, start: int, end: int) -> None:
+        self.collectives.append(coll)
+        self.coll_starts.append(start)
+        self.coll_ends.append(end)
 
 class GPUDevice:
-    id: any = None
-    streams: Dict[str, GPUStream] = None
     def __init__(self, id: int):
-        self.id = id
+        self.id: int = id
+        self.streams: Dict[str, GPUStream] = {}
     def __repr__(self):
         return f"GPUDevice(id={self.id})"
     def __eq__(self, value):
@@ -19,6 +28,8 @@ class GPUDevice:
         return self.id == value.id
     def __hash__(self):
         return hash(self.id)
+    def add_collective(self, stream: str, coll: CommOp, start: int, end: int, context: int = -1) -> None:
+        self.streams.setdefault(stream, GPUStream(context)).add_collective(coll, start, end)
 
 class NCCLPrimitiveComm(ABC):    
     @abstractmethod
@@ -34,11 +45,9 @@ class NCCLPrimitiveComm(ABC):
         pass
 
 class NCCLPrimitiveParallel(NCCLPrimitiveComm):
-    primitives: List[NCCLPrimitiveComm] = []
-    single_executer: bool = False
-
     def __init__(self, single_executer: bool = False):
         self.single_executer = single_executer
+        self.primitives: List[NCCLPrimitiveComm] = []
 
     def add(self, primitive: Union[NCCLPrimitiveComm]) -> None:
         self.primitives.append(primitive)
@@ -59,7 +68,6 @@ class NCCLPrimitiveParallel(NCCLPrimitiveComm):
         return "NCCLPrimitiveParallel(" + ", ".join(repr(p) for p in self.primitives) + ")"
 
 class NCCLPrimitiveSequantial(NCCLPrimitiveComm):
-    primitives: List[Union[NCCLPrimitiveComm]] = []
     def append(self, primitive: Union[NCCLPrimitiveComm]) -> None:
         self.primitives.append(primitive)
     

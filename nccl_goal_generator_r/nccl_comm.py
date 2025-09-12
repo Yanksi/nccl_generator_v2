@@ -27,19 +27,13 @@ class RingTopoNode:
     nxt: GPUDevice
 
 class Communicator:
-    comm_id: str = None
-    rank2gpu: List[GPUDevice] = None
-    gpu2rank: Dict[GPUDevice, int] = None
-    tree_topo: Dict[GPUDevice, List[TreeTopoNode]] = None
-    ring_topo: Dict[GPUDevice, List[RingTopoNode]] = None
-    n_ranks: int = 0
     def __init__(self, comm_id: str, gpus: List[GPUDevice]):
-        self.comm_id = comm_id
-        self.rank2gpu = gpus
-        self.gpu2rank = {gpu: i for i, gpu in enumerate(gpus)}
+        self.comm_id: str = comm_id
+        self.rank2gpu: List[GPUDevice] = gpus
+        self.gpu2rank: Dict[GPUDevice, int] = {gpu: i for i, gpu in enumerate(gpus)}
         self.n_ranks = len(gpus)
-        self.tree_topo = {gpu: [] for gpu in gpus}
-        self.ring_topo = {gpu: [] for gpu in gpus}
+        self.tree_topo: Dict[GPUDevice, List[TreeTopoNode]] = {gpu: [] for gpu in gpus}
+        self.ring_topo: Dict[GPUDevice, List[RingTopoNode]] = {gpu: [] for gpu in gpus}
         self.rank2gpu.append(None) # when query rank -1, return None
     
     def add_tree_topo(self, gpu_rank: int, parent_rank: int, children_ranks: List[int]):
@@ -113,39 +107,36 @@ class CollChnlInfo:
 
 
 class CollectiveOp(CommOp):
-    comm: Communicator
-    coll_info: CollInfo
-    coll_chnl_infos: List[CollChnlInfo]
-
-    def __init__(self, comm: Communicator, coll_info: CollInfo, coll_chnl_infos: List[CollChnlInfo]):
+    def __init__(self, comm: Communicator, coll_info: CollInfo, gpu: GPUDevice, coll_chnl_infos: List[CollChnlInfo]):
         self.comm = comm
         self.coll_info = coll_info
+        self.gpu = gpu
         self.coll_chnl_infos = coll_chnl_infos
 
-    def to_primitives_ring_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
+    def _to_primitives_ring_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
         raise NotImplementedError
     
-    def to_primitives_tree_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
+    def _to_primitives_tree_chnl(self, gpu: GPUDevice, chnl_id: int) -> NCCLPrimitiveComm:
         raise NotImplementedError
 
-    def to_primitives_tree(self, gpu: GPUDevice) -> NCCLPrimitiveComm:
+    def _to_primitives_tree(self) -> NCCLPrimitiveComm:
         result = NCCLPrimitiveParallel()
         for chnl_id in range(len(self.coll_chnl_infos)):
-            result.add(self.to_primitives_tree_chnl(gpu, chnl_id))
+            result.add(self._to_primitives_tree_chnl(self.gpu, chnl_id))
         return result
     
-    def to_primitives_ring(self, gpu: GPUDevice) -> NCCLPrimitiveComm:
+    def _to_primitives_ring(self) -> NCCLPrimitiveComm:
         result = NCCLPrimitiveParallel()
         for chnl_id in range(len(self.coll_chnl_infos)):
-            result.add(self.to_primitives_ring_chnl(gpu, chnl_id))
+            result.add(self._to_primitives_ring_chnl(self.gpu, chnl_id))
         return result
     
-    def to_primitives(self, gpu: GPUDevice) -> NCCLPrimitiveComm:
+    def to_primitives(self) -> NCCLPrimitiveComm:
         result = None
         if self.coll_info.algo == CollAlgo.RING:
-            result = self.to_primitives_ring(gpu)
+            result = self._to_primitives_ring()
         elif self.coll_info.algo == CollAlgo.TREE:
-            result = self.to_primitives_tree(gpu)
+            result = self._to_primitives_tree()
         else:
             raise ValueError(f"Unknown algo: {self.coll_info.algo}")
         return result
