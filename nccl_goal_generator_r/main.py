@@ -108,3 +108,9 @@ def construct_p2p(
         "Send": Send,
         "Recv": Recv
     }
+    p2p_kernels['gpu'] = p2p_kernels.apply(lambda row: gpu_devices[(row['nodeId'], row['pid'])], axis=1)
+    p2p_kernels['comm'] = p2p_kernels.apply(lambda row: communicators[row['commId']], axis=1)
+    p2p_kernels["p2pOp"] = p2p_kernels.apply(lambda row: p2p_ops[row['collective']](row["Bytes"], row["peer"], row["comm"], row["chunkSize"]), axis=1)
+    
+    for _, row in p2p_kernels.iterrows():
+        row['gpu'].add_collective(row["stream"], row['p2pOp'], row['start'], row['end'])
