@@ -53,15 +53,15 @@ class GoalCalc(GoalOp):
         return f"calc {self.duration} cpu {self.cpu}"
 
 class GoalParallel(GoalOp):
-    def __init__(self):
-        self.ops: List[GoalOp] = []
+    def __init__(self, *ops: GoalOp):
+        self.ops: List[GoalOp] = list(ops)
     
     def add_op(self, op: GoalOp):
         self.ops.append(op)
 
 class GoalSequential(GoalOp):
-    def __init__(self):
-        self.ops: List[GoalOp] = []
+    def __init__(self, *ops: GoalOp):
+        self.ops: List[GoalOp] = list(ops)
     
     def add_op(self, op: GoalOp):
         self.ops.append(op)
@@ -204,7 +204,10 @@ class NCCLSend(NCCLPrimitive):
     
     def to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], tag: int, cpu: int, nic: int, intra_node: bool):
         if intra_node:
-            pass
+            return GoalSequential(
+                GoalCalc(intra_node_transfer_time(self.size), cpu),
+                GoalSend(gpu2goal_rank[self.target_gpu], 0, tag, cpu, nic)
+            )
 
     
 class NCCLCopySend(NCCLPrimitive):
