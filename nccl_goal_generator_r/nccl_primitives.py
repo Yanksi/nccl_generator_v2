@@ -4,6 +4,68 @@ from typing import List, Dict, Type, Union, Optional
 from math import ceil
 from .nccl_comm import CommOp
 
+
+def intra_node_transfer_time(size: int) -> int:
+    # TODO
+    return 0
+
+def reduction_time(size: int) -> int:
+    # TODO
+    return 0
+
+
+class GoalOp(ABC):
+    """
+    class for modeling the dependencies between different goal objects, labeling and creating edges
+    """
+    @abstractmethod
+    def __repr__(self):
+        pass
+
+class GoalSend(GoalOp):
+    def __init__(self, target_rank: int, size: int, tag: int, cpu: int, nic: int):
+        self.target_rank = target_rank
+        self.size = size
+        self.tag = tag
+        self.cpu = cpu
+        self.nic = nic
+    
+    def __repr__(self):
+        return f"send {self.size}b to {self.target_rank} tag {self.tag} cpu {self.cpu} nic {self.nic}"
+
+class GoalRecv(GoalOp):
+    def __init__(self, source_rank: int, size: int, tag: int, cpu: int, nic: int):
+        self.source_rank = source_rank
+        self.size = size
+        self.tag = tag
+        self.cpu = cpu
+        self.nic = nic
+    
+    def __repr__(self):
+        return f"recv {self.size}b from {self.source_rank} tag {self.tag} cpu {self.cpu} nic {self.nic}"
+    
+class GoalCalc(GoalOp):
+    def __init__(self, duration: int, cpu: int):
+        self.duration = duration
+        self.cpu = cpu
+    
+    def __repr__(self):
+        return f"calc {self.duration} cpu {self.cpu}"
+
+class GoalParallel(GoalOp):
+    def __init__(self):
+        self.ops: List[GoalOp] = []
+    
+    def add_op(self, op: GoalOp):
+        self.ops.append(op)
+
+class GoalSequential(GoalOp):
+    def __init__(self):
+        self.ops: List[GoalOp] = []
+    
+    def add_op(self, op: GoalOp):
+        self.ops.append(op)
+
 class GPUStream:
     
     def __init__(self, context_info: int = -1):
@@ -132,10 +194,18 @@ class NCCLPrimitive(NCCLPrimitiveComm):
                 __reduced__=True
             ))
         return result
+    
+    def to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], tag: int, cpu: int, nic: int, intra_node: bool):
+        raise NotImplementedError("to_goal method must be implemented in subclasses.")
 
 class NCCLSend(NCCLPrimitive):
     def __repr__(self) -> str:
         return f"NCCLSend(target_gpu={self.target_gpu}, size={self.size})"
+    
+    def to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], tag: int, cpu: int, nic: int, intra_node: bool):
+        if intra_node:
+            pass
+
     
 class NCCLCopySend(NCCLPrimitive):
     def __repr__(self) -> str:

@@ -44,7 +44,7 @@ proto_mapping = {
 }
 
 def construct_collectives(
-    gpu_deviecs: Dict[Tuple[str, int], GPUDevice],
+    gpu_devices: Dict[Tuple[str, int], GPUDevice],
     communicators: Dict[str, Communicator],
     coll_info: pd.DataFrame,
     coll_kernels: pd.DataFrame,
@@ -97,7 +97,8 @@ def construct_p2p(
     gpu_devices: Dict[Tuple[str, int], GPUDevice],
     communicators: Dict[str, Communicator],
     p2p_kernels: pd.DataFrame,
-    comm_data: pd.DataFrame) -> None:
+    comm_data: pd.DataFrame,
+    comm_info: pd.DataFrame) -> None:
     p2p_kernels = p2p_kernels[["Bytes", "nWarps", "peer", "proto", "countHi32", "countLo32", "chunkSize", "association"]].merge(
         comm_data, left_on="association", right_on="eventId", how="left"
     ).merge(
