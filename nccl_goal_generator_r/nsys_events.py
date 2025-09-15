@@ -372,3 +372,4 @@ if __name__ == "__main__":
     profiling_interval = get_profiling_interval(nvtx_events)
     comm_data, coll_info, coll_kernels, p2p_kernels = get_event_info(nvtx_events, profiling_interval)
     kernel_events = associate_kernel_to_nvtx(comm_data, kernel_events, profiling_interval)
+    comm_data = add_context_parallelism(comm_data)
