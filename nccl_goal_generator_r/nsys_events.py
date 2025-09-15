@@ -225,6 +225,7 @@ def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
         ).drop(columns=["eventId_comm"])
     return comm_data, coll_info_data, coll_kernel_data, p2p_kernel_data
 
+
 def associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     if profiling_interval is not None:
         logger.info("filtering kernel events by profiling intervals")
@@ -301,14 +302,73 @@ def associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFram
         right_on=["association"]
     ).drop(columns=["association"]), kernel_events
     
+def add_context_parallelism(comm_data: pd.DataFrame):
+    collective_labels = {
+        "AllGather": "A",
+        "AllReduce": "B",
+        "Broadcast": "C",
+        "ReduceScatter": "D",
+        "Recv": "E",
+        "Send": "F"
+    }
+
+    def rule_dp(label_seq):
+        # for fully sharded data parallelism, the collective sequence should be like AAADDDAAADDD...
+        # get the number of starting As
+        n_a = 0
+        for c in label_seq:
+            if c == "A":
+                n_a += 1
+            else:
+                break
+        if n_a == 0:
+            return False
+        # check if the rest of the sequence is made of D and A in alternating blocks of size n_a
+        for i in range(0, len(label_seq), 2 * n_a):
+            if label_seq[i:i+n_a] != "A" * n_a:
+                return False
+            if label_seq[i+n_a:i+2*n_a] != "D" * n_a and i + n_a < len(label_seq):
+                return False
+        return True
+
+
+    def rule_pp(label_seq):
+        # for pipeline parallelism, it should just be a sequence of alternating E and F
+        # the length of the sequence should be even
+        if len(label_seq) % 2 != 0:
+            return False
+        first_two = label_seq[:2]
+        for i in range(0, len(label_seq), 2):
+            if label_seq[i:i+2] != first_two:
+                return False
+        return True
+    
+    def get_rule(label_seq):
+        if rule_dp(label_seq):
+            return "DP"
+        elif rule_pp(label_seq):
+            return "PP"
+        else:
+            return "Other"
+
+    comm_data = comm_data.copy()
+    comm_data["label"] = comm_data["collective"].map(collective_labels)
+    comm_grouped = comm_data.groupby(["nodeId", "pid", "stream"]).agg(
+        label_seq=("label", lambda x: "".join(x))
+    ).reset_index()
+    comm_grouped["parallelism"] = comm_grouped["label_seq"].map(get_rule)
+    return comm_data.merge(
+        comm_grouped[["nodeId", "pid", "stream", "parallelism"]],
+        on=["nodeId", "pid", "stream"],
+        how="left"
+    ).drop(columns=["label"])
 
 
 if __name__ == "__main__":
     traces = find_all_traces("traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite")
     kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)
-    comm_info, comm_ring_info, comm_tree_info = _get_communicator_info(nvtx_events)
-    profiling_interval = _get_profiling_interval(nvtx_events)
-    comm_data, coll_info, coll_kernels, p2p_kernels = _get_event_info(nvtx_events, profiling_interval)
-    kernel_events = _associate_kernel_to_nvtx(comm_data, kernel_events, profiling_interval)
-    comm_data = _update_comm_time(comm_data, kernel_events)
+    comm_info, comm_ring_info, comm_tree_info = get_communicator_info(nvtx_events)
+    profiling_interval = get_profiling_interval(nvtx_events)
+    comm_data, coll_info, coll_kernels, p2p_kernels = get_event_info(nvtx_events, profiling_interval)
+    kernel_events = associate_kernel_to_nvtx(comm_data, kernel_events, profiling_interval)
