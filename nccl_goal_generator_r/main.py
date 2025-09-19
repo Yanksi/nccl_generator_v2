@@ -88,7 +88,7 @@ def construct_collectives(
         "Broadcast": Broadcast,
         "Reduce": Reduce
     }
-    coll_info["collOp"] = coll_info.apply(lambda row: collective_ops[row['collective']](row['comm'], row['collInfo'], row['gpu'], row['chnlInfo']), axis=1)
+    coll_info["collOp"] = coll_info.apply(lambda row: collective_ops[row['collective']](row['gpu'], row['comm'], row['collInfo'], row['chnlInfo']), axis=1)
     for _, row in coll_info.iterrows():
         row['gpu'].add_collective(row['stream'], row['collOp'], row['start'], row['end'])
 
@@ -111,7 +111,7 @@ def construct_p2p(
     }
     p2p_kernels['gpu'] = p2p_kernels.apply(lambda row: gpu_devices[(row['nodeId'], row['pid'])], axis=1)
     p2p_kernels['comm'] = p2p_kernels.apply(lambda row: communicators[row['commId']], axis=1)
-    p2p_kernels["p2pOp"] = p2p_kernels.apply(lambda row: p2p_ops[row['collective']](row["Bytes"], row["peer"], row["comm"], row["chunkSize"]), axis=1)
+    p2p_kernels["p2pOp"] = p2p_kernels.apply(lambda row: p2p_ops[row['collective']](row["gpu"], row["Bytes"], row["peer"], row["comm"], row["chunkSize"]), axis=1)
     
     for _, row in p2p_kernels.iterrows():
         row['gpu'].add_collective(row["stream"], row['p2pOp'], row['start'], row['end'])
