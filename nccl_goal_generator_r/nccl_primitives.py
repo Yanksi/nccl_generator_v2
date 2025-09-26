@@ -23,49 +23,110 @@ class GoalOp(ABC):
     class for modeling the dependencies between different goal objects, labeling and creating edges
     """
     @abstractmethod
-    def __repr__(self):
+    def get_start_id(self) -> int:
         pass
 
-class GoalTraffic(GoalOp, ABC):
-    def __init__(self, peer_rank: int, size: int, cpu: int, nic: int):
+    @abstractmethod
+    def get_end_id(self) -> int:
+        pass
+    
+    @abstractmethod
+    def __str__(self):
+        pass
+
+class GoalOpAtom(GoalOp, ABC):
+    task_id_for_rank: Dict[int, int] = {}
+    def __init__(self, self_rank: int):
+        self.id = GoalOp.task_id_for_rank.setdefault(self_rank, 0)
+        self_rank: int = self_rank
+        GoalOp.task_id_for_rank[self_rank] += 1 # each task can take two ids (mostly for the parallel case)
+
+    def get_start_id(self) -> int:
+        return self.id
+    
+    def get_end_id(self) -> int:
+        return self.id
+    
+class GoalTraffic(GoalOpAtom, ABC):
+    def __init__(self, self_rank: int, peer_rank: int, size: int, cpu: int, nic: int, context: int):
+        super().__init__(self_rank)
+        self.context = context
         self.peer_rank = peer_rank
         self.size = size
         self.cpu = cpu
         self.nic = nic
-    
-    @abstractmethod
-    def __repr__(self):
-        pass
 
 class GoalSend(GoalTraffic):
-    def __repr__(self):
-        return f"send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic}"
+    send_message_id: Dict[Tuple[int, int], int] = {}
+    def __str__(self):
+        if not hasattr(self, 'message_id'):
+            self.message_id = GoalSend.send_message_id.setdefault((self.peer_rank, self.size), 0)
+            GoalSend.send_message_id[(self.peer_rank, self.size)] += 1
+        tag = str(self.context).zfill(2) + str(self.message_id).zfill(5)
+        return f"l{self.id}: send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
 
 class GoalRecv(GoalTraffic):
-    def __repr__(self):
-        return f"recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic}"
+    recv_message_id: Dict[Tuple[int, int], int] = {}
+    def __str__(self):
+        if not hasattr(self, 'message_id'):
+            self.message_id = GoalRecv.recv_message_id.setdefault((self.peer_rank, self.size), 0)
+            GoalRecv.recv_message_id[(self.peer_rank, self.size)] += 1
+        tag = str(self.context).zfill(2) + str(self.message_id).zfill(5)
+        return f"l{self.id}: recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
     
-class GoalCalc(GoalOp):
-    def __init__(self, duration: int, cpu: int):
+class GoalCalc(GoalOpAtom):
+    def __init__(self, self_rank: int, duration: int, cpu: int):
+        super().__init__(self_rank)
         self.duration = duration
         self.cpu = cpu
     
-    def __repr__(self):
-        return f"calc {self.duration} cpu {self.cpu}"
+    def __str__(self):
+        return f"l{self.id}: calc {self.duration} cpu {self.cpu}"
 
 class GoalParallel(GoalOp):
-    def __init__(self, *ops: GoalOp):
+    def __init__(self, self_rank: int, *ops: GoalOp):
         self.ops: List[GoalOp] = list(ops)
+        self.starting_op = GoalCalc(self_rank, 0, 0)
+        self.ending_op = GoalCalc(self_rank, 0, 0)
     
     def add_op(self, op: GoalOp):
         self.ops.append(op)
+    
+    def get_start_id(self) -> int:
+        return self.starting_op.get_start_id()
+
+    def get_end_id(self) -> int:
+        return self.ending_op.get_end_id()
+    
+    def __str__(self):
+        results = "\n".join([str(op) for op in self.ops] + [str(self.starting_op), str(self.ending_op)])
+        requirements_pre = "\n".join([
+            f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}" for op in self.ops
+        ])
+        requirements_post = "\n".join([
+            f"l{self.ending_op.get_start_id()} requires l{op.get_end_id()}" for op in self.ops
+        ])
+        return results + "\n" + requirements_pre + "\n" + requirements_post
 
 class GoalSequential(GoalOp):
-    def __init__(self, *ops: GoalOp):
+    def __init__(self, self_rank: int, *ops: GoalOp):
         self.ops: List[GoalOp] = list(ops)
     
     def add_op(self, op: GoalOp):
         self.ops.append(op)
+    
+    def get_start_id(self) -> int:
+        return self.ops[0].get_start_id() if self.ops else -1
+    
+    def get_end_id(self) -> int:
+        return self.ops[-1].get_end_id() if self.ops else -1
+    
+    def __str__(self):
+        results = "\n".join([str(op) for op in self.ops])
+        requirements = "\n".join([
+            f"l{self.ops[i+1].get_start_id()} requires l{self.ops[i].get_end_id()}" for i in range(len(self.ops)-1)
+        ])
+        return results + "\n" + requirements
 
 
 class GPUStream:
@@ -79,6 +140,21 @@ class GPUStream:
         self.collectives.append(coll)
         self.coll_starts.append(start)
         self.coll_ends.append(end)
+    
+    def generate_goal(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+        curr_cpu = starting_cpu_id
+        last_cpu = curr_cpu
+        prev_end = -1
+        goal_ops = []
+        for coll, start, end in zip(self.collectives, self.coll_starts, self.coll_ends):
+            primitives = coll.to_primitives()
+            goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic, gpu2node)
+            last_cpu = max(last_cpu, _last_cpu)
+            if prev_end > 0:
+                goal_ops.append(GoalCalc(start - prev_end, curr_cpu))
+            goal_ops.append(goal_op)
+            prev_end = end
+        return GoalSequential(*goal_ops), last_cpu
 
 class GPUDevice:
     def __init__(self, id: int):
@@ -95,19 +171,12 @@ class GPUDevice:
     def add_collective(self, stream: str, coll: CommOp, start: int, end: int, context: int = -1) -> None:
         self.streams.setdefault(stream, GPUStream(context)).add_collective(coll, start, end)
     
-    def generate_goal_for_stream(self, stream_id: str, starting_cpu_id: int) -> int:
-        curr_cpu = starting_cpu_id
-        stream = self.streams[stream_id]
-        for coll, start, end in zip(stream.collectives, stream.coll_starts, stream.coll_ends):
-            primitives = coll.to_primitives()
-
-            
-    
-    def generate_goal(self):
-        last_cpu_id = 0
-        for stream_name, stream in self.streams.items():
-            for coll, start, end in zip(stream.collectives, stream.coll_starts, stream.coll_ends):
-                primitives = coll.to_primitives()
+    def generate_goal(self, starting_cpu_id: int, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int], nic: int) -> int:
+        goal_result = []
+        for stream_id, stream in self.streams.items():
+            goal_op, starting_cpu_id = stream.generate_goal(starting_cpu_id, nic, gpu2goal_rank, gpu2node)
+            goal_result.append(goal_op)
+        return GoalParallel(*goal_result), starting_cpu_id
 
 class NCCLPrimitiveComm(ABC):
     def __init__(self, __reduced__: bool = False):

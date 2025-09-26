@@ -53,16 +53,17 @@ class Communicator:
 
 
 class CommOp(ABC):
-    def __init__(self, gpu: GPUDevice):
+    def __init__(self, gpu: GPUDevice, context: int):
         self.gpu = gpu
+        self.context = context
 
     @abstractmethod
     def to_primitives(self) -> NCCLPrimitiveComm:
         pass
 
 class P2POp(CommOp, ABC):
-    def __init__(self, gpu: GPUDevice, size: int, peer_rank: int, comm: Communicator, chunk_size: int):
-        super().__init__(gpu)
+    def __init__(self, gpu: GPUDevice, size: int, peer_rank: int, comm: Communicator, chunk_size: int, context: int):
+        super().__init__(gpu, context)
         self.size = size
         self.peer_gpu = comm.rank2gpu[peer_rank]
         if chunk_size < 0:
@@ -106,8 +107,8 @@ class CollChnlInfo:
 
 
 class CollectiveOp(CommOp, ABC):
-    def __init__(self, gpu: GPUDevice, comm: Communicator, coll_info: CollInfo, coll_chnl_infos: List[CollChnlInfo]):
-        super().__init__(gpu)
+    def __init__(self, gpu: GPUDevice, comm: Communicator, coll_info: CollInfo, coll_chnl_infos: List[CollChnlInfo], context: int):
+        super().__init__(gpu, context)
         self.comm = comm
         self.coll_info = coll_info
         self.coll_chnl_infos = coll_chnl_infos
