@@ -22,7 +22,7 @@ class GoalOpAtom(GoalOp, ABC):
     task_id_for_rank: Dict[int, int] = {}
     def __init__(self, self_rank: int):
         self.id = GoalOpAtom.task_id_for_rank.setdefault(self_rank, 0)
-        self_rank: int = self_rank
+        self.self_rank = self_rank
         GoalOpAtom.task_id_for_rank[self_rank] += 1 # each task can take two ids (mostly for the parallel case)
 
     def get_start_id(self) -> int:
@@ -41,20 +41,24 @@ class GoalTraffic(GoalOpAtom, ABC):
         self.nic = nic
 
 class GoalSend(GoalTraffic):
-    send_message_id: Dict[Tuple[int, int], int] = {}
+    send_message_id: Dict[Tuple[int, int, int], int] = {}
+    def __init__(self, self_rank: int, peer_rank: int, size: int, cpu: int, nic: int, context: int):
+        super().__init__(self_rank, peer_rank, size, cpu, nic, context)
+        self.message_id = GoalSend.send_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
+        GoalSend.send_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
+
     def __str__(self):
-        if not hasattr(self, 'message_id'):
-            self.message_id = GoalSend.send_message_id.setdefault((self.peer_rank, self.size), 0)
-            GoalSend.send_message_id[(self.peer_rank, self.size)] += 1
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(5)
         return f"l{self.id}: send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
 
 class GoalRecv(GoalTraffic):
-    recv_message_id: Dict[Tuple[int, int], int] = {}
+    recv_message_id: Dict[Tuple[int, int, int], int] = {}
+    def __init__(self, self_rank: int, peer_rank: int, size: int, cpu: int, nic: int, context: int):
+        super().__init__(self_rank, peer_rank, size, cpu, nic, context)
+        self.message_id = GoalRecv.recv_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
+        GoalRecv.recv_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
+    
     def __str__(self):
-        if not hasattr(self, 'message_id'):
-            self.message_id = GoalRecv.recv_message_id.setdefault((self.peer_rank, self.size), 0)
-            GoalRecv.recv_message_id[(self.peer_rank, self.size)] += 1
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(5)
         return f"l{self.id}: recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
     

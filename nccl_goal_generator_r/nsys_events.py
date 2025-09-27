@@ -331,7 +331,6 @@ def add_context_parallelism(comm_data: pd.DataFrame):
                 return False
         return True
 
-
     def rule_pp(label_seq):
         # for pipeline parallelism, it should just be a sequence of alternating E and F
         # the length of the sequence should be even
