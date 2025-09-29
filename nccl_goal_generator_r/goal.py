@@ -6,6 +6,9 @@ class GoalOp(ABC):
     """
     class for modeling the dependencies between different goal objects, labeling and creating edges
     """
+    def __init__(self, cpu):
+        self.cpu = cpu
+
     @abstractmethod
     def get_start_id(self) -> int:
         pass
@@ -20,10 +23,11 @@ class GoalOp(ABC):
 
 class GoalOpAtom(GoalOp, ABC):
     task_id_for_rank: Dict[int, int] = {}
-    def __init__(self, self_rank: int):
+    def __init__(self, self_rank: int, cpu: int):
+        super().__init__(cpu)
         self.id = GoalOpAtom.task_id_for_rank.setdefault(self_rank, 0)
         self.self_rank = self_rank
-        GoalOpAtom.task_id_for_rank[self_rank] += 1 # each task can take two ids (mostly for the parallel case)
+        GoalOpAtom.task_id_for_rank[self_rank] += 1
 
     def get_start_id(self) -> int:
         return self.id
@@ -33,11 +37,10 @@ class GoalOpAtom(GoalOp, ABC):
     
 class GoalTraffic(GoalOpAtom, ABC):
     def __init__(self, self_rank: int, peer_rank: int, size: int, cpu: int, nic: int, context: int):
-        super().__init__(self_rank)
+        super().__init__(self_rank, cpu)
         self.context = context
         self.peer_rank = peer_rank
         self.size = size
-        self.cpu = cpu
         self.nic = nic
 
 class GoalSend(GoalTraffic):
@@ -48,7 +51,7 @@ class GoalSend(GoalTraffic):
         GoalSend.send_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
 
     def __str__(self):
-        tag = str(self.context).zfill(2) + str(self.message_id).zfill(5)
+        tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
         return f"l{self.id}: send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
 
 class GoalRecv(GoalTraffic):
@@ -59,24 +62,24 @@ class GoalRecv(GoalTraffic):
         GoalRecv.recv_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
     
     def __str__(self):
-        tag = str(self.context).zfill(2) + str(self.message_id).zfill(5)
+        tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
         return f"l{self.id}: recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
     
 class GoalCalc(GoalOpAtom):
     def __init__(self, self_rank: int, duration: int, cpu: int):
-        super().__init__(self_rank)
+        super().__init__(self_rank, cpu)
         self.duration = duration
-        self.cpu = cpu
     
     def __str__(self):
         return f"l{self.id}: calc {self.duration} cpu {self.cpu}"
 
 class GoalParallel(GoalOp):
-    def __init__(self, self_rank: int, *ops: GoalOp):
-        self.ops: List[GoalOp] = list(ops)
-        self.starting_op = GoalCalc(self_rank, 0, 0)
-        self.ending_op = GoalCalc(self_rank, 0, 0)
-    
+    def __init__(self, self_rank: int, cpu: int, ops: list[GoalOp]):
+        super().__init__(cpu)
+        self.ops: List[GoalOp] = ops
+        self.starting_op = GoalCalc(self_rank, 0, cpu)
+        self.ending_op = GoalCalc(self_rank, 0, cpu)
+
     def add_op(self, op: GoalOp):
         self.ops.append(op)
     
@@ -97,9 +100,10 @@ class GoalParallel(GoalOp):
         return f"{results}\n{requirements_pre}\n{requirements_post}"
 
 class GoalSequential(GoalOp):
-    def __init__(self, self_rank: int, *ops: GoalOp):
-        self.ops: List[GoalOp] = list(ops)
-    
+    def __init__(self, self_rank: int, cpu: int, ops: list[GoalOp]):
+        super().__init__(cpu)
+        self.ops: List[GoalOp] = ops
+
     def add_op(self, op: GoalOp):
         self.ops.append(op)
     

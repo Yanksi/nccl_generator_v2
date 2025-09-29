@@ -1,12 +1,16 @@
 from __future__ import annotations
-from .nccl_comm import CommOp
-from .goal import GoalOp, GoalCalc, GoalSequential, GoalParallel
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from nccl_comm import CommOp
+# from nccl_comm import CommOp
+from goal import GoalOp, GoalCalc, GoalSequential, GoalParallel
 from typing import List, Dict, Type, Union, Optional, Tuple
 
 
 class GPUStream:
-    def __init__(self, context_info: int = -1):
+    def __init__(self, self_gpu: GPUDevice, context_info: int = -1):
         self.context_info: int = context_info
+        self.self_gpu: GPUDevice = self_gpu
         self.collectives: List[CommOp] = []
         self.coll_starts: List[int] = []
         self.coll_ends: List[int] = []
@@ -26,10 +30,10 @@ class GPUStream:
             goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic, gpu2node)
             last_cpu = max(last_cpu, _last_cpu)
             if prev_end > 0:
-                goal_ops.append(GoalCalc(start - prev_end, curr_cpu))
+                goal_ops.append(GoalCalc(starting_cpu_id, start - prev_end, curr_cpu))
             goal_ops.append(goal_op)
             prev_end = end
-        return GoalSequential(*goal_ops), last_cpu
+        return GoalSequential(gpu2goal_rank[self.self_gpu], starting_cpu_id, goal_ops), last_cpu
 
 class GPUDevice:
     def __init__(self, id: int):
@@ -44,11 +48,12 @@ class GPUDevice:
     def __hash__(self):
         return hash(self.id)
     def add_collective(self, stream: str, coll: CommOp, start: int, end: int, context: int = -1) -> None:
-        self.streams.setdefault(stream, GPUStream(context)).add_collective(coll, start, end)
-    
-    def generate_goal(self, starting_cpu_id: int, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int], nic: int) -> int:
+        self.streams.setdefault(stream, GPUStream(self, context)).add_collective(coll, start, end)
+
+    def generate_goal(self, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int], nic: int) -> int:
         goal_result = []
+        starting_cpu_id = 0
         for stream_id, stream in self.streams.items():
             goal_op, starting_cpu_id = stream.generate_goal(starting_cpu_id, nic, gpu2goal_rank, gpu2node)
             goal_result.append(goal_op)
-        return GoalParallel(*goal_result), starting_cpu_id
+        return GoalParallel(gpu2goal_rank[self], 0, goal_result), starting_cpu_id
