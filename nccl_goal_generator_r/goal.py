@@ -1,6 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import List, Dict, Type, Union, Optional, Tuple, Iterator
+from typing import List, Dict, Type, Union, Optional, Tuple, Generator
 
 class GoalOp(ABC):
     """
@@ -18,7 +18,7 @@ class GoalOp(ABC):
         pass
     
     @abstractmethod
-    def generate_lines(self) -> Iterator[str]:
+    def generate_lines(self) -> Generator[str]:
         pass
     
     def __str__(self):
@@ -53,7 +53,7 @@ class GoalSend(GoalTraffic):
         self.message_id = GoalSend.send_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
         GoalSend.send_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
 
-    def generate_lines(self) -> Iterator[str]:
+    def generate_lines(self) -> Generator[str]:
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
         yield f"l{self.id}: send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
         
@@ -64,7 +64,7 @@ class GoalRecv(GoalTraffic):
         self.message_id = GoalRecv.recv_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
         GoalRecv.recv_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
     
-    def generate_lines(self) -> Iterator[str]:
+    def generate_lines(self) -> Generator[str]:
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
         yield f"l{self.id}: recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
     
@@ -73,13 +73,13 @@ class GoalCalc(GoalOpAtom):
         super().__init__(self_rank, cpu)
         self.duration = duration
     
-    def generate_lines(self) -> Iterator[str]:
+    def generate_lines(self) -> Generator[str]:
         yield f"l{self.id}: calc {self.duration} cpu {self.cpu}"
 
 class GoalParallel(GoalOp):
-    def __init__(self, self_rank: int, cpu: int, ops: list[GoalOp]):
+    def __init__(self, self_rank: int, cpu: int, ops: Union[list[GoalOp], Generator[GoalOp]]):
         super().__init__(cpu)
-        self.ops: List[GoalOp] = ops
+        self.ops: Union[List[GoalOp], Generator[GoalOp]] = ops
         self.starting_op = GoalCalc(self_rank, 0, cpu)
         self.ending_op = GoalCalc(self_rank, 0, cpu)
 
@@ -92,17 +92,15 @@ class GoalParallel(GoalOp):
     def get_end_id(self) -> int:
         return self.ending_op.get_end_id()
     
-    def generate_lines(self) -> Iterator[str]:
-        for op in self.ops:
-            yield from op.generate_lines()
-        
+    def generate_lines(self) -> Generator[str]:
         yield from self.starting_op.generate_lines()
         yield from self.ending_op.generate_lines()
-        
+
         for op in self.ops:
+            yield from op.generate_lines()
             yield f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}"
-        for op in self.ops:
             yield f"l{self.ending_op.get_start_id()} requires l{op.get_end_id()}"
+            
         # results = "\n".join([str(op) for op in self.ops] + [str(self.starting_op), str(self.ending_op)])
         # requirements_pre = "\n".join([
         #     f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}" for op in self.ops
@@ -113,24 +111,39 @@ class GoalParallel(GoalOp):
         # return f"{results}\n{requirements_pre}\n{requirements_post}"
 
 class GoalSequential(GoalOp):
-    def __init__(self, self_rank: int, cpu: int, ops: list[GoalOp]):
+    def __init__(self, self_rank: int, cpu: int, ops: Union[List[GoalOp], Generator[GoalOp]]):
         super().__init__(cpu)
-        self.ops: List[GoalOp] = ops
+        self.ops: Union[List[GoalOp], Generator[GoalOp]] = ops
+        self.starting_op = None
+        self.ending_op = None
 
     def add_op(self, op: GoalOp):
         self.ops.append(op)
     
     def get_start_id(self) -> int:
-        return self.ops[0].get_start_id() if self.ops else -1
+        if self.starting_op:
+            return self.starting_op.get_start_id()
+        self.starting_op = self.ops[0] # should automatically raise error if ops is a generator
+        return self.starting_op.get_start_id()
     
     def get_end_id(self) -> int:
-        return self.ops[-1].get_end_id() if self.ops else -1
-    
-    def generate_lines(self) -> Iterator[str]:
-        for op in self.ops:
+        if self.ending_op:
+            return self.ending_op.get_end_id()
+        self.ending_op = self.ops[-1] # should automatically raise error if ops is a generator
+        return self.ending_op.get_end_id()
+
+    def generate_lines(self) -> Generator[str]:
+        iterator = iter(self.ops)
+        self.starting_op = next(iterator)
+        self.ending_op = self.starting_op
+        prev_op = self.starting_op
+        yield from self.starting_op.generate_lines()
+
+        for op in iterator:
+            self.ending_op = op
             yield from op.generate_lines()
-        for i in range(len(self.ops)-1):
-            yield f"l{self.ops[i+1].get_start_id()} requires l{self.ops[i].get_end_id()}"
+            yield f"l{op.get_start_id()} requires l{prev_op.get_end_id()}"
+            prev_op = op
         # results = "\n".join([str(op) for op in self.ops])
         # requirements = "\n".join([
         #     f"l{self.ops[i+1].get_start_id()} requires l{self.ops[i].get_end_id()}" for i in range(len(self.ops)-1)

@@ -88,7 +88,7 @@ def construct_collectives(
     ).merge(
         comm_data, left_on="association", right_on="eventId", how="left"
     ).merge(
-        comm_info[["nodeId", "commHash", "commId"]],
+        comm_info[["nodeId", "commHash", "commId"]].drop_duplicates(),
         on=["nodeId", "commHash"], how="left"
     ).drop(columns=["association", "text"])
     
@@ -115,7 +115,7 @@ def construct_p2p(
     p2p_kernels = p2p_kernels[["Bytes", "nWarps", "peer", "proto", "countHi32", "countLo32", "chunkSize", "association"]].merge(
         comm_data, left_on="association", right_on="eventId", how="left"
     ).merge(
-        comm_info[["nodeId", "commHash", "commId"]],
+        comm_info[["nodeId", "commHash", "commId"]].drop_duplicates(),
         on=["nodeId", "commHash"], how="left"
     )
     p2p_ops = {
@@ -139,7 +139,7 @@ if __name__ == "__main__":
     comm_info, comm_ring_info, comm_tree_info = get_communicator_info(nvtx_events)
     profiling_interval = get_profiling_interval(nvtx_events)
     comm_data, coll_info, coll_kernels, p2p_kernels = get_event_info(nvtx_events, profiling_interval)
-    kernel_events = associate_kernel_to_nvtx(comm_data, kernel_events, profiling_interval)
+    comm_data, kernel_events = associate_kernel_to_nvtx(comm_data, kernel_events, profiling_interval)
     comm_data = add_context_parallelism(comm_data)
     
     communicators, gpu_devices = construct_communicators(comm_info, comm_ring_info, comm_tree_info)
