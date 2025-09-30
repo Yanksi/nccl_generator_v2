@@ -39,9 +39,9 @@ class GPUStream:
     def generate_goal_lines(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int]):
         curr_cpu = starting_cpu_id
         last_cpu = curr_cpu
-        prev_end = -1
         def goal_gen():
-            nonlocal curr_cpu, last_cpu, prev_end
+            nonlocal curr_cpu, last_cpu
+            prev_end = -1
             for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
                 primitives = coll.to_primitives()
                 goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic, gpu2node)
@@ -87,4 +87,6 @@ class GPUDevice:
     
     def generate_goal_lines(self, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int], nic: int):
         starting_cpu_id = 0
-        pass
+        for stream_id, stream in tqdm(self.streams.items(), leave=False):
+            starting_cpu_id = yield from stream.generate_goal_lines(starting_cpu_id, nic, gpu2goal_rank, gpu2node)
+        return starting_cpu_id

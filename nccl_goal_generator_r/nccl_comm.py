@@ -170,7 +170,7 @@ class AllReduce(CollectiveOp):
 
         result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
         for elem_offset in range(0, channel_count, loop_count):
-            chunk_comm = NCCLPrimitiveSequantial(self.gpu)
+            chunk_comm = NCCLPrimitiveSequential(self.gpu)
             rem_count = channel_count - elem_offset            
             
             if rem_count < loop_count:
@@ -267,7 +267,7 @@ class AllReduce(CollectiveOp):
             slice_size = self.coll_info.slice_steps * self.coll_info.step_size
             slice_per_chunk = self.coll_info.chunk_steps // self.coll_info.slice_steps
             slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
-            chunk_comm = NCCLPrimitiveSequantial(self.gpu)
+            chunk_comm = NCCLPrimitiveSequential(self.gpu)
 
             if parent is None and len(children) > 0: # root node
                 reduction_comm = NCCLPrimitiveParallel(self.gpu, single_executer=True)
@@ -382,7 +382,7 @@ class AllGather(CollectiveOp):
             slice_size = self.coll_info.slice_steps * self.coll_info.step_size
             slice_per_chunk = self.coll_info.chunk_steps // self.coll_info.slice_steps
             slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
-            chunk_comm = NCCLPrimitiveSequantial(self.gpu)
+            chunk_comm = NCCLPrimitiveSequential(self.gpu)
             # step 0: send the slice of data to next
             if send_buff == recv_buff + (ring_ix * count): # in place send
                 chunk_comm.append(NCCLSend(
@@ -439,11 +439,11 @@ class ReduceScatter(CollectiveOp):
         chunk_count = coll_chnl_info.chunk_count
         channel_count = coll_chnl_info.work_count
         
-        # result = NCCLPrimitiveSequantial()
+        # result = NCCLPrimitiveSequential()
         result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
         # for each chunk, the following communications will be performed
         for chunk_offset in range(0, channel_count, chunk_count):
-            chunk_comm = NCCLPrimitiveSequantial(self.gpu)
+            chunk_comm = NCCLPrimitiveSequential(self.gpu)
             n_elems = min(chunk_count, max(0, channel_count - chunk_offset))
             slice_size = self.coll_info.slice_steps * self.coll_info.step_size
             slice_per_chunk = self.coll_info.chunk_steps // self.coll_info.slice_steps

@@ -80,10 +80,14 @@ class GoalParallel(GoalOp):
     def __init__(self, self_rank: int, cpu: int, ops: Union[list[GoalOp], Generator[GoalOp]]):
         super().__init__(cpu)
         self.ops: Union[List[GoalOp], Generator[GoalOp]] = ops
+        self.single_use = isinstance(ops, Generator)
+        self.consumed = False
         self.starting_op = GoalCalc(self_rank, 0, cpu)
         self.ending_op = GoalCalc(self_rank, 0, cpu)
 
     def add_op(self, op: GoalOp):
+        if self.single_use:
+            raise ValueError("Cannot add op to a GoalParallel initialized with a generator.")
         self.ops.append(op)
     
     def get_start_id(self) -> int:
@@ -93,6 +97,9 @@ class GoalParallel(GoalOp):
         return self.ending_op.get_end_id()
     
     def generate_lines(self) -> Generator[str]:
+        if self.consumed:
+            raise ValueError("This GoalParallel has already been consumed and it is single-use.")
+
         yield from self.starting_op.generate_lines()
         yield from self.ending_op.generate_lines()
 
@@ -100,7 +107,8 @@ class GoalParallel(GoalOp):
             yield from op.generate_lines()
             yield f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}"
             yield f"l{self.ending_op.get_start_id()} requires l{op.get_end_id()}"
-            
+        
+        self.consumed = True and self.single_use
         # results = "\n".join([str(op) for op in self.ops] + [str(self.starting_op), str(self.ending_op)])
         # requirements_pre = "\n".join([
         #     f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}" for op in self.ops
@@ -114,10 +122,14 @@ class GoalSequential(GoalOp):
     def __init__(self, self_rank: int, cpu: int, ops: Union[List[GoalOp], Generator[GoalOp]]):
         super().__init__(cpu)
         self.ops: Union[List[GoalOp], Generator[GoalOp]] = ops
+        self.single_use = isinstance(ops, Generator)
+        self.consumed = False
         self.starting_op = None
         self.ending_op = None
 
     def add_op(self, op: GoalOp):
+        if self.single_use:
+            raise ValueError("Cannot add op to a GoalSequential initialized with a generator.")
         self.ops.append(op)
     
     def get_start_id(self) -> int:
@@ -133,6 +145,8 @@ class GoalSequential(GoalOp):
         return self.ending_op.get_end_id()
 
     def generate_lines(self) -> Generator[str]:
+        if self.consumed:
+            raise ValueError("This GoalSequential has already been consumed and it is single-use.")
         iterator = iter(self.ops)
         self.starting_op = next(iterator)
         self.ending_op = self.starting_op
@@ -144,6 +158,7 @@ class GoalSequential(GoalOp):
             yield from op.generate_lines()
             yield f"l{op.get_start_id()} requires l{prev_op.get_end_id()}"
             prev_op = op
+        self.consumed = True and self.single_use
         # results = "\n".join([str(op) for op in self.ops])
         # requirements = "\n".join([
         #     f"l{self.ops[i+1].get_start_id()} requires l{self.ops[i].get_end_id()}" for i in range(len(self.ops)-1)

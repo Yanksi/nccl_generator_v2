@@ -1,6 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import List, Dict, Type, Union, Optional, Tuple
+from typing import List, Dict, Type, Union, Optional, Tuple, Generator
 from math import ceil
 from gpu import GPUDevice
 from goal import GoalSend, GoalRecv, GoalCalc, GoalSequential, GoalParallel, GoalOp
@@ -112,27 +112,36 @@ class NCCLPrimitiveComm(ABC):
         return self.goal_cache
 
 class NCCLPrimitiveParallel(NCCLPrimitiveComm):
-    def __init__(self, gpu: GPUDevice, single_executer: bool = False):
+    def __init__(self, gpu: GPUDevice, single_executer: bool = False, primitives: Generator[NCCLPrimitiveComm] = None):
         super().__init__(gpu)
         self.single_executer = single_executer
-        self.primitives: List[NCCLPrimitiveComm] = []
+        self.single_use = primitives is not None
+        self.consumed = False
+        self.primitives: List[NCCLPrimitiveComm] = primitives if primitives is not None else []
 
     def add(self, primitive: Union[NCCLPrimitiveComm]) -> None:
+        if self.single_use:
+            raise ValueError("Cannot add primitive to a NCCLPrimitiveParallel initialized with a generator.")
         self.primitives.append(primitive)
     
     def proto_ll(self) -> NCCLPrimitiveComm:
-        result = NCCLPrimitiveParallel(self.gpu, self.single_executer)
-        for p in self.primitives:
-            result.add(p.proto_ll())
+        if self.consumed:
+            raise ValueError("This NCCLPrimitiveParallel has already been consumed and it is single-use.")
+        result = NCCLPrimitiveParallel(self.gpu, self.single_executer, (p.proto_ll() for p in self.primitives))
+        self.consumed = True and self.single_use
         return result
 
     def proto_simple(self) -> NCCLPrimitiveComm:
-        result = NCCLPrimitiveParallel(self.gpu, self.single_executer)
-        for p in self.primitives:
-            result.add(p.proto_simple())
+        if self.consumed:
+            raise ValueError("This NCCLPrimitiveParallel has already been consumed and it is single-use.")
+        result = NCCLPrimitiveParallel(self.gpu, self.single_executer, (p.proto_simple() for p in self.primitives))
+        self.consumed = True and self.single_use
         return result
     
     def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, gpu2node: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+        if self.consumed:
+            raise ValueError("This NCCLPrimitiveParallel has already been consumed and it is single-use.")
+        self.consumed = True and self.single_use
         curr_cpu_start = cpu
         if self.single_executer:
             ops = [p.to_goal(gpu2goal_rank, curr_cpu_start, nic, gpu2node) for p in self.primitives]
@@ -148,42 +157,57 @@ class NCCLPrimitiveParallel(NCCLPrimitiveComm):
 
     def __repr__(self) -> str:
         indent = "  "
-        primitives_repr = [repr(p) for p in self.primitives]
-        for i in range(len(primitives_repr)):
-            primitives_repr[i] = indent + primitives_repr[i].replace("\n", "\n" + indent)
-        return f"NCCLPrimitiveParallel(single_executer={self.single_executer}\n" + ",\n".join(primitives_repr) + ")"
+        if not self.single_use:
+            primitives_repr = [repr(p) for p in self.primitives]
+            for i in range(len(primitives_repr)):
+                primitives_repr[i] = indent + primitives_repr[i].replace("\n", "\n" + indent)
+            return f"NCCLPrimitiveParallel(single_executer={self.single_executer}\n" + ",\n".join(primitives_repr) + ")"
+        else:
+            return f"NCCLPrimitiveParallel(single_executer={self.single_executer}, single_use=True)"
 
-class NCCLPrimitiveSequantial(NCCLPrimitiveComm):
-    def __init__(self, gpu: GPUDevice):
+class NCCLPrimitiveSequential(NCCLPrimitiveComm):
+    def __init__(self, gpu: GPUDevice, primitives: Generator[NCCLPrimitiveComm] = None):
         super().__init__(gpu)
-        self.primitives: List[NCCLPrimitiveComm] = []
+        self.single_use = primitives is not None
+        self.consumed = False
+        self.primitives: List[NCCLPrimitiveComm] = primitives if primitives is not None else []
     
     def append(self, primitive: Union[NCCLPrimitiveComm]) -> None:
+        if self.single_use:
+            raise ValueError("Cannot add primitive to a NCCLPrimitiveSequential initialized with a generator.")
         self.primitives.append(primitive)
     
     def proto_ll(self) -> NCCLPrimitiveComm:
-        result = NCCLPrimitiveSequantial(self.gpu)
-        for p in self.primitives:
-            result.append(p.proto_ll())
+        if self.consumed:
+            raise ValueError("This NCCLPrimitiveSequential has already been consumed and it is single-use.")
+        result = NCCLPrimitiveSequential(self.gpu, (p.proto_ll() for p in self.primitives))
+        self.consumed = True and self.single_use
         return result
     
     def proto_simple(self) -> NCCLPrimitiveComm:
-        result = NCCLPrimitiveSequantial(self.gpu)
-        for p in self.primitives:
-            result.append(p.proto_simple())
+        if self.consumed:
+            raise ValueError("This NCCLPrimitiveSequential has already been consumed and it is single-use.")
+        result = NCCLPrimitiveSequential(self.gpu, (p.proto_simple() for p in self.primitives))
+        self.consumed = True and self.single_use
         return result
     
     def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, gpu2node: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+        if self.consumed:
+            raise ValueError("This NCCLPrimitiveSequential has already been consumed and it is single-use.")
+        self.consumed = True and self.single_use
         ops = [p.to_goal(gpu2goal_rank, cpu, nic, gpu2node) for p in self.primitives]
         max_cpu = max(op[1] for op in ops)
         return GoalSequential(gpu2goal_rank[self.gpu], cpu, list(op[0] for op in ops)), max_cpu
     
     def __repr__(self) -> str:
         indent = "  "
-        primitives_repr = [repr(p) for p in self.primitives]
-        for i in range(len(primitives_repr)):
-            primitives_repr[i] = indent + primitives_repr[i].replace("\n", "\n" + indent)
-        return "NCCLPrimitiveSequantial(\n" + ",\n".join(primitives_repr) + ")"
+        if not self.single_use:
+            primitives_repr = [repr(p) for p in self.primitives]
+            for i in range(len(primitives_repr)):
+                primitives_repr[i] = indent + primitives_repr[i].replace("\n", "\n" + indent)
+            return "NCCLPrimitiveSequential(\n" + ",\n".join(primitives_repr) + ")"
+        else:
+            return f"NCCLPrimitiveSequential(single_use=True)"
 
 class NCCLPrimitive(NCCLPrimitiveComm, ABC):
     """Base class for NCCL primitives."""
@@ -226,28 +250,52 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
                 size=self.size,
                 __proto__=2
             )
-        result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
-        for _ in range(n_chunks):
-            result.add(self.__class__(
-                self.context,
-                self.gpu,
-                source_gpu=self.source_gpu, 
-                target_gpu=self.target_gpu, 
-                size=self.chunk_size,
-                __proto__=2
-            ))
-
-        remaining_size = self.size % self.chunk_size
-        if remaining_size > 0:
-            result.add(self.__class__(
-                self.context,
-                self.gpu,
-                source_gpu=self.source_gpu, 
-                target_gpu=self.target_gpu, 
-                 size=remaining_size,
-                __proto__=2
-            ))
+        
+        def generator():
+            nonlocal self, n_chunks
+            for _ in range(n_chunks):
+                yield self.__class__(
+                    self.context,
+                    self.gpu,
+                    source_gpu=self.source_gpu, 
+                    target_gpu=self.target_gpu, 
+                    size=self.chunk_size,
+                    __proto__=2
+                )
+            remaining_size = self.size % self.chunk_size
+            if remaining_size > 0:
+                yield self.__class__(
+                    self.context,
+                    self.gpu,
+                    source_gpu=self.source_gpu, 
+                    target_gpu=self.target_gpu, 
+                     size=remaining_size,
+                    __proto__=2
+                )
+        result = NCCLPrimitiveParallel(self.gpu, True, generator())
         return result
+        # result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
+        # for _ in range(n_chunks):
+        #     result.add(self.__class__(
+        #         self.context,
+        #         self.gpu,
+        #         source_gpu=self.source_gpu, 
+        #         target_gpu=self.target_gpu, 
+        #         size=self.chunk_size,
+        #         __proto__=2
+        #     ))
+
+        # remaining_size = self.size % self.chunk_size
+        # if remaining_size > 0:
+        #     result.add(self.__class__(
+        #         self.context,
+        #         self.gpu,
+        #         source_gpu=self.source_gpu, 
+        #         target_gpu=self.target_gpu, 
+        #          size=remaining_size,
+        #         __proto__=2
+        #     ))
+        # return result
     
     def send_goal(self, self_goal_rank, target_goal_rank: int, size: int, cpu: int, nic: int, intra_node: bool) -> GoalOp:
         if intra_node:

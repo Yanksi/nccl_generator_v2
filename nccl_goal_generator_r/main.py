@@ -164,12 +164,8 @@ if __name__ == "__main__":
     with open("trace.goal", "w") as f:
         logger.info("writing goal file")
         for gpu in tqdm(gpu_devices.values()):
-            goal_gpu, _ = gpu.generate_goal(gpu2goal_rank, gpu2node, nic=0)
-            lines = goal_gpu.generate_lines()
             f.write(f"rank {gpu2goal_rank[gpu]} {{\n")
-            for line in lines:
+            for line in gpu.generate_goal_lines(gpu2goal_rank, gpu2node, nic=0):
                 f.write(f" {line}\n")
             f.write("}\n")
-            # result = f"rank {gpu2goal_rank[gpu]} {{\n {goal_gpu}\n}}\n"
-            # f.write(result)
 # %%
