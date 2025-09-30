@@ -5,6 +5,7 @@ if TYPE_CHECKING:
 # from nccl_comm import CommOp
 from goal import GoalOp, GoalCalc, GoalSequential, GoalParallel
 from typing import List, Dict, Type, Union, Optional, Tuple
+from tqdm import tqdm
 
 
 class GPUStream:
@@ -25,7 +26,7 @@ class GPUStream:
         last_cpu = curr_cpu
         prev_end = -1
         goal_ops = []
-        for coll, start, end in zip(self.collectives, self.coll_starts, self.coll_ends):
+        for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
             primitives = coll.to_primitives()
             goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic, gpu2node)
             last_cpu = max(last_cpu, _last_cpu)
@@ -53,7 +54,7 @@ class GPUDevice:
     def generate_goal(self, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int], nic: int) -> int:
         goal_result = []
         starting_cpu_id = 0
-        for stream_id, stream in self.streams.items():
+        for stream_id, stream in tqdm(self.streams.items(), leave=False):
             goal_op, starting_cpu_id = stream.generate_goal(starting_cpu_id, nic, gpu2goal_rank, gpu2node)
             goal_result.append(goal_op)
         return GoalParallel(gpu2goal_rank[self], 0, goal_result), starting_cpu_id

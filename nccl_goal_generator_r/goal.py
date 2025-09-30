@@ -1,6 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from typing import List, Dict, Type, Union, Optional, Tuple
+from typing import List, Dict, Type, Union, Optional, Tuple, Iterator
 
 class GoalOp(ABC):
     """
@@ -18,8 +18,11 @@ class GoalOp(ABC):
         pass
     
     @abstractmethod
-    def __str__(self):
+    def generate_lines(self) -> Iterator[str]:
         pass
+    
+    def __str__(self):
+        return "\n".join(self.generate_lines())
 
 class GoalOpAtom(GoalOp, ABC):
     task_id_for_rank: Dict[int, int] = {}
@@ -50,10 +53,10 @@ class GoalSend(GoalTraffic):
         self.message_id = GoalSend.send_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
         GoalSend.send_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
 
-    def __str__(self):
+    def generate_lines(self) -> Iterator[str]:
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
-        return f"l{self.id}: send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
-
+        yield f"l{self.id}: send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
+        
 class GoalRecv(GoalTraffic):
     recv_message_id: Dict[Tuple[int, int, int], int] = {}
     def __init__(self, self_rank: int, peer_rank: int, size: int, cpu: int, nic: int, context: int):
@@ -61,17 +64,17 @@ class GoalRecv(GoalTraffic):
         self.message_id = GoalRecv.recv_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
         GoalRecv.recv_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
     
-    def __str__(self):
+    def generate_lines(self) -> Iterator[str]:
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
-        return f"l{self.id}: recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
+        yield f"l{self.id}: recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
     
 class GoalCalc(GoalOpAtom):
     def __init__(self, self_rank: int, duration: int, cpu: int):
         super().__init__(self_rank, cpu)
         self.duration = duration
     
-    def __str__(self):
-        return f"l{self.id}: calc {self.duration} cpu {self.cpu}"
+    def generate_lines(self) -> Iterator[str]:
+        yield f"l{self.id}: calc {self.duration} cpu {self.cpu}"
 
 class GoalParallel(GoalOp):
     def __init__(self, self_rank: int, cpu: int, ops: list[GoalOp]):
@@ -89,15 +92,25 @@ class GoalParallel(GoalOp):
     def get_end_id(self) -> int:
         return self.ending_op.get_end_id()
     
-    def __str__(self):
-        results = "\n".join([str(op) for op in self.ops] + [str(self.starting_op), str(self.ending_op)])
-        requirements_pre = "\n".join([
-            f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}" for op in self.ops
-        ])
-        requirements_post = "\n".join([
-            f"l{self.ending_op.get_start_id()} requires l{op.get_end_id()}" for op in self.ops
-        ])
-        return f"{results}\n{requirements_pre}\n{requirements_post}"
+    def generate_lines(self) -> Iterator[str]:
+        for op in self.ops:
+            yield from op.generate_lines()
+        
+        yield from self.starting_op.generate_lines()
+        yield from self.ending_op.generate_lines()
+        
+        for op in self.ops:
+            yield f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}"
+        for op in self.ops:
+            yield f"l{self.ending_op.get_start_id()} requires l{op.get_end_id()}"
+        # results = "\n".join([str(op) for op in self.ops] + [str(self.starting_op), str(self.ending_op)])
+        # requirements_pre = "\n".join([
+        #     f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}" for op in self.ops
+        # ])
+        # requirements_post = "\n".join([
+        #     f"l{self.ending_op.get_start_id()} requires l{op.get_end_id()}" for op in self.ops
+        # ])
+        # return f"{results}\n{requirements_pre}\n{requirements_post}"
 
 class GoalSequential(GoalOp):
     def __init__(self, self_rank: int, cpu: int, ops: list[GoalOp]):
@@ -113,9 +126,13 @@ class GoalSequential(GoalOp):
     def get_end_id(self) -> int:
         return self.ops[-1].get_end_id() if self.ops else -1
     
-    def __str__(self):
-        results = "\n".join([str(op) for op in self.ops])
-        requirements = "\n".join([
-            f"l{self.ops[i+1].get_start_id()} requires l{self.ops[i].get_end_id()}" for i in range(len(self.ops)-1)
-        ])
-        return f"{results}\n{requirements}"
+    def generate_lines(self) -> Iterator[str]:
+        for op in self.ops:
+            yield from op.generate_lines()
+        for i in range(len(self.ops)-1):
+            yield f"l{self.ops[i+1].get_start_id()} requires l{self.ops[i].get_end_id()}"
+        # results = "\n".join([str(op) for op in self.ops])
+        # requirements = "\n".join([
+        #     f"l{self.ops[i+1].get_start_id()} requires l{self.ops[i].get_end_id()}" for i in range(len(self.ops)-1)
+        # ])
+        # return f"{results}\n{requirements}"

@@ -6,6 +6,9 @@ from tqdm import tqdm
 import pandas as pd
 import logging
 from typing import Dict, Tuple
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import aiofiles
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -147,12 +150,26 @@ if __name__ == "__main__":
     gpu2node = {gpu: gpu_id[0] for gpu_id, gpu in gpu_devices.items()}
 
     init_data("npkit_benchmark_results/ault/npkit_data_summary_Simple.json", "npkit_benchmark_results/ault/npkit_data_summary_LL.json")
-
+    
+    # async def write_goals_buffered():
+    #     logger.info("writing goal file")
+    #     write_tasks = []
+    #     async with aiofiles.open("trace.goal", "w") as f:
+    #         for gpu in tqdm(gpu_devices.values()):
+    #             goal_gpu, _ = gpu.generate_goal(gpu2goal_rank, gpu2node, nic=0)
+    #             result = f"rank {gpu2goal_rank[gpu]} {{\n {goal_gpu}\n}}\n"
+    #             write_tasks.append(f.write(result))
+    #         await asyncio.gather(*write_tasks)
+    # asyncio.run(write_goals_buffered())
     with open("trace.goal", "w") as f:
         logger.info("writing goal file")
         for gpu in tqdm(gpu_devices.values()):
-            f.write(f"rank {gpu2goal_rank[gpu]} {{\n")
             goal_gpu, _ = gpu.generate_goal(gpu2goal_rank, gpu2node, nic=0)
-            f.write(str(goal_gpu))
+            lines = goal_gpu.generate_lines()
+            f.write(f"rank {gpu2goal_rank[gpu]} {{\n")
+            for line in lines:
+                f.write(f" {line}\n")
             f.write("}\n")
+            # result = f"rank {gpu2goal_rank[gpu]} {{\n {goal_gpu}\n}}\n"
+            # f.write(result)
 # %%
