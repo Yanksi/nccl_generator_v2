@@ -19,7 +19,7 @@ def construct_communicators(comm_info: pd.DataFrame, comm_ring_info: pd.DataFram
 
     # construct GPUDevice objects
     gpus_df = comm_info[["nodeId", "pid"]].drop_duplicates()
-    gpu_devices = {(row['nodeId'], row['pid']): GPUDevice(i) for i, (_, row) in enumerate(gpus_df.iterrows())}
+    gpu_devices = {(row['nodeId'], row['pid']): GPUDevice(i, int(row['nodeId'])) for i, (_, row) in enumerate(gpus_df.iterrows())}
     comm_info = comm_info.copy()
     comm_info["gpu"] = comm_info.apply(lambda row: gpu_devices[(row['nodeId'], row['pid'])], axis=1)
     comm_gpus_df = comm_info.sort_values("rank").groupby(["commId"]).aggregate({"gpu": list}).reset_index()
@@ -165,7 +165,7 @@ if __name__ == "__main__":
         logger.info("writing goal file")
         for gpu in tqdm(gpu_devices.values()):
             f.write(f"rank {gpu2goal_rank[gpu]} {{\n")
-            for line in gpu.generate_goal_lines(gpu2goal_rank, gpu2node, nic=0):
+            for line in gpu.generate_goal_lines(gpu2goal_rank, nic=0):
                 f.write(f" {line}\n")
             f.write("}\n")
 # %%

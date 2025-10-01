@@ -103,12 +103,12 @@ class NCCLPrimitiveComm(ABC):
         pass
 
     @abstractmethod
-    def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, gpu2node: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+    def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int) -> Tuple[GoalOp, int]:
         pass
 
-    def to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int,  gpu2node: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+    def to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int) -> Tuple[GoalOp, int]:
         if not hasattr(self, 'goal_cache'):
-            self.goal_cache = self._to_goal(gpu2goal_rank, cpu, nic, gpu2node)
+            self.goal_cache = self._to_goal(gpu2goal_rank, cpu, nic)
         return self.goal_cache
 
 class NCCLPrimitiveParallel(NCCLPrimitiveComm):
@@ -138,19 +138,19 @@ class NCCLPrimitiveParallel(NCCLPrimitiveComm):
         self.consumed = True and self.single_use
         return result
     
-    def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, gpu2node: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+    def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int) -> Tuple[GoalOp, int]:
         if self.consumed:
             raise ValueError("This NCCLPrimitiveParallel has already been consumed and it is single-use.")
         self.consumed = True and self.single_use
         curr_cpu_start = cpu
         if self.single_executer:
-            ops = [p.to_goal(gpu2goal_rank, curr_cpu_start, nic, gpu2node) for p in self.primitives]
+            ops = [p.to_goal(gpu2goal_rank, curr_cpu_start, nic) for p in self.primitives]
             max_cpu = max(op[1] for op in ops)
             return GoalParallel(gpu2goal_rank[self.gpu], curr_cpu_start, list(op[0] for op in ops)), max_cpu
         else:
             ops = []
             for p in self.primitives:
-                op, curr_cpu_end = p.to_goal(gpu2goal_rank, curr_cpu_start, nic, gpu2node)
+                op, curr_cpu_end = p.to_goal(gpu2goal_rank, curr_cpu_start, nic)
                 ops.append(op)
                 curr_cpu_start = curr_cpu_end
             return GoalParallel(gpu2goal_rank[self.gpu], curr_cpu_start, ops), curr_cpu_start
@@ -191,11 +191,11 @@ class NCCLPrimitiveSequential(NCCLPrimitiveComm):
         self.consumed = True and self.single_use
         return result
     
-    def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, gpu2node: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+    def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int) -> Tuple[GoalOp, int]:
         if self.consumed:
             raise ValueError("This NCCLPrimitiveSequential has already been consumed and it is single-use.")
         self.consumed = True and self.single_use
-        ops = [p.to_goal(gpu2goal_rank, cpu, nic, gpu2node) for p in self.primitives]
+        ops = [p.to_goal(gpu2goal_rank, cpu, nic) for p in self.primitives]
         max_cpu = max(op[1] for op in ops)
         return GoalSequential(gpu2goal_rank[self.gpu], cpu, list(op[0] for op in ops)), max_cpu
     
@@ -319,12 +319,12 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
     def _p_to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, intra_node_send: bool, intra_node_recv: bool) -> GoalOp:
         pass
 
-    def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, gpu2node: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+    def _to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int) -> Tuple[GoalOp, int]:
         # check whether the send and recv are intra-node
         if self.__proto__ == -1:
             raise ValueError("Primitive protocol not specified.")
-        intra_send = gpu2node[self.gpu] == gpu2node[self.target_gpu] if self.target_gpu else False
-        intra_recv = gpu2node[self.gpu] == gpu2node[self.source_gpu] if self.source_gpu else False
+        intra_send = self.gpu.node_id == self.target_gpu.node_id if self.target_gpu else False
+        intra_recv = self.gpu.node_id == self.source_gpu.node_id if self.source_gpu else False
         return self._p_to_goal(gpu2goal_rank, cpu, nic, intra_send, intra_recv), cpu + 1
 
 

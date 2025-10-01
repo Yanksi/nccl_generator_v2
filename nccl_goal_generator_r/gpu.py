@@ -21,14 +21,14 @@ class GPUStream:
         self.coll_starts.append(start)
         self.coll_ends.append(end)
     
-    def generate_goal(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+    def generate_goal(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
         curr_cpu = starting_cpu_id
         last_cpu = curr_cpu
         prev_end = -1
         goal_ops = []
         for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
             primitives = coll.to_primitives()
-            goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic, gpu2node)
+            goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
             last_cpu = max(last_cpu, _last_cpu)
             if prev_end > 0:
                 goal_ops.append(GoalCalc(starting_cpu_id, start - prev_end, curr_cpu))
@@ -36,7 +36,7 @@ class GPUStream:
             prev_end = end
         return GoalSequential(gpu2goal_rank[self.self_gpu], starting_cpu_id, goal_ops), last_cpu
     
-    def generate_goal_lines(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int]):
+    def generate_goal_lines(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int]):
         curr_cpu = starting_cpu_id
         last_cpu = curr_cpu
         def goal_gen():
@@ -44,7 +44,7 @@ class GPUStream:
             prev_end = -1
             for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
                 primitives = coll.to_primitives()
-                goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic, gpu2node)
+                goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
                 last_cpu = max(last_cpu, _last_cpu)
                 if prev_end > 0:
                     yield GoalCalc(starting_cpu_id, start - prev_end, curr_cpu)
@@ -59,9 +59,10 @@ class GPUStream:
         return f"GPUStream(context_info={self.context_info}, self_gpu={self.self_gpu}, num_collectives={len(self.collectives)})"
 
 class GPUDevice:
-    def __init__(self, id: int):
+    def __init__(self, id: int, node_id: int = -1):
         self.id: int = id
         self.streams: Dict[str, GPUStream] = {}
+        self.node_id: int = node_id
     
     def __repr__(self):
         return f"GPUDevice(id={self.id})"
@@ -77,16 +78,16 @@ class GPUDevice:
     def add_collective(self, stream: str, coll: CommOp, start: int, end: int, context: int = -1) -> None:
         self.streams.setdefault(stream, GPUStream(self, context)).add_collective(coll, start, end)
 
-    def generate_goal(self, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int], nic: int) -> int:
+    def generate_goal(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int) -> int:
         goal_result = []
         starting_cpu_id = 0
         for stream_id, stream in tqdm(self.streams.items(), leave=False):
-            goal_op, starting_cpu_id = stream.generate_goal(starting_cpu_id, nic, gpu2goal_rank, gpu2node)
+            goal_op, starting_cpu_id = stream.generate_goal(starting_cpu_id, nic, gpu2goal_rank)
             goal_result.append(goal_op)
         return GoalParallel(gpu2goal_rank[self], 0, goal_result), starting_cpu_id
     
-    def generate_goal_lines(self, gpu2goal_rank: Dict[GPUDevice, int], gpu2node: Dict[GPUDevice, int], nic: int):
+    def generate_goal_lines(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int):
         starting_cpu_id = 0
         for stream_id, stream in tqdm(self.streams.items(), leave=False):
-            starting_cpu_id = yield from stream.generate_goal_lines(starting_cpu_id, nic, gpu2goal_rank, gpu2node)
+            starting_cpu_id = yield from stream.generate_goal_lines(starting_cpu_id, nic, gpu2goal_rank)
         return starting_cpu_id
