@@ -28,14 +28,19 @@ class GoalOpAtom(GoalOp, ABC):
     task_id_for_rank: Dict[int, int] = {}
     def __init__(self, self_rank: int, cpu: int):
         super().__init__(cpu)
-        self.id = GoalOpAtom.task_id_for_rank.setdefault(self_rank, 0)
         self.self_rank = self_rank
-        GoalOpAtom.task_id_for_rank[self_rank] += 1
+        self.id: int = -1
 
     def get_start_id(self) -> int:
-        return self.id
+        return self.get_id()
     
     def get_end_id(self) -> int:
+        return self.get_id()
+    
+    def get_id(self) -> None:
+        if self.id < 0:
+            self.id = GoalOpAtom.task_id_for_rank.setdefault(self.self_rank, 0)
+            GoalOpAtom.task_id_for_rank[self.self_rank] += 1
         return self.id
     
 class GoalTraffic(GoalOpAtom, ABC):
@@ -55,7 +60,7 @@ class GoalSend(GoalTraffic):
 
     def generate_lines(self) -> Generator[str]:
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
-        yield f"l{self.id}: send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
+        yield f"l{self.get_id()}: send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
         
 class GoalRecv(GoalTraffic):
     recv_message_id: Dict[Tuple[int, int, int], int] = {}
@@ -66,15 +71,15 @@ class GoalRecv(GoalTraffic):
     
     def generate_lines(self) -> Generator[str]:
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
-        yield f"l{self.id}: recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
-    
+        yield f"l{self.get_id()}: recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
+
 class GoalCalc(GoalOpAtom):
     def __init__(self, self_rank: int, duration: int, cpu: int):
         super().__init__(self_rank, cpu)
         self.duration = duration
     
     def generate_lines(self) -> Generator[str]:
-        yield f"l{self.id}: calc {self.duration} cpu {self.cpu}"
+        yield f"l{self.get_id()}: calc {self.duration} cpu {self.cpu}"
 
 class GoalParallel(GoalOp):
     def __init__(self, self_rank: int, cpu: int, ops: Union[list[GoalOp], Generator[GoalOp]]):
@@ -101,11 +106,12 @@ class GoalParallel(GoalOp):
             raise ValueError("This GoalParallel has already been consumed and it is single-use.")
 
         yield from self.starting_op.generate_lines()
-        yield from self.ending_op.generate_lines()
-
         for op in self.ops:
             yield from op.generate_lines()
             yield f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}"
+        
+        yield from self.ending_op.generate_lines()
+        for op in self.ops:
             yield f"l{self.ending_op.get_start_id()} requires l{op.get_end_id()}"
         
         self.consumed = True and self.single_use
