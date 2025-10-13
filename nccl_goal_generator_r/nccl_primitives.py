@@ -142,18 +142,17 @@ class NCCLPrimitiveParallel(NCCLPrimitiveComm):
         if self.consumed:
             raise ValueError("This NCCLPrimitiveParallel has already been consumed and it is single-use.")
         self.consumed = True and self.single_use
-        curr_cpu_start = cpu
         if self.single_executer:
-            ops = [p.to_goal(gpu2goal_rank, curr_cpu_start, nic) for p in self.primitives]
+            ops = [p.to_goal(gpu2goal_rank, cpu, nic) for p in self.primitives]
             max_cpu = max(op[1] for op in ops)
-            return GoalParallel(gpu2goal_rank[self.gpu], curr_cpu_start, list(op[0] for op in ops)), max_cpu
+            return GoalParallel(gpu2goal_rank[self.gpu], cpu, list(op[0] for op in ops)), max_cpu
         else:
             ops = []
+            curr_cpu_start = cpu
             for p in self.primitives:
-                op, curr_cpu_end = p.to_goal(gpu2goal_rank, curr_cpu_start, nic)
+                op, curr_cpu_start = p.to_goal(gpu2goal_rank, curr_cpu_start, nic)
                 ops.append(op)
-                curr_cpu_start = curr_cpu_end
-            return GoalParallel(gpu2goal_rank[self.gpu], curr_cpu_start, ops), curr_cpu_start
+            return GoalParallel(gpu2goal_rank[self.gpu], cpu, ops), curr_cpu_start
 
     def __repr__(self) -> str:
         indent = "  "
