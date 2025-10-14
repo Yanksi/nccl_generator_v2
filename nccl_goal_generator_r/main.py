@@ -163,9 +163,11 @@ if __name__ == "__main__":
     # asyncio.run(write_goals_buffered())
     with open("trace.goal", "w") as f:
         logger.info("writing goal file")
-        for gpu in tqdm(gpu_devices.values()):
+        gpus = gpu_devices.values()
+        f.write(f"num_ranks {len(gpus)}\n")
+        for gpu in tqdm(gpus):
             f.write(f"rank {gpu2goal_rank[gpu]} {{\n")
             for line in gpu.generate_goal_lines(gpu2goal_rank, nic=0):
-                f.write(f" {line}\n")
+                f.write(f"{line}\n")
             f.write("}\n")
 # %%
