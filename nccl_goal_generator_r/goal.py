@@ -60,7 +60,7 @@ class GoalSend(GoalTraffic):
 
     def generate_lines(self) -> Generator[str]:
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
-        yield f"l{self.get_id()}: send {self.size}b to {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
+        yield f"l{self.get_id()}: send {self.size}b to {self.peer_rank} tag {tag} cpu {self.cpu} nic {self.nic}"
         
 class GoalRecv(GoalTraffic):
     recv_message_id: Dict[Tuple[int, int, int], int] = {}
@@ -71,7 +71,7 @@ class GoalRecv(GoalTraffic):
     
     def generate_lines(self) -> Generator[str]:
         tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
-        yield f"l{self.get_id()}: recv {self.size}b from {self.peer_rank} cpu {self.cpu} nic {self.nic} tag {tag}"
+        yield f"l{self.get_id()}: recv {self.size}b from {self.peer_rank} tag {tag} cpu {self.cpu} nic {self.nic}"
 
 class GoalCalc(GoalOpAtom):
     def __init__(self, self_rank: int, duration: int, cpu: int):
