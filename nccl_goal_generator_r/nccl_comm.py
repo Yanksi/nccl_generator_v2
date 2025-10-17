@@ -80,6 +80,53 @@ class Recv(P2POp):
         return NCCLRecv(self.context, self.gpu, source_gpu=self.peer_gpu, size=self.size, chunk_size=self.chunk_size).proto_simple()
 
 
+class AllToAll(CommOp):
+    def __init__(self, gpu: GPUDevice, size_per_peer: int, comm: Communicator, chunk_size: int, context: int):
+        super().__init__(gpu, context)
+        self.size_per_peer = size_per_peer
+        self.comm = comm
+        self.chunk_size = chunk_size
+    
+    def to_primitives(self) -> NCCLPrimitiveComm:
+        n_ranks = self.comm.n_ranks
+        def generator():
+            for peer_rank in range(self.comm.gpu2rank[self.gpu]):
+                # Recv from peer
+                yield NCCLRecv(
+                    self.context,
+                    self.gpu,
+                    source_gpu=self.comm.rank2gpu[peer_rank],
+                    size=self.size_per_peer,
+                    chunk_size=self.chunk_size
+                ).proto_simple()
+                yield NCCLSend(
+                    self.context,
+                    self.gpu,
+                    target_gpu=self.comm.rank2gpu[peer_rank],
+                    size=self.size_per_peer,
+                    chunk_size=self.chunk_size
+                ).proto_simple()
+            for peer_rank in range(self.comm.gpu2rank[self.gpu] + 1, n_ranks):
+                # Send to peer
+                yield NCCLSend(
+                    self.context,
+                    self.gpu,
+                    target_gpu=self.comm.rank2gpu[peer_rank],
+                    size=self.size_per_peer,
+                    chunk_size=self.chunk_size
+                ).proto_simple()
+                yield NCCLRecv(
+                    self.context,
+                    self.gpu,
+                    source_gpu=self.comm.rank2gpu[peer_rank],
+                    size=self.size_per_peer,
+                    chunk_size=self.chunk_size
+                ).proto_simple()
+    
+        result = NCCLPrimitiveParallel(self.gpu, True, generator())
+        return result
+
+
 @dataclass
 class CollInfo:
     root_rank: int
