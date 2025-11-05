@@ -180,7 +180,7 @@ if __name__ == "__main__":
     #             write_tasks.append(f.write(result))
     #         await asyncio.gather(*write_tasks)
     # asyncio.run(write_goals_buffered())
-    with open("allreduce_tree_artificial_zero_comm.goal", "w") as f:
+    with open("allreduce_tree_artificial.goal", "w") as f:
         logger.info("writing goal file")
         gpus = [gpu for gpu in gpu_devices.values() if len(gpu.streams) > 0]
         f.write(f"num_ranks {len(gpus)}\n")
