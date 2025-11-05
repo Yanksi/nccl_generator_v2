@@ -42,7 +42,8 @@ def construct_communicators(comm_info: pd.DataFrame, comm_ring_info: pd.DataFram
 
 algo_mapping = {
     0: CollAlgo.TREE,
-    1: CollAlgo.RING,
+    # 1: CollAlgo.RING,
+    1: CollAlgo.TREE # use TREE for RING as well
 }
 proto_mapping = {
     0: NCCLProto.LL,
@@ -94,23 +95,31 @@ def construct_collectives(
     
     coll_info["gpu"] = coll_info.apply(lambda row: gpu_devices[(row['nodeId'], row['pid'])], axis=1)
     coll_info["comm"] = coll_info.apply(lambda row: communicators[row['commId']], axis=1)
-    collective_ops = {
+    # collective_ops = {
+    #     "AllReduce": AllReduce,
+    #     "AllGather": AllGather,
+    #     "ReduceScatter": ReduceScatter,
+    #     "Broadcast": Broadcast,
+    #     "Reduce": Reduce
+    # }
+    collective_ops = { # make all collectives as AllReduce for testing
         "AllReduce": AllReduce,
-        "AllGather": AllGather,
-        "ReduceScatter": ReduceScatter,
-        "Broadcast": Broadcast,
-        "Reduce": Reduce
+        "AllGather": AllReduce,
+        "ReduceScatter": AllReduce,
+        "Broadcast": AllReduce,
+        "Reduce": AllReduce
     }
     coll_info["context_label"] = coll_info.apply(lambda row: context_labels.get(row['parallelism'], 0), axis=1)
     coll_info["collOp"] = coll_info.apply(lambda row: collective_ops[row['collective']](row['gpu'], row['comm'], row['collInfo'], row['chnlInfo'], row['context_label']), axis=1)
     
     logged_gpus = set()
     logged_communicator = None
-    coll_info = coll_info.sort_values(["data_size", "start"], ascending=[False, True])
+    coll_info = coll_info.sort_values(["data_size", "start"], ascending=[True, True])
     for _, row in coll_info.iterrows():
         if row['gpu'] not in logged_gpus and (row['commId'] == logged_communicator or logged_communicator is None):
-            # if row['parallelism'] == "DP":
-            if row["data_size"] > 1000 and row["collective"] == "AllGather":
+            if row['parallelism'] == "DP" and row["collective"] == "ReduceScatter" and row["data_size"] > 1000:
+                print(row["data_size"])
+            # if row["data_size"] > 1000 and row["collective"] == "AllReduce":
                 row['gpu'].add_collective(row['stream'], row['collOp'], row['start'], row['end'])
                 logged_gpus.add(row['gpu'])
                 logged_communicator = row['commId']
@@ -171,7 +180,7 @@ if __name__ == "__main__":
     #             write_tasks.append(f.write(result))
     #         await asyncio.gather(*write_tasks)
     # asyncio.run(write_goals_buffered())
-    with open("trace.goal", "w") as f:
+    with open("allreduce_tree_artificial_zero_comm.goal", "w") as f:
         logger.info("writing goal file")
         gpus = [gpu for gpu in gpu_devices.values() if len(gpu.streams) > 0]
         f.write(f"num_ranks {len(gpus)}\n")

@@ -59,7 +59,7 @@ class GoalSend(GoalTraffic):
         GoalSend.send_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
 
     def generate_lines(self) -> Generator[str]:
-        tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
+        tag =  str(self.message_id).zfill(6) + str(self.context).zfill(2)
         yield f"l{self.get_id()}: send {self.size}b to {self.peer_rank} tag {tag} cpu {self.cpu} nic {self.nic}"
         
 class GoalRecv(GoalTraffic):
@@ -70,7 +70,7 @@ class GoalRecv(GoalTraffic):
         GoalRecv.recv_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
     
     def generate_lines(self) -> Generator[str]:
-        tag = str(self.context).zfill(2) + str(self.message_id).zfill(6)
+        tag = str(self.message_id).zfill(6) + str(self.context).zfill(2)
         yield f"l{self.get_id()}: recv {self.size}b from {self.peer_rank} tag {tag} cpu {self.cpu} nic {self.nic}"
 
 class GoalCalc(GoalOpAtom):

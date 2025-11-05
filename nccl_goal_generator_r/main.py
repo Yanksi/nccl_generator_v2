@@ -9,6 +9,7 @@ from typing import Dict, Tuple
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import aiofiles
+import pathlib
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -133,7 +134,12 @@ def construct_p2p(
 
 if __name__ == "__main__":
 #%%
-    traces = find_all_traces("../traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite")
+    # get the path of the current script
+    script_path = pathlib.Path(__file__).resolve()
+    # get the parent directory
+    parent_dir = script_path.parent
+    trace_dir = parent_dir / "../traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite"
+    traces = find_all_traces(trace_dir)
     kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)
     comm_info, comm_ring_info, comm_tree_info = get_communicator_info(nvtx_events)

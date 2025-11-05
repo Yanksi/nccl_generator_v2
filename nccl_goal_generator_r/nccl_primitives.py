@@ -10,6 +10,9 @@ import json
 import random
 from scipy import interpolate
 
+zero_price_reduction_copy = False
+zero_price_communication = False
+
 def intra_node_transfer_time(size: int) -> int:
     bw = 150
     return size * 10**9 // (bw * 10**9 * 1 * 2)
@@ -36,6 +39,8 @@ def init_data(simple_file, ll_file):
 
 @lru_cache(maxsize=2048)
 def reduction_time(data_size: int, proto: int) -> int:
+    if zero_price_reduction_copy:
+        return 0
     data = _DATA_CACHE[proto]
 
     if str(data_size) in data['NPKIT_EVENT_GPU_RECV_REDUCE_SEND']:
@@ -62,6 +67,8 @@ def reduction_time(data_size: int, proto: int) -> int:
 
 @lru_cache(maxsize=2048)
 def copy_time(data_size: int, proto: int) -> int:
+    if zero_price_reduction_copy:
+        return 0
     data = _DATA_CACHE[proto]
 
     if str(data_size) in data['NPKIT_EVENT_GPU_DIRECT_RECV_COPY_SEND']:
@@ -297,6 +304,8 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
         # return result
     
     def send_goal(self, self_goal_rank, target_goal_rank: int, size: int, cpu: int, nic: int, intra_node: bool) -> GoalOp:
+        if zero_price_communication:
+            return GoalSend(self_goal_rank, target_goal_rank, 0, cpu, nic, self.context)
         if intra_node:
             return GoalSequential(self_goal_rank, cpu,
                 [GoalCalc(self_goal_rank, intra_node_transfer_time(size), cpu),
@@ -306,6 +315,8 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
             return GoalSend(self_goal_rank, target_goal_rank, size, cpu, nic, self.context)
 
     def recv_goal(self, self_goal_rank, source_goal_rank: int, size: int, cpu: int, nic: int, intra_node: bool) -> GoalOp:
+        if zero_price_communication:
+            return GoalRecv(self_goal_rank, source_goal_rank, 0, cpu, nic, self.context)
         if intra_node:
             return GoalSequential(self_goal_rank, cpu,
                 [GoalRecv(self_goal_rank, source_goal_rank, 0, cpu, nic, self.context),
