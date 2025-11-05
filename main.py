@@ -138,7 +138,7 @@ if __name__ == "__main__":
     script_path = pathlib.Path(__file__).resolve()
     # get the parent directory
     parent_dir = script_path.parent
-    trace_dir = parent_dir / "../traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite"
+    trace_dir = parent_dir / "traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite"
     traces = find_all_traces(trace_dir)
     kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)

@@ -151,7 +151,7 @@ def construct_p2p(
 
 if __name__ == "__main__":
 #%%
-    traces = find_all_traces("../traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite")
+    traces = find_all_traces("traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite")
     kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)
     comm_info, comm_ring_info, comm_tree_info = get_communicator_info(nvtx_events)
