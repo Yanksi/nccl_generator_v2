@@ -120,7 +120,7 @@ def construct_collectives(
             if row['parallelism'] == "DP" and row["collective"] == "ReduceScatter" and row["data_size"] > 1000:
                 print(row["data_size"])
             # if row["data_size"] > 1000 and row["collective"] == "AllReduce":
-                row['gpu'].add_collective(row['stream'], row['collOp'], row['start'], row['end'])
+                row['gpu'].add_collective(row['stream'], row['collOp'], row['start'], row['end'], row['context_label'])
                 logged_gpus.add(row['gpu'])
                 logged_communicator = row['commId']
 
@@ -146,7 +146,7 @@ def construct_p2p(
     p2p_kernels["p2pOp"] = p2p_kernels.apply(lambda row: p2p_ops[row['collective']](row["gpu"], row["Bytes"], row["peer"], row["comm"], row["chunkSize"], row['context_label']), axis=1)
     
     for _, row in p2p_kernels.iterrows():
-        row['gpu'].add_collective(row["stream"], row['p2pOp'], row['start'], row['end'])
+        row['gpu'].add_collective(row["stream"], row['p2pOp'], row['start'], row['end'], row['context_label'])
 
 
 if __name__ == "__main__":
@@ -168,7 +168,7 @@ if __name__ == "__main__":
     gpu2goal_rank = {gpu: i for i, gpu in enumerate(g for g in gpu_devices.values() if len(g.streams) > 0)}
     gpu2node = {gpu: gpu_id[0] for gpu_id, gpu in gpu_devices.items()}
 
-    init_data("npkit_benchmark_results/ault/npkit_data_summary_Simple.json", "npkit_benchmark_results/ault/npkit_data_summary_LL.json")
+    init_data("nccl_goal_generator_r/npkit_benchmark_results/ault/npkit_data_summary_Simple.json", "nccl_goal_generator_r/npkit_benchmark_results/ault/npkit_data_summary_LL.json")
     
     # async def write_goals_buffered():
     #     logger.info("writing goal file")
@@ -180,7 +180,7 @@ if __name__ == "__main__":
     #             write_tasks.append(f.write(result))
     #         await asyncio.gather(*write_tasks)
     # asyncio.run(write_goals_buffered())
-    with open("allreduce_tree_artificial.goal", "w") as f:
+    with open("allreduce_tree_artificial_zero_comm.goal", "w") as f:
         logger.info("writing goal file")
         gpus = [gpu for gpu in gpu_devices.values() if len(gpu.streams) > 0]
         f.write(f"num_ranks {len(gpus)}\n")

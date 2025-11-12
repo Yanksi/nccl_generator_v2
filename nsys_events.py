@@ -337,6 +337,8 @@ def add_context_parallelism(comm_data: pd.DataFrame):
         if len(label_seq) % 2 != 0:
             return False
         first_two = label_seq[:2]
+        if first_two not in ["EF", "FE"]:
+            return False
         for i in range(0, len(label_seq), 2):
             if label_seq[i:i+2] != first_two:
                 return False

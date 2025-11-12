@@ -53,6 +53,7 @@ class GPUStream:
         goal_op = GoalSequential(gpu2goal_rank[self.self_gpu], starting_cpu_id, goal_gen())
         for line in goal_op.generate_lines():
             yield line
+        tqdm.write(f"Generated goals for stream on GPU {self.self_gpu.id} with context {self.context_info} for {len(self.collectives)} collectives.")
         return last_cpu
     
     def __repr__(self):
