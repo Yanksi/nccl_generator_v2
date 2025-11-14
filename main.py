@@ -156,7 +156,7 @@ if __name__ == "__main__":
     gpu2goal_rank = {gpu: i for i, gpu in enumerate(gpu_devices.values())}
     gpu2node = {gpu: gpu_id[0] for gpu_id, gpu in gpu_devices.items()}
 
-    init_data("nccl_goal_generator_r/npkit_benchmark_results/ault/npkit_data_summary_Simple.json", "nccl_goal_generator_r/npkit_benchmark_results/ault/npkit_data_summary_LL.json")
+    init_data("npkit_benchmark_results/ault/npkit_data_summary_Simple.json", "npkit_benchmark_results/ault/npkit_data_summary_LL.json")
     
     # async def write_goals_buffered():
     #     logger.info("writing goal file")
