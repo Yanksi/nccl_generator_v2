@@ -12,6 +12,7 @@ from scipy import interpolate
 
 zero_price_reduction_copy = False
 zero_price_communication = False
+enable_intra_node_transfer = False
 
 def intra_node_transfer_time(size: int) -> int:
     bw = 150
@@ -306,24 +307,22 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
     def send_goal(self, self_goal_rank, target_goal_rank: int, size: int, cpu: int, nic: int, intra_node: bool) -> GoalOp:
         if zero_price_communication:
             return GoalSend(self_goal_rank, target_goal_rank, 0, cpu, nic, self.context)
-        if intra_node:
+        if intra_node and enable_intra_node_transfer:
             return GoalSequential(self_goal_rank, cpu,
                 [GoalCalc(self_goal_rank, intra_node_transfer_time(size), cpu),
                 GoalSend(self_goal_rank, target_goal_rank, 0, cpu, nic, self.context)]
             )
-        else:
-            return GoalSend(self_goal_rank, target_goal_rank, size, cpu, nic, self.context)
+        return GoalSend(self_goal_rank, target_goal_rank, size, cpu, nic, self.context)
 
     def recv_goal(self, self_goal_rank, source_goal_rank: int, size: int, cpu: int, nic: int, intra_node: bool) -> GoalOp:
         if zero_price_communication:
             return GoalRecv(self_goal_rank, source_goal_rank, 0, cpu, nic, self.context)
-        if intra_node:
+        if intra_node and enable_intra_node_transfer:
             return GoalSequential(self_goal_rank, cpu,
                 [GoalRecv(self_goal_rank, source_goal_rank, 0, cpu, nic, self.context),
                 GoalCalc(self_goal_rank, intra_node_transfer_time(size), cpu)]
             )
-        else:
-            return GoalRecv(self_goal_rank, source_goal_rank, size, cpu, nic, self.context)
+        return GoalRecv(self_goal_rank, source_goal_rank, size, cpu, nic, self.context)
     
     @abstractmethod
     def _p_to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, intra_node_send: bool, intra_node_recv: bool) -> GoalOp:
