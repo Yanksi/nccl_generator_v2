@@ -68,7 +68,7 @@ def get_communicator_info(data: pd.DataFrame):
     comm_info = data[data['text'].str.match(comm_info_pattern)].copy()
     comm_info[["commHash", "commId", "rank", "nRanks", "pid"]] = comm_info["text"].str.extract(comm_info_pattern)
     comm_info[["nRanks", "rank", "pid"]] = comm_info[["nRanks", "rank", "pid"]].astype("Int64")
-    comm_info = comm_info.drop(columns=["text", "start", "end"])
+    comm_info = comm_info.drop(columns=["text", "start", "end", "eventId"]).drop_duplicates()
     
     comm_hash2id = comm_info[["nodeId", "commHash", "commId"]].drop_duplicates()
 
@@ -81,7 +81,7 @@ def get_communicator_info(data: pd.DataFrame):
         comm_hash2id,
         on=["nodeId", "commHash"],
         how="left"
-    ).drop(columns=["commHash", "text", "start", "end"])
+    ).drop(columns=["commHash", "text", "start", "end", "eventId"]).drop_duplicates()
 
     logger.info("extracting communicator trees")
     comm_tree_pattern = r"commHash (0x[0-9a-f]+) Trees \[(\d+)\] (-?\d+)/(-?\d+)/(-?\d+)->(-?\d+)->(-?\d+) pid (\d+)"
@@ -92,7 +92,7 @@ def get_communicator_info(data: pd.DataFrame):
         comm_hash2id,
         on=["nodeId", "commHash"],
         how="left"
-    ).drop(columns=["commHash", "text", "start", "end"])
+    ).drop(columns=["commHash", "text", "start", "end", "eventId"]).drop_duplicates()
     return comm_info, comm_ring_info, comm_tree_info
 
 def get_profiling_interval(data: pd.DataFrame):
@@ -122,7 +122,7 @@ def _associate_events(interval_starts, interval_ends, interval_id, events_time):
             associated_ids[i] = interval_id[j]
     return associated_ids
 
-def _filter_time(profiling_interval: pd.DataFrame, data: pd.DataFrame):
+def filter_time(profiling_interval: pd.DataFrame, data: pd.DataFrame):
         merged = data.merge(
             profiling_interval,
             on=["nodeId", "pid"],
@@ -206,7 +206,7 @@ def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     # get the events grouped by stream    
     if profiling_interval is not None:
         logger.info("filtering events by profiling intervals")
-        comm_data = _filter_time(profiling_interval, comm_data)
+        comm_data = filter_time(profiling_interval, comm_data)
         coll_info_data = coll_info_data.merge(
             comm_data[["eventId"]],
             left_on=["association"],
@@ -236,9 +236,9 @@ def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
 def associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     if profiling_interval is not None:
         logger.info("filtering kernel events by profiling intervals")
-        kernel_events_filtered = _filter_time(kernel_events, profiling_interval)
+        kernel_events = filter_time(kernel_events, profiling_interval)
     logger.info("associating kernels to nvtx events")
-    kernel_df_grouped = {name: group for name, group in kernel_events_filtered.groupby(['nodeId', 'pid'])}
+    kernel_df_grouped = {name: group for name, group in kernel_events.groupby(['nodeId', 'pid'])}
     comm_grouped = {name: group for name, group in comm_data.groupby(['nodeId', 'pid'])}
     kernels_list = []
     for gpu in tqdm(kernel_df_grouped.keys()):
