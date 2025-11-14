@@ -165,33 +165,40 @@ def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
         comm = comm.sort_values(by="start").reset_index(drop=True)
 
         coll_comm = comm[(comm["collective"] != "Send") & (comm["collective"] != "Recv")]
-        coll_infos = coll_info_grouped[gpu]
-        coll_kernels = coll_kernel_grouped[gpu]
-        
-        coll_infos = coll_infos.sort_values(by="start").reset_index(drop=True)
-        coll_kernels = coll_kernels.sort_values(by="start").reset_index(drop=True)
+        if len(coll_comm) > 0:
+            coll_infos = coll_info_grouped[gpu]
+            coll_kernels = coll_kernel_grouped[gpu]
+            
+            coll_infos = coll_infos.sort_values(by="start").reset_index(drop=True)
+            coll_kernels = coll_kernels.sort_values(by="start").reset_index(drop=True)
 
-        comm_starts = coll_comm["start"].to_numpy()
-        comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
-        
-        coll_info_starts = coll_infos["start"].to_numpy()
-        coll_infos["association"] = _associate_events(comm_starts, comm_ends, coll_comm["eventId"].to_numpy(), coll_info_starts)
+            comm_starts = coll_comm["start"].to_numpy()
+            comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
+            
+            coll_info_starts = coll_infos["start"].to_numpy()
+            coll_infos["association"] = _associate_events(comm_starts, comm_ends, coll_comm["eventId"].to_numpy(), coll_info_starts)
 
-        coll_kernel_starts = coll_kernels["start"].to_numpy()
-        coll_kernels["association"] = _associate_events(comm_starts, comm_ends, coll_comm["eventId"].to_numpy(), coll_kernel_starts)
+            coll_kernel_starts = coll_kernels["start"].to_numpy()
+            coll_kernels["association"] = _associate_events(comm_starts, comm_ends, coll_comm["eventId"].to_numpy(), coll_kernel_starts)
+            coll_info_grouped[gpu] = coll_infos
+            coll_kernel_grouped[gpu] = coll_kernels
 
         p2p_comm = comm[(comm["collective"] == "Send") | (comm["collective"] == "Recv")]
-        p2p_kernels = p2p_kernel_grouped[gpu]
-        p2p_kernels = p2p_kernels.sort_values(by="start").reset_index(drop=True)
-        comm_starts = p2p_comm["start"].to_numpy()
-        comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
-        p2p_kernel_starts = p2p_kernels["start"].to_numpy()
-        p2p_kernels["association"] = _associate_events(comm_starts, comm_ends, p2p_comm["eventId"].to_numpy(), p2p_kernel_starts)
-        
-        coll_info_grouped[gpu] = coll_infos
-        coll_kernel_grouped[gpu] = coll_kernels
-        p2p_kernel_grouped[gpu] = p2p_kernels
+        if len(p2p_comm) > 0:
+            p2p_kernels = p2p_kernel_grouped[gpu]
+            p2p_kernels = p2p_kernels.sort_values(by="start").reset_index(drop=True)
+            comm_starts = p2p_comm["start"].to_numpy()
+            comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
+            p2p_kernel_starts = p2p_kernels["start"].to_numpy()
+            p2p_kernels["association"] = _associate_events(comm_starts, comm_ends, p2p_comm["eventId"].to_numpy(), p2p_kernel_starts)
+            p2p_kernel_grouped[gpu] = p2p_kernels
     
+    if len(coll_info_grouped) == 0:
+        coll_info_grouped[("0", 0)] = pd.DataFrame(columns=list(coll_info_data.columns) + ["association"])
+    if len(coll_kernel_grouped) == 0:
+        coll_kernel_grouped[("0", 0)] = pd.DataFrame(columns=list(coll_kernel_data.columns) + ["association"])
+    if len(p2p_kernel_grouped) == 0:
+        p2p_kernel_grouped[("0", 0)] = pd.DataFrame(columns=list(p2p_kernel_data.columns) + ["association"])
     coll_info_data = pd.concat(list(coll_info_grouped.values()), ignore_index=True)
     coll_kernel_data = pd.concat(list(coll_kernel_grouped.values()), ignore_index=True)
     p2p_kernel_data = pd.concat(list(p2p_kernel_grouped.values()), ignore_index=True)
