@@ -231,69 +231,95 @@ class AllReduce(CollectiveOp):
             chunk_offset = chunk * chunk_count
             n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
             slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
-            chunk_comm.append(NCCLSend(
-                self.context,
-                self.gpu,
-                target_gpu=nxt_gpu,
-                size=n_elems * self.coll_info.type_size,
-                chunk_size=slice_size
-            ))
-
-            # step k-2 steps: reduce and copy to next GPU
-            for j in range(2, n_ranks):
+            
+            for j in range(1, n_ranks):
                 chunk = (ring_ix + n_ranks - j) % n_ranks
                 chunk_offset = chunk * chunk_count
                 n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
                 slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
-                chunk_comm.append(NCCLRecvReduceSend(
-                    self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
-                    size=n_elems * self.coll_info.type_size,
-                    chunk_size=slice_size
-                ))
+                chunk_comm.append(NCCLPrimitiveParallel(self.gpu, True, [
+                    NCCLSend(self.context, self.gpu, target_gpu=nxt_gpu, size=n_elems * self.coll_info.type_size, chunk_size=slice_size),
+                    NCCLRecvReduce(self.context, self.gpu, source_gpu=prev_gpu, size=n_elems * self.coll_info.type_size, chunk_size=slice_size)
+                ]))
+                
+                if j == n_ranks - 1: # last round, do a copy
+                    chunk_comm.append(NCCLCopy(self.context, self.gpu, size=n_elems * self.coll_info.type_size, chunk_size=slice_size))
+            
+            
+            for j in range(1, n_ranks):
+                chunk = (ring_ix + n_ranks - j) % n_ranks
+                chunk_offset = chunk * chunk_count
+                n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
+                slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
+                recv_op = NCCLRecv if j == n_ranks -1 else NCCLRecvCopy
+                chunk_comm.append(NCCLPrimitiveParallel(self.gpu, True, [
+                    NCCLSend(self.context, self.gpu, target_gpu=nxt_gpu, size=n_elems * self.coll_info.type_size, chunk_size=slice_size),
+                    recv_op(self.context, self.gpu, source_gpu=prev_gpu, size=n_elems * self.coll_info.type_size, chunk_size=slice_size)
+                ]))
+                
+            # chunk_comm.append(NCCLSend(
+            #     self.context,
+            #     self.gpu,
+            #     target_gpu=nxt_gpu,
+            #     size=n_elems * self.coll_info.type_size,
+            #     chunk_size=slice_size
+            # ))
+
+            # # step k-2 steps: reduce and copy to next GPU
+            # for j in range(2, n_ranks):
+            #     chunk = (ring_ix + n_ranks - j) % n_ranks
+            #     chunk_offset = chunk * chunk_count
+            #     n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
+            #     slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
+            #     chunk_comm.append(NCCLRecvReduceSend(
+            #         self.context,
+            #         self.gpu,
+            #         source_gpu=prev_gpu,
+            #         target_gpu=nxt_gpu,
+            #         size=n_elems * self.coll_info.type_size,
+            #         chunk_size=slice_size
+            #     ))
 
             # step k-1: recv the reduced data from prev
-            chunk = ring_ix
-            chunk_offset = chunk * chunk_count
-            n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
-            slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
-            chunk_comm.append(NCCLRecvReduceCopySend(
-                self.context,
-                self.gpu,
-                source_gpu=prev_gpu,
-                target_gpu=nxt_gpu,
-                size=n_elems * self.coll_info.type_size,
-                chunk_size=slice_size
-            ))
+            # chunk = ring_ix
+            # chunk_offset = chunk * chunk_count
+            # n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
+            # slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
+            # chunk_comm.append(NCCLRecvReduceCopySend(
+            #     self.context,
+            #     self.gpu,
+            #     source_gpu=prev_gpu,
+            #     target_gpu=nxt_gpu,
+            #     size=n_elems * self.coll_info.type_size,
+            #     chunk_size=slice_size
+            # ))
 
-            # k-2 steps: copy to next GPU
-            for j in range(1, n_ranks - 1):
-                chunk = (ring_ix + n_ranks - j) % n_ranks
-                chunk_offset = chunk * chunk_count
-                n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
-                slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
-                chunk_comm.append(NCCLRecvCopySend(
-                    self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
-                    size=n_elems * self.coll_info.type_size,
-                    chunk_size=slice_size
-                ))
+            # # k-2 steps: copy to next GPU
+            # for j in range(1, n_ranks - 1):
+            #     chunk = (ring_ix + n_ranks - j) % n_ranks
+            #     chunk_offset = chunk * chunk_count
+            #     n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
+            #     slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
+            #     chunk_comm.append(NCCLRecvCopySend(
+            #         self.context,
+            #         self.gpu,
+            #         source_gpu=prev_gpu,
+            #         target_gpu=nxt_gpu,
+            #         size=n_elems * self.coll_info.type_size,
+            #         chunk_size=slice_size
+            #     ))
             
-            chunk = (ring_ix + 1) % n_ranks
-            chunk_offset = chunk * chunk_count
-            n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
-            slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
-            chunk_comm.append(NCCLRecv(
-                self.context,
-                self.gpu,
-                source_gpu=prev_gpu,
-                size=n_elems * self.coll_info.type_size,
-                chunk_size=slice_size
-            ))
+            # chunk = (ring_ix + 1) % n_ranks
+            # chunk_offset = chunk * chunk_count
+            # n_elems = min(chunk_count, max(0, rem_count - chunk_offset))
+            # slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
+            # chunk_comm.append(NCCLRecv(
+            #     self.context,
+            #     self.gpu,
+            #     source_gpu=prev_gpu,
+            #     size=n_elems * self.coll_info.type_size,
+            #     chunk_size=slice_size
+            # ))
 
             result.add(chunk_comm)
         return result
@@ -430,43 +456,62 @@ class AllGather(CollectiveOp):
             slice_per_chunk = self.coll_info.chunk_steps // self.coll_info.slice_steps
             slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
             chunk_comm = NCCLPrimitiveSequential(self.gpu)
-            # step 0: send the slice of data to next
-            if send_buff == recv_buff + (ring_ix * count): # in place send
-                chunk_comm.append(NCCLSend(
-                    self.context,
-                    self.gpu,
-                    target_gpu=nxt_gpu,
-                    size=n_elems,
-                    chunk_size=slice_size
-                ))
-            else: # CopySend
-                chunk_comm.append(NCCLCopySend(
-                    self.context,
-                    self.gpu,
-                    target_gpu=nxt_gpu,
-                    size=n_elems,
-                    chunk_size=slice_size
-                ))
+            
+            for j in range(n_ranks - 1):
+                send_op = NCCLSend if j == 0 and send_buff == recv_buff + (ring_ix * count) else NCCLCopySend
+                chunk_comm.append(NCCLPrimitiveParallel(self.gpu, True, [
+                    send_op(
+                        self.context,
+                        self.gpu,
+                        target_gpu=nxt_gpu,
+                        size=n_elems,
+                        chunk_size=slice_size
+                    ),
+                    NCCLRecv(
+                        self.context,
+                        self.gpu,
+                        source_gpu=prev_gpu,
+                        size=n_elems,
+                        chunk_size=slice_size
+                    )
+                ]))
+            # # step 0: send the slice of data to next
+            # if send_buff == recv_buff + (ring_ix * count): # in place send
+            #     chunk_comm.append(NCCLSend(
+            #         self.context,
+            #         self.gpu,
+            #         target_gpu=nxt_gpu,
+            #         size=n_elems,
+            #         chunk_size=slice_size
+            #     ))
+            # else: # CopySend
+            #     chunk_comm.append(NCCLCopySend(
+            #         self.context,
+            #         self.gpu,
+            #         target_gpu=nxt_gpu,
+            #         size=n_elems,
+            #         chunk_size=slice_size
+            #     ))
                 
-            # step k-2 steps:
-            for _ in range(n_ranks - 2):
-                chunk_comm.append(NCCLRecvCopySend(
-                    self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
-                    size=n_elems,
-                    chunk_size=slice_size
-                ))
+            # # step k-2 steps:
+            # for _ in range(n_ranks - 2):
+            #     chunk_comm.append(NCCLRecvCopySend(
+            #         self.context,
+            #         self.gpu,
+            #         source_gpu=prev_gpu,
+            #         target_gpu=nxt_gpu,
+            #         size=n_elems,
+            #         chunk_size=slice_size
+            #     ))
 
-            # step k-1: recv the slice of data from prev
-            chunk_comm.append(NCCLRecv(
-                self.context,
-                self.gpu,
-                source_gpu=prev_gpu,
-                size=n_elems,
-                chunk_size=slice_size
-            ))
+            # # step k-1: recv the slice of data from prev
+            # chunk_comm.append(NCCLRecv(
+            #     self.context,
+            #     self.gpu,
+            #     source_gpu=prev_gpu,
+            #     size=n_elems,
+            #     chunk_size=slice_size
+            # ))
             result.add(chunk_comm)
         return result
 
@@ -495,34 +540,60 @@ class ReduceScatter(CollectiveOp):
             slice_size = self.coll_info.slice_steps * self.coll_info.step_size
             slice_per_chunk = self.coll_info.chunk_steps // self.coll_info.slice_steps
             slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
-            # step 0: send the slice of data to nxt
-            chunk_comm.append(NCCLSend(
+            
+            for j in range(n_ranks - 1):
+                send_op = NCCLSend if j == 0 else NCCLCopySend
+                chunk_comm.append(NCCLPrimitiveParallel(self.gpu, True, [
+                    send_op(
+                        self.context,
+                        self.gpu,
+                        target_gpu=nxt_gpu,
+                        size=n_elems * self.coll_info.type_size,
+                        chunk_size=slice_size
+                    ),
+                    NCCLRecvReduce(
+                        self.context,
+                        self.gpu,
+                        source_gpu=prev_gpu,
+                        size=n_elems * self.coll_info.type_size,
+                        chunk_size=slice_size
+                    )
+                ]))
+            
+            chunk_comm.append(NCCLReduce(
                 self.context,
                 self.gpu,
-                target_gpu=nxt_gpu,
                 size=n_elems * self.coll_info.type_size,
-                chunk_size=slice_size
             ))
             
-            # step k-2 steps:
-            for _ in range(n_ranks - 2):
-                chunk_comm.append(NCCLRecvReduceSend(
-                    self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
-                    size=n_elems * self.coll_info.type_size,
-                    chunk_size=slice_size
-                ))
+            # # step 0: send the slice of data to nxt
+            # chunk_comm.append(NCCLSend(
+            #     self.context,
+            #     self.gpu,
+            #     target_gpu=nxt_gpu,
+            #     size=n_elems * self.coll_info.type_size,
+            #     chunk_size=slice_size
+            # ))
             
-            # step k-1: recv the reduced data from prev
-            chunk_comm.append(NCCLRecvReduceCopy(
-                self.context,
-                self.gpu,
-                source_gpu=prev_gpu,
-                size=n_elems * self.coll_info.type_size,
-                chunk_size=slice_size
-            ))
+            # # step k-2 steps:
+            # for _ in range(n_ranks - 2):
+            #     chunk_comm.append(NCCLRecvReduceSend(
+            #         self.context,
+            #         self.gpu,
+            #         source_gpu=prev_gpu,
+            #         target_gpu=nxt_gpu,
+            #         size=n_elems * self.coll_info.type_size,
+            #         chunk_size=slice_size
+            #     ))
+            
+            # # step k-1: recv the reduced data from prev
+            # chunk_comm.append(NCCLRecvReduceCopy(
+            #     self.context,
+            #     self.gpu,
+            #     source_gpu=prev_gpu,
+            #     size=n_elems * self.coll_info.type_size,
+            #     chunk_size=slice_size
+            # ))
             result.add(chunk_comm)
         return result
 

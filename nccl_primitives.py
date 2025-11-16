@@ -14,6 +14,13 @@ zero_price_reduction_copy = False
 zero_price_communication = False
 enable_intra_node_transfer = False
 
+
+def init_generation_flags(zero_price_reduction_copy_flag: bool, zero_price_communication_flag: bool, enable_intra_node_transfer_flag: bool) -> None:
+    global zero_price_reduction_copy, zero_price_communication, enable_intra_node_transfer
+    zero_price_reduction_copy = zero_price_reduction_copy_flag
+    zero_price_communication = zero_price_communication_flag
+    enable_intra_node_transfer = enable_intra_node_transfer_flag
+
 def intra_node_transfer_time(size: int) -> int:
     bw = 150
     return size * 10**9 // (bw * 10**9 * 1 * 2)
@@ -364,6 +371,42 @@ class NCCLRecv(NCCLPrimitive):
     def _p_to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, intra_node_send: bool, intra_node_recv: bool) -> GoalOp:
         return self.recv_goal(gpu2goal_rank[self.gpu], gpu2goal_rank[self.source_gpu], self.size, cpu, nic, intra_node_recv)
 
+class NCCLSendRecv(NCCLPrimitive): # for use in ring algorithms
+    def __repr__(self) -> str:
+        return f"NCCLSendRecv(source_gpu={self.source_gpu}, target_gpu={self.target_gpu}, size={self.size})"
+    
+    def _p_to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, intra_node_send: bool, intra_node_recv: bool) -> GoalOp:
+        self_goal_rank = gpu2goal_rank[self.gpu]
+        send = self.send_goal(self_goal_rank, gpu2goal_rank[self.target_gpu], self.size, cpu, nic, intra_node_send)
+        recv = self.recv_goal(self_goal_rank, gpu2goal_rank[self.source_gpu], self.size, cpu, nic, intra_node_recv)
+        return GoalParallel(self_goal_rank, cpu,
+            [send, recv]
+        )
+
+class NCCLReduce(NCCLPrimitive):
+    def __repr__(self) -> str:
+        return f"NCCLReduce(source_gpu={self.source_gpu}, size={self.size})"
+    
+    def _p_to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, intra_node_send: bool, intra_node_recv: bool) -> GoalOp:
+        self_goal_rank = gpu2goal_rank[self.gpu]
+        return GoalCalc(self_goal_rank, reduction_time(self.size, self.__proto__), cpu)
+
+class NCCLCopy(NCCLPrimitive):
+    def __repr__(self) -> str:
+        return f"NCCLCopy(size={self.size})"
+    
+    def _p_to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, intra_node_send: bool, intra_node_recv: bool) -> GoalOp:
+        self_goal_rank = gpu2goal_rank[self.gpu]
+        return GoalCalc(self_goal_rank, copy_time(self.size, self.__proto__), cpu)
+
+class NCCLReduceCopy(NCCLPrimitive):
+    def __repr__(self) -> str:
+        return f"NCCLReduceCopy(size={self.size})"
+    
+    def _p_to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, intra_node_send: bool, intra_node_recv: bool) -> GoalOp:
+        self_goal_rank = gpu2goal_rank[self.gpu]
+        return GoalCalc(self_goal_rank, reduction_time(self.size, self.__proto__) + copy_time(self.size, self.__proto__), cpu)
+
 class NCCLRecvReduce(NCCLPrimitive):
     def __repr__(self) -> str:
         return f"NCCLRecvReduce(source_gpu={self.source_gpu}, size={self.size})"
@@ -400,6 +443,18 @@ class NCCLRecvCopySend(NCCLPrimitive):
             [recv,
             GoalCalc(self_goal_rank, copy_time(self.size, self.__proto__), cpu),
             send]
+        )
+
+class NCCLRecvCopy(NCCLPrimitive):
+    def __repr__(self):
+        return f"NCCLRecvCopy(source_gpu={self.source_gpu}, size={self.size})"
+    
+    def _p_to_goal(self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int, intra_node_send: bool, intra_node_recv: bool) -> GoalOp:
+        self_goal_rank = gpu2goal_rank[self.gpu]
+        recv = self.recv_goal(self_goal_rank, gpu2goal_rank[self.source_gpu], self.size, cpu, nic, intra_node_recv)
+        return GoalSequential(self_goal_rank, cpu,
+            [recv,
+            GoalCalc(self_goal_rank, copy_time(self.size, self.__proto__), cpu)]
         )
 
 class NCCLRecvReduceSend(NCCLPrimitive):
