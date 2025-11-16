@@ -138,13 +138,13 @@ if __name__ == "__main__":
     script_path = pathlib.Path(__file__).resolve()
     # get the parent directory
     parent_dir = script_path.parent
-    trace_dir = parent_dir / "traces/LLama/sqlite"
+    trace_dir = parent_dir / "traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite"
     traces = find_all_traces(trace_dir)
     kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)
     comm_info, comm_ring_info, comm_tree_info = get_communicator_info(nvtx_events)
-    # profiling_interval = get_profiling_interval(nvtx_events)
-    profiling_interval = None
+    profiling_interval = get_profiling_interval(nvtx_events)
+    # profiling_interval = None
     comm_data, coll_info, coll_kernels, p2p_kernels = get_event_info(nvtx_events, profiling_interval)
     comm_data, kernel_events = associate_kernel_to_nvtx(comm_data, kernel_events, profiling_interval)
     comm_data = add_context_parallelism(comm_data)
@@ -168,7 +168,7 @@ if __name__ == "__main__":
     #             write_tasks.append(f.write(result))
     #         await asyncio.gather(*write_tasks)
     # asyncio.run(write_goals_buffered())
-    with open("trace2.goal", "w") as f:
+    with open("trace1.goal", "w") as f:
         logger.info("writing goal file")
         gpus = gpu_devices.values()
         f.write(f"num_ranks {len(gpus)}\n")
