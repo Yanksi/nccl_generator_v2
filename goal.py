@@ -50,6 +50,8 @@ class GoalTraffic(GoalOpAtom, ABC):
         self.peer_rank = peer_rank
         self.size = size
         self.nic = nic
+        if self.size < 0:
+            raise ValueError("Size must be non-negative.")
 
 class GoalSend(GoalTraffic):
     send_message_id: Dict[Tuple[int, int, int], int] = {}
@@ -77,6 +79,8 @@ class GoalCalc(GoalOpAtom):
     def __init__(self, self_rank: int, duration: int, cpu: int):
         super().__init__(self_rank, cpu)
         self.duration = duration
+        if self.duration < 0:
+            raise ValueError("Duration must be non-negative.")
     
     def generate_lines(self) -> Generator[str]:
         yield f"l{self.get_id()}: calc {self.duration} cpu {self.cpu}"
