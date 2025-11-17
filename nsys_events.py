@@ -236,7 +236,7 @@ def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
 def associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     if profiling_interval is not None:
         logger.info("filtering kernel events by profiling intervals")
-        kernel_events = filter_time(kernel_events, profiling_interval)
+        kernel_events = filter_time(profiling_interval, kernel_events)
     logger.info("associating kernels to nvtx events")
     kernel_df_grouped = {name: group for name, group in kernel_events.groupby(['nodeId', 'pid'])}
     comm_grouped = {name: group for name, group in comm_data.groupby(['nodeId', 'pid'])}
