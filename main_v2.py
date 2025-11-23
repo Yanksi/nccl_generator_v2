@@ -8,7 +8,7 @@ import logging
 from typing import Dict, Tuple
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import aiofiles
+# import aiofiles
 import pathlib
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -107,6 +107,7 @@ def construct_collectives(
     coll_info["context_label"] = coll_info.apply(lambda row: context_labels.get(row['parallelism'], 0), axis=1)
     coll_info["collOp"] = coll_info.apply(lambda row: collective_ops[row['collective']](row['gpu'], row['comm'], row['collInfo'], row['chnlInfo'], row['context_label']), axis=1)
     for _, row in coll_info.iterrows():
+        # if row['parallelism'] != "DP":
         row['gpu'].add_collective(row['stream'], row['collOp'], row['start'], row['end'], row['context_label'])
 
 def construct_p2p(

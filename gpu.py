@@ -31,10 +31,10 @@ class GPUStream:
             goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
             last_cpu = max(last_cpu, _last_cpu)
             if prev_end > 0:
-                goal_ops.append(GoalCalc(gpu2goal_rank[self.self_gpu], start - prev_end, curr_cpu))
+                goal_ops.append(GoalCalc(start - prev_end, gpu2goal_rank[self.self_gpu], curr_cpu))
             goal_ops.append(goal_op)
             prev_end = end
-        return GoalSequential(gpu2goal_rank[self.self_gpu], starting_cpu_id, goal_ops), last_cpu
+        return GoalSequential(goal_ops, gpu2goal_rank[self.self_gpu], starting_cpu_id), last_cpu
     
     def generate_goal_lines(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int]):
         curr_cpu = starting_cpu_id
@@ -47,10 +47,10 @@ class GPUStream:
                 goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
                 last_cpu = max(last_cpu, _last_cpu)
                 if prev_end > 0:
-                    yield GoalCalc(gpu2goal_rank[self.self_gpu], start - prev_end, curr_cpu)
+                    yield GoalCalc(start - prev_end, gpu2goal_rank[self.self_gpu], curr_cpu)
                 yield goal_op
                 prev_end = end
-        goal_op = GoalSequential(gpu2goal_rank[self.self_gpu], starting_cpu_id, goal_gen())
+        goal_op = GoalSequential(goal_gen(), gpu2goal_rank[self.self_gpu], starting_cpu_id)
         for line in goal_op.generate_lines():
             yield line
         tqdm.write(f"Generated goals for stream on GPU {self.self_gpu.id} with context {self.context_info} for {len(self.collectives)} collectives.")
@@ -93,7 +93,7 @@ class GPUDevice:
         for stream_id, stream in self.streams_sorted():
             goal_op, starting_cpu_id = stream.generate_goal(starting_cpu_id, nic, gpu2goal_rank)
             goal_result.append(goal_op)
-        return GoalParallel(gpu2goal_rank[self], 0, goal_result), starting_cpu_id
+        return GoalParallel(goal_result, gpu2goal_rank[self], 0), starting_cpu_id
     
     def generate_goal_lines(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int):
         starting_cpu_id = 0

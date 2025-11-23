@@ -153,20 +153,18 @@ class CollChnlInfo:
     recv_buff: int
 
 
-class CollectiveOp(CommOp, ABC):
+class CollectiveOp(CommOp):
     def __init__(self, gpu: GPUDevice, comm: Communicator, coll_info: CollInfo, coll_chnl_infos: List[CollChnlInfo], context: int):
         super().__init__(gpu, context)
         self.comm = comm
         self.coll_info = coll_info
         self.coll_chnl_infos = coll_chnl_infos
 
-    @abstractmethod
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
-        pass
+        raise NotImplementedError()
 
-    @abstractmethod
     def _to_primitives_tree_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
-        pass
+        raise NotImplementedError()
 
     def _to_primitives_tree(self) -> NCCLPrimitiveComm:
         result = NCCLPrimitiveParallel(self.gpu)
@@ -436,9 +434,6 @@ class AllReduce(CollectiveOp):
 
 
 class AllGather(CollectiveOp):
-    def _to_primitives_tree_chnl(self, chnl_id):
-        raise NotImplementedError()
-    
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         n_ranks = comm.n_ranks
@@ -525,9 +520,6 @@ class AllGather(CollectiveOp):
 
 
 class ReduceScatter(CollectiveOp):
-    def _to_primitives_tree_chnl(self, chnl_id):
-        raise NotImplementedError()
-    
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         n_ranks = comm.n_ranks
@@ -610,9 +602,6 @@ class ReduceScatter(CollectiveOp):
 
 
 class Reduce(CollectiveOp):
-    def _to_primitives_tree_chnl(self, chnl_id):
-        raise NotImplementedError()
-
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         ring_topo_node = comm.ring_topo[self.gpu][chnl_id]
@@ -665,9 +654,6 @@ class Reduce(CollectiveOp):
 
 
 class Broadcast(CollectiveOp):
-    def _to_primitives_tree_chnl(self, chnl_id):
-        raise NotImplementedError()
-    
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         ring_topo_node = comm.ring_topo[self.gpu][chnl_id]

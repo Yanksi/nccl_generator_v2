@@ -5,56 +5,63 @@ import contextvars
 from contextlib import ContextDecorator
 
 
-DEFAULT_SELF_RANK: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("DEFAULT_SELF_RANK", default=None)
-DEFAULT_CPU: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("DEFAULT_CPU", default=None)
+DEFAULT_SELF_RANK: contextvars.ContextVar[Optional[GoalRank]] = contextvars.ContextVar("DEFAULT_SELF_RANK", default=None)
+DEFAULT_CPU: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("DEFAULT_CPU", default=0)
 
 class GoalRank(ContextDecorator):
     def __init__(self, self_rank):
         self.self_rank = self_rank
+        self._token_self: Optional[contextvars.Token] = None
     
     def __enter__(self):
-        self._token_self = DEFAULT_SELF_RANK.set(self.self_rank)
+        if self._token_self is None:
+            self._token_self = DEFAULT_SELF_RANK.set(self)
         return self
     
     def __exit__(self, exc_type, exc, tb):
         if self._token_self is not None:
             DEFAULT_SELF_RANK.reset(self._token_self)
+            self._token_self = None
         return False
     
     def __hash__(self):
         return hash(self.self_rank)
+    
+    def __str__(self):
+        return str(self.self_rank)
 
 class GoalCPU(ContextDecorator):
-    def __init__(self, cpu):
+    def __init__(self, cpu, offset_mode: bool = False):
         self.cpu = cpu
+        self.offset_mode = offset_mode
     
     def __enter__(self):
-        self._token_cpu = DEFAULT_CPU.set(self.cpu)
+        cpu = self.cpu
+        if self.offset_mode:
+            cpu += _current_cpu()
+        self._token_cpu = DEFAULT_CPU.set(cpu)
         return self
     
-    def __exit__(self):
+    def __exit__(self, exc_type, exc, tb):
         if self._token_cpu is not None:
             DEFAULT_CPU.reset(self._token_cpu)
         return False
 
-def _current_self_rank() -> int:
+def _current_self_rank() -> GoalRank:
     val = DEFAULT_SELF_RANK.get()
     if val is None:
         raise ValueError("self_rank not provided and no GoalContext active.")
     return val
 
 def _current_cpu() -> int:
-    val = DEFAULT_CPU.get()
-    if val is None:
-        raise ValueError("cpu not provided and no GoalContext active.")
-    return val
+    return DEFAULT_CPU.get()
 
 
 class GoalOp(ABC):
     """
     class for modeling the dependencies between different goal objects, labeling and creating edges
     """
-    def __init__(self, self_rank: Optional[int] = None, cpu: Optional[int] = None):
+    def __init__(self, self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         self.cpu = cpu if cpu is not None else _current_cpu()
         self.self_rank = self_rank if self_rank is not None else _current_self_rank()
     
@@ -75,7 +82,7 @@ class GoalOp(ABC):
 
 class GoalOpAtom(GoalOp, ABC):
     task_id_for_rank: Dict[int, int] = {}
-    def __init__(self, self_rank: Optional[int] = None, cpu: Optional[int] = None):
+    def __init__(self, self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         super().__init__(self_rank, cpu)
         self.id: int = -1
 
@@ -92,7 +99,7 @@ class GoalOpAtom(GoalOp, ABC):
         return self.id
     
 class GoalTraffic(GoalOpAtom, ABC):
-    def __init__(self, peer_rank: int, size: int, nic: int, context: int, self_rank: Optional[int] = None, cpu: Optional[int] = None):
+    def __init__(self, peer_rank: GoalRank, size: int, nic: int, context: int, self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         super().__init__(self_rank, cpu)
         self.context = context
         self.peer_rank = peer_rank
@@ -102,8 +109,8 @@ class GoalTraffic(GoalOpAtom, ABC):
             raise ValueError("Size must be non-negative.")
 
 class GoalSend(GoalTraffic):
-    send_message_id: Dict[Tuple[int, int, int], int] = {}
-    def __init__(self, peer_rank: int, size: int, nic: int, context: int, self_rank: Optional[int] = None, cpu: Optional[int] = None):
+    send_message_id: Dict[Tuple[GoalRank, GoalRank, int], int] = {}
+    def __init__(self, peer_rank: GoalRank, size: int, nic: int, context: int, self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         super().__init__(peer_rank, size, nic, context, self_rank, cpu)
         self.message_id = GoalSend.send_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
         GoalSend.send_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
@@ -113,8 +120,8 @@ class GoalSend(GoalTraffic):
         yield f"l{self.get_id()}: send {self.size}b to {self.peer_rank} tag {tag} cpu {self.cpu} nic {self.nic}"
         
 class GoalRecv(GoalTraffic):
-    recv_message_id: Dict[Tuple[int, int, int], int] = {}
-    def __init__(self, peer_rank: int, size: int, nic: int, context: int, self_rank: Optional[int] = None, cpu: Optional[int] = None):
+    recv_message_id: Dict[Tuple[GoalRank, GoalRank, int], int] = {}
+    def __init__(self, peer_rank: GoalRank, size: int, nic: int, context: int, self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         super().__init__(peer_rank, size, nic, context, self_rank, cpu)
         self.message_id = GoalRecv.recv_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
         GoalRecv.recv_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
@@ -124,7 +131,7 @@ class GoalRecv(GoalTraffic):
         yield f"l{self.get_id()}: recv {self.size}b from {self.peer_rank} tag {tag} cpu {self.cpu} nic {self.nic}"
 
 class GoalCalc(GoalOpAtom):
-    def __init__(self, duration: int, self_rank: Optional[int] = None, cpu: Optional[int] = None):
+    def __init__(self, duration: int, self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         super().__init__(self_rank, cpu)
         self.duration = duration
         if self.duration < 0:
@@ -134,7 +141,7 @@ class GoalCalc(GoalOpAtom):
         yield f"l{self.get_id()}: calc {self.duration} cpu {self.cpu}"
 
 class GoalParallel(GoalOp):
-    def __init__(self, ops: Union[list[GoalOp], Generator[GoalOp]], self_rank: Optional[int] = None, cpu: Optional[int] = None):
+    def __init__(self, ops: Union[list[GoalOp], Generator[GoalOp]], self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         super().__init__(self_rank, cpu)
         self.ops: Union[List[GoalOp], Generator[GoalOp]] = ops
         self.single_use = isinstance(ops, Generator)
@@ -156,15 +163,18 @@ class GoalParallel(GoalOp):
     def generate_lines(self) -> Generator[str]:
         if self.consumed:
             raise ValueError("This GoalParallel has already been consumed and it is single-use.")
+        
+        op_ending_ids = []
 
         yield from self.starting_op.generate_lines()
         for op in self.ops:
             yield from op.generate_lines()
+            op_ending_ids.append(op.get_end_id())
             yield f"l{op.get_start_id()} requires l{self.starting_op.get_end_id()}"
         
         yield from self.ending_op.generate_lines()
-        for op in self.ops:
-            yield f"l{self.ending_op.get_start_id()} requires l{op.get_end_id()}"
+        for op_ending_ids in op_ending_ids:
+            yield f"l{self.ending_op.get_start_id()} requires l{op_ending_ids}"
         
         self.consumed = True and self.single_use
         # results = "\n".join([str(op) for op in self.ops] + [str(self.starting_op), str(self.ending_op)])
@@ -177,7 +187,7 @@ class GoalParallel(GoalOp):
         # return f"{results}\n{requirements_pre}\n{requirements_post}"
 
 class GoalSequential(GoalOp):
-    def __init__(self, ops: Union[List[GoalOp], Generator[GoalOp]], self_rank: Optional[int] = None, cpu: Optional[int] = None, *, dependency: bool = True):
+    def __init__(self, ops: Union[List[GoalOp], Generator[GoalOp]], self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None, *, dependency: bool = True):
         super().__init__(self_rank, cpu)
         self.ops: Union[List[GoalOp], Generator[GoalOp]] = ops
         self.single_use = isinstance(ops, Generator)
