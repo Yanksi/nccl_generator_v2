@@ -42,7 +42,8 @@ class GPUStream:
         def goal_gen():
             nonlocal curr_cpu, last_cpu
             prev_end = -1
-            for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
+            # for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
+            for start, end, coll in tqdm(sorted(zip(self.coll_starts, self.coll_ends, self.collectives)), leave=False, total=len(self.collectives)):
                 primitives = coll.to_primitives()
                 goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
                 last_cpu = max(last_cpu, _last_cpu)

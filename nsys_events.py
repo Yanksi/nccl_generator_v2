@@ -132,6 +132,24 @@ def filter_time(profiling_interval: pd.DataFrame, data: pd.DataFrame):
             (merged["start"] < merged["end_profile"]) & (merged["end"] > merged["start_profile"])
         ].drop(columns=["start_profile", "end_profile"])
 
+@numba.njit
+def _associate_start_ends(sequence, internal_groups=True):
+    group_id = -1
+    group_ids = -1 * np.ones(len(sequence), dtype=np.int64)
+    stack = []
+    for i in range(len(sequence)):
+        if sequence[i]:
+            curr_group_id = -1
+            if internal_groups or len(stack) == 0:
+                curr_group_id = group_id + 1
+                group_id += 1
+            group_ids[i] = curr_group_id
+            stack.append(curr_group_id)
+        else:
+            group_ids[i] = stack.pop()
+    assert len(stack) == 0, "Mismatched start and end events"
+    return group_ids
+
 def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     logger.info("extracting event infos")
     comm_pattern = r"nccl([a-zA-Z]+)\(\): commHash (0x[0-9a-f]+), stream (0x[0-9a-f]+), data_size (\d+), type_size (\d+),.* pid (\d+)"
@@ -154,6 +172,29 @@ def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     p2p_kernel_data[["Bytes", "nWarps", "p2pType", "peer", "proto", "countHi32", "countLo32", "chunkSize", "pid"]] = p2p_kernel_data["text"].str.extract(p2p_kernel_pattern)
     p2p_kernel_data[["Bytes", "nWarps", "peer", "proto", "countHi32", "countLo32", "chunkSize", "pid"]] = p2p_kernel_data[["Bytes", "nWarps", "peer", "proto", "countHi32", "countLo32", "chunkSize", "pid"]].astype("Int64")
     
+    kernel_group_start_pattern = r'ncclGroupStart\(\): pid (\d+)'
+    kernel_group_end_pattern = r'ncclGroupEnd\(\): pid (\d+)'
+    kernel_group_start_info = data[data['text'].str.match(kernel_group_start_pattern)].copy()
+    kernel_group_end_info = data[data['text'].str.match(kernel_group_end_pattern)].copy()
+    kernel_group_start_info["pid"] = kernel_group_start_info["text"].str.extract(kernel_group_start_pattern).astype("Int64")
+    kernel_group_end_info["pid"] = kernel_group_end_info["text"].str.extract(kernel_group_end_pattern).astype("Int64")
+    # concat start and end info
+    kernel_group_start_end = pd.concat([kernel_group_start_info, kernel_group_end_info], ignore_index=True).sort_values(by=["nodeId", "pid", "start"]).reset_index(drop=True)
+    kernel_group_start_end['isStart'] = kernel_group_start_end['text'].str.contains("ncclGroupStart")
+    group_start_end_grouped = {name: group for name, group in kernel_group_start_end.groupby(['nodeId', 'pid'])}
+    for gpu, group in group_start_end_grouped.items():
+        group = group.sort_values(by="start").reset_index(drop=True)
+        group["groupId"] = _associate_start_ends(group["isStart"].to_numpy(), False)
+        group_starts = group[group["isStart"]].rename(columns={"start": "group_start"})[["groupId", "group_start"]]
+        group_ends = group[~group["isStart"]].rename(columns={"end": "group_end"})[["groupId", "group_end"]]
+        group = group_starts.merge(
+            group_ends,
+            on=["groupId"],
+            how="inner"
+        )
+        group = group[group["groupId"] != -1]
+        group_start_end_grouped[gpu] = group
+
     comm_grouped = {name: group for name, group in comm_data.groupby(['nodeId', 'pid'])}
     coll_info_grouped = {name: group for name, group in coll_info_data.groupby(['nodeId', 'pid'])}
     coll_kernel_grouped = {name: group for name, group in coll_kernel_data.groupby(['nodeId', 'pid'])}
@@ -163,7 +204,9 @@ def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
     for gpu in tqdm(comm_grouped.keys()):
         comm = comm_grouped[gpu]
         comm = comm.sort_values(by="start").reset_index(drop=True)
-
+        group_start_ends = group_start_end_grouped[gpu]
+        comm["groupId"] = _associate_events(group_start_ends['group_start'].to_numpy(), group_start_ends['group_end'].to_numpy(), group_start_ends['groupId'].to_numpy(), comm['start'].to_numpy())
+        comm_grouped[gpu] = comm
         coll_comm = comm[(comm["collective"] != "Send") & (comm["collective"] != "Recv")]
         if len(coll_comm) > 0:
             coll_infos = coll_info_grouped[gpu]
@@ -185,13 +228,19 @@ def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
 
         p2p_comm = comm[(comm["collective"] == "Send") | (comm["collective"] == "Recv")]
         if len(p2p_comm) > 0:
+            group_start_ends = group_start_end_grouped[gpu]
             p2p_kernels = p2p_kernel_grouped[gpu]
             p2p_kernels = p2p_kernels.sort_values(by="start").reset_index(drop=True)
-            comm_starts = p2p_comm["start"].to_numpy()
-            comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
-            p2p_kernel_starts = p2p_kernels["start"].to_numpy()
-            p2p_kernels["association"] = _associate_events(comm_starts, comm_ends, p2p_comm["eventId"].to_numpy(), p2p_kernel_starts)
+            # check if the length of p2p_comm and p2p_kernels are the same
+            if len(p2p_comm) != len(p2p_kernels):
+                raise ValueError(f"Mismatch in number of P2P comm events and P2P kernel events on GPU {gpu}: {len(p2p_comm)} vs {len(p2p_kernels)}")
+            p2p_kernels["association"] = p2p_comm["eventId"].to_numpy()
             p2p_kernel_grouped[gpu] = p2p_kernels
+            # comm_starts = p2p_comm["start"].to_numpy()
+            # comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
+            # p2p_kernel_starts = p2p_kernels["start"].to_numpy()
+            # p2p_kernels["association"] = _associate_events(comm_starts, comm_ends, p2p_comm["eventId"].to_numpy(), p2p_kernel_starts)
+            # p2p_kernel_grouped[gpu] = p2p_kernels
     
     if len(coll_info_grouped) == 0:
         coll_info_grouped[("0", 0)] = pd.DataFrame(columns=list(coll_info_data.columns) + ["association"])
@@ -199,6 +248,7 @@ def get_event_info(data: pd.DataFrame, profiling_interval: pd.DataFrame = None):
         coll_kernel_grouped[("0", 0)] = pd.DataFrame(columns=list(coll_kernel_data.columns) + ["association"])
     if len(p2p_kernel_grouped) == 0:
         p2p_kernel_grouped[("0", 0)] = pd.DataFrame(columns=list(p2p_kernel_data.columns) + ["association"])
+    comm_data = pd.concat(list(comm_grouped.values()), ignore_index=True)
     coll_info_data = pd.concat(list(coll_info_grouped.values()), ignore_index=True)
     coll_kernel_data = pd.concat(list(coll_kernel_grouped.values()), ignore_index=True)
     p2p_kernel_data = pd.concat(list(p2p_kernel_grouped.values()), ignore_index=True)
@@ -253,6 +303,13 @@ def associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFram
         }
         kernels = kernel_df_grouped[gpu].sort_values(by="start").reset_index(drop=True)
         nvtxs = comm_grouped[gpu].sort_values(by="start").reset_index(drop=True)
+        non_grouped_nvtxs = nvtxs[nvtxs["groupId"] == -1]
+        grouped_nvtxs = nvtxs[nvtxs["groupId"] != -1]
+
+        first_nvtxs_in_group = grouped_nvtxs.groupby("groupId").first().reset_index()
+        dropped_nvtxs = grouped_nvtxs.groupby("groupId").apply(lambda x: x.iloc[1:], include_groups=False).reset_index(level=0).reset_index(drop=True)
+
+        nvtxs = pd.concat([non_grouped_nvtxs, first_nvtxs_in_group], ignore_index=True).sort_values(by="start").reset_index(drop=True)
         kernels["label"] = kernels["collective"].map(collective_labels)
         nvtxs["label"] = nvtxs["collective"].map(collective_labels)
         
@@ -299,15 +356,28 @@ def associate_kernel_to_nvtx(comm_data: pd.DataFrame, kernel_events: pd.DataFram
         ).drop(columns=["inStreamEventId", "stream", "label"]
         ).rename(columns={"eventId": "association"})
         
-        kernels_list.append(kernels)
+        kernel_df_grouped[gpu] = kernels
+        nvtxs = nvtxs.drop(columns=["label", "inStreamEventId", "start", "end"]).merge(
+            kernels[["start", "end", "association"]],
+            left_on=["eventId"],
+            right_on=["association"],
+        ).drop(columns=["association"])
+
+        dropped_nvtxs = dropped_nvtxs.drop(columns=["start", "end"]).merge(
+            nvtxs[["end", "groupId"]],
+            on=["groupId"],
+            how="left"
+        )
+
+        dropped_nvtxs["start"] = dropped_nvtxs["end"]  # assign the end time of the previous nvtx as the start time of the dropped nvtx
+        nvtxs = pd.concat([nvtxs, dropped_nvtxs], ignore_index=True).sort_values(by=["start"]).reset_index(drop=True)
+
+        comm_grouped[gpu] = nvtxs
         
-    kernel_events = pd.concat(kernels_list, ignore_index=True)
+    kernel_events = pd.concat(list(kernel_df_grouped.values()), ignore_index=True)
+    comm_data = pd.concat(list(comm_grouped.values()), ignore_index=True)
     logger.info("updating communicator time based on associated kernels")
-    return comm_data.drop(columns=["start", "end"]).merge(
-        kernel_events[["start", "end", "association"]],
-        left_on=["eventId"],
-        right_on=["association"]
-    ).drop(columns=["association"]), kernel_events
+    return comm_data, kernel_events
     
 def add_context_parallelism(comm_data: pd.DataFrame):
     collective_labels = {
