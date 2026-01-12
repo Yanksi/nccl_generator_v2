@@ -8,6 +8,9 @@ from contextlib import ContextDecorator
 DEFAULT_SELF_RANK: contextvars.ContextVar[Optional[GoalRank]] = contextvars.ContextVar("DEFAULT_SELF_RANK", default=None)
 DEFAULT_CPU: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("DEFAULT_CPU", default=0)
 
+MESSAGE_ID_WIDTH = 5
+MESSAGE_TAG_WIDTH = 4
+
 class GoalRank(ContextDecorator):
     def __init__(self, self_rank):
         self.self_rank = self_rank
@@ -97,7 +100,10 @@ class GoalOpAtom(GoalOp, ABC):
             self.id = GoalOpAtom.task_id_for_rank.setdefault(self.self_rank, 0)
             GoalOpAtom.task_id_for_rank[self.self_rank] += 1
         return self.id
-    
+
+def ndigits(number: int) -> int:
+    return len(str(abs(number)))
+
 class GoalTraffic(GoalOpAtom, ABC):
     def __init__(self, peer_rank: GoalRank, size: int, nic: int, context: int, self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         super().__init__(self_rank, cpu)
@@ -105,6 +111,7 @@ class GoalTraffic(GoalOpAtom, ABC):
         self.peer_rank = peer_rank
         self.size = size
         self.nic = nic
+        assert(ndigits(self.context) <= MESSAGE_TAG_WIDTH)
         if self.size < 0:
             raise ValueError("Size must be non-negative.")
 
@@ -113,10 +120,11 @@ class GoalSend(GoalTraffic):
     def __init__(self, peer_rank: GoalRank, size: int, nic: int, context: int, self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         super().__init__(peer_rank, size, nic, context, self_rank, cpu)
         self.message_id = GoalSend.send_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
+        assert(ndigits(self.message_id) <= MESSAGE_ID_WIDTH)
         GoalSend.send_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
 
     def generate_lines(self) -> Generator[str]:
-        tag =  str(self.message_id).zfill(6) + str(self.context).zfill(2)
+        tag = str(self.message_id).zfill(MESSAGE_ID_WIDTH) + str(self.context).zfill(MESSAGE_TAG_WIDTH)
         yield f"l{self.get_id()}: send {self.size}b to {self.peer_rank} tag {tag} cpu {self.cpu} nic {self.nic}"
         
 class GoalRecv(GoalTraffic):
@@ -124,10 +132,11 @@ class GoalRecv(GoalTraffic):
     def __init__(self, peer_rank: GoalRank, size: int, nic: int, context: int, self_rank: Optional[GoalRank] = None, cpu: Optional[int] = None):
         super().__init__(peer_rank, size, nic, context, self_rank, cpu)
         self.message_id = GoalRecv.recv_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
+        assert(ndigits(self.message_id) <= MESSAGE_ID_WIDTH)
         GoalRecv.recv_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
     
     def generate_lines(self) -> Generator[str]:
-        tag = str(self.message_id).zfill(6) + str(self.context).zfill(2)
+        tag = str(self.message_id).zfill(MESSAGE_ID_WIDTH) + str(self.context).zfill(MESSAGE_TAG_WIDTH)
         yield f"l{self.get_id()}: recv {self.size}b from {self.peer_rank} tag {tag} cpu {self.cpu} nic {self.nic}"
 
 class GoalCalc(GoalOpAtom):

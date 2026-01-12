@@ -6,6 +6,7 @@ if TYPE_CHECKING:
 from goal import GoalOp, GoalCalc, GoalSequential, GoalParallel
 from typing import List, Dict, Type, Union, Optional, Tuple
 from tqdm import tqdm
+from functools import reduce
 
 
 class GPUStream:
@@ -49,6 +50,7 @@ class GPUStream:
                 last_cpu = max(last_cpu, _last_cpu)
                 if prev_end > 0:
                     yield GoalCalc(start - prev_end, gpu2goal_rank[self.self_gpu], curr_cpu)
+                    # yield GoalCalc(112123, gpu2goal_rank[self.self_gpu], curr_cpu)
                 yield goal_op
                 prev_end = end
         goal_op = GoalSequential(goal_gen(), gpu2goal_rank[self.self_gpu], starting_cpu_id)
@@ -101,3 +103,24 @@ class GPUDevice:
         for stream_id, stream in self.streams_sorted():
             starting_cpu_id = yield from stream.generate_goal_lines(starting_cpu_id, nic, gpu2goal_rank)
         return starting_cpu_id
+    
+    def merge_streams(self) -> None:
+        all_collectives = reduce(lambda a, b: a + b,
+                                  [stream.collectives for stream in self.streams])
+        all_starts = reduce(lambda a, b: a + b,
+                                  [stream.coll_starts for stream in self.streams])
+        all_ends = reduce(lambda a, b: a + b,
+                                  [stream.coll_ends for stream in self.streams])
+        all_collectives_with_times = sorted(zip(all_starts, all_ends, all_collectives), key=lambda x: x[0])
+        streams = [GPUStream(self)]
+        for start, end, coll in all_collectives_with_times:
+            stream_id = -1
+            for i, stream in enumerate(streams):
+                if len(stream) == 0 or stream.coll_ends[-1] <= start:
+                    stream_id = i
+                    break
+            if stream_id == -1:
+                stream_id = len(streams)
+                streams.append(GPUStream(self))
+            streams[stream_id].add_collective(coll, start, end)
+        self.streams = {f"merged_stream_{i}": stream for i, stream in enumerate(streams)}

@@ -173,6 +173,22 @@ class AllGather_Ring(CollectiveOp):
                 yield GoalSequential([send_op, recv_op], dependency=False)
         return GoalSequential(goal_gen())
 
+class AlltoAll_Linear(CollectiveOp):
+    def _to_goal_chnl(self, channel: int) -> GoalOp:
+        self_rank = _current_self_rank()
+        self_comm_rank = self.comm.get_comm_rank(self_rank, channel)
+        num_ranks = len(self.comm.channels[channel][0])
+        block_size = self.size // num_ranks
+        def goal_gen():
+            for r in range(num_ranks):
+                if r == self_comm_rank:
+                    continue
+                peer_rank = self.comm.get_goal_rank(r, channel)
+                send_op = GoalSend(peer_rank, block_size, nic=0, context=self.context)
+                recv_op = GoalRecv(peer_rank, block_size, nic=0, context=self.context)
+                yield GoalSequential([send_op, recv_op], dependency=False)
+        return GoalParallel(goal_gen())
+
 def gen_pp_edge():
     nranks = 8
     ranks = [GoalRank(i) for i in range(nranks)]
@@ -181,10 +197,12 @@ def gen_pp_edge():
     chnls = np.arange(nranks)
     all_gather = AllGather_RecDoub(comm, size=1024*1024*8)
     reduce_scatter = ReduceScatter_RecDoub(comm, size=1024*1024*8)
-    expected_fwd_comp_time = get_reduction_time(1024 * 1024 * 64)
-    expected_bwd_comp_time = get_reduction_time(1024 * 1024 * 64)
+    # all_gather = AllGather_Ring(comm, size=1024*1024*8)
+    # reduce_scatter = ReduceScatter_Ring(comm, size=1024*1024*8)
+    expected_fwd_comp_time = get_reduction_time(1024 * 1024 * 25)
+    expected_bwd_comp_time = get_reduction_time(1024 * 1024 * 25)
     comp_segments = 4
-    with open("pp_edge.goal", "w") as f:
+    with open("dp_edge.goal", "w") as f:
         f.write(f"num_ranks {nranks}\n")
         for rank in ranks:
             with rank:
@@ -197,6 +215,53 @@ def gen_pp_edge():
                     f.write(line + "\n")
                 f.write("}\n")
 
+
+def gen_mix():
+    nranks = 8
+    ranks = [GoalRank(i) for i in range(nranks)]
+    comm = Communicator(ranks)
+    comm.add_channel(list(range(nranks)))
+    alltoall = AlltoAll_Linear(comm, size=1024*1024*8, context=1)
+    all_gather = AllGather_RecDoub(comm, size=1024*1024*8, context=2)
+    reduce_scatter = ReduceScatter_RecDoub(comm, size=1024*1024*8, context=2)
+    expected_fwd_comp_time = get_reduction_time(1024 * 1024 * 64)
+    expected_bwd_comp_time = get_reduction_time(1024 * 1024 * 64)
+    comp_segments = 4
+    with open("mix_edge.goal", "w") as f:
+        f.write(f"num_ranks {nranks}\n")
+        for rank in ranks:
+            with rank:
+                forward_op = GoalSequential([all_gather.to_goal(), GoalSequential(GoalCalc(expected_fwd_comp_time // comp_segments) for _ in range(comp_segments)), alltoall.to_goal()])
+                backward_op = GoalSequential([alltoall.to_goal(), GoalSequential(GoalCalc(expected_bwd_comp_time // comp_segments) for _ in range(comp_segments)), reduce_scatter.to_goal()])
+                f.write(f"rank {rank.self_rank} {{\n")
+                for line in forward_op.generate_lines():
+                    f.write(line + "\n")
+                for line in backward_op.generate_lines():
+                    f.write(line + "\n")
+                f.write("}\n")
+
+
+def gen_moe():
+    nranks = 8
+    ranks = [GoalRank(i) for i in range(nranks)]
+    comm = Communicator(ranks)
+    comm.add_channel(list(range(nranks)))
+    alltoall = AlltoAll_Linear(comm, size=1024*1024*8)
+    expected_fwd_comp_time = get_reduction_time(1024 * 1024 * 64)
+    expected_bwd_comp_time = get_reduction_time(1024 * 1024 * 64)
+    comp_segments = 4
+    with open("moe_edge.goal", "w") as f:
+        f.write(f"num_ranks {nranks}\n")
+        for rank in ranks:
+            with rank:
+                forward_op = GoalSequential([GoalSequential(GoalCalc(expected_fwd_comp_time // comp_segments) for _ in range(comp_segments)), alltoall.to_goal()])
+                backward_op = GoalSequential([alltoall.to_goal(), GoalSequential(GoalCalc(expected_bwd_comp_time // comp_segments) for _ in range(comp_segments))])
+                f.write(f"rank {rank.self_rank} {{\n")
+                for line in forward_op.generate_lines():
+                    f.write(line + "\n")
+                for line in backward_op.generate_lines():
+                    f.write(line + "\n")
+                f.write("}\n")
 
 if __name__ == "__main__":
     # Example usage
@@ -224,3 +289,5 @@ if __name__ == "__main__":
     #                 f.write(line + "\n")
     #             f.write("}\n")
     gen_pp_edge()
+    gen_moe()
+    gen_mix()
