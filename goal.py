@@ -187,14 +187,13 @@ class GoalParallel(GoalOp):
         # return f"{results}\n{requirements_pre}\n{requirements_post}"
 
 class GoalSequential(GoalOp):
-    def __init__(self, ops: Union[List[GoalOp], Generator[GoalOp]], self_rank: Optional[int] = None, cpu: Optional[int] = None, *, dependency: bool = True):
+    def __init__(self, ops: Union[List[GoalOp], Generator[GoalOp]], self_rank: Optional[int] = None, cpu: Optional[int] = None):
         super().__init__(self_rank, cpu)
         self.ops: Union[List[GoalOp], Generator[GoalOp]] = ops
         self.single_use = isinstance(ops, Generator)
         self.consumed = False
         self.starting_op = None
         self.ending_op = None
-        self.dependency = dependency
 
     def add_op(self, op: GoalOp):
         if self.single_use:
@@ -225,8 +224,7 @@ class GoalSequential(GoalOp):
         for op in iterator:
             self.ending_op = op
             yield from op.generate_lines()
-            if self.dependency:
-                yield f"l{op.get_start_id()} requires l{prev_op.get_end_id()}"
+            yield f"l{op.get_start_id()} requires l{prev_op.get_end_id()}"
             prev_op = op
         self.consumed = True and self.single_use
         # results = "\n".join([str(op) for op in self.ops])

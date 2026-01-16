@@ -320,6 +320,7 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
         target_gpu: Optional[GPUDevice] = None,
         size: int = 0,
         chunk_size: int = 0,
+        slice_per_chunk: int = 0,
         __proto__: int = -1,
     ):
         super().__init__(gpu)
@@ -328,6 +329,7 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
         self.target_gpu = target_gpu
         self.size = size
         self.chunk_size = chunk_size if chunk_size > 0 else size
+        self.slice_per_chunk = slice_per_chunk
         self.__proto__ = __proto__
         self.additional_info = {}
 
@@ -352,44 +354,89 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
             raise ValueError(
                 "Reduced operations cannot be converted to Simple protocol."
             )
-        n_chunks = self.size // self.chunk_size
-        if n_chunks <= 1:
-            return self.__class__(
-                self.context,
-                self.gpu,
-                source_gpu=self.source_gpu,
-                target_gpu=self.target_gpu,
-                size=self.size,
-                __proto__=2,
-                **self.additional_info,
-            )
 
-        def generator():
-            nonlocal self, n_chunks
-            for _ in range(n_chunks):
-                yield self.__class__(
-                    self.context,
-                    self.gpu,
-                    source_gpu=self.source_gpu,
-                    target_gpu=self.target_gpu,
-                    size=self.chunk_size,
-                    __proto__=2,
-                    **self.additional_info,
-                )
-            remaining_size = self.size % self.chunk_size
-            if remaining_size > 0:
-                yield self.__class__(
-                    self.context,
-                    self.gpu,
-                    source_gpu=self.source_gpu,
-                    target_gpu=self.target_gpu,
-                    size=remaining_size,
-                    __proto__=2,
-                    **self.additional_info,
-                )
+        if self.slice_per_chunk > 0:
+            # Dynamic slicing calculation based on NCCL Simple Protocol logic
+            spc = self.slice_per_chunk
+            # self.chunk_size is treated as the MAX slice size here
+            max_byte_size = self.chunk_size
+            
+            # Calculate optimal slice size
+            # div_up(size, 16*spc) * 16
+            step_size = 16 * spc
+            optimal_size = ((self.size + step_size - 1) // step_size) * 16
+            
+            # Apply heuristic: max(optimal, max_capacity // 32)
+            chunk_size_var = max(optimal_size, max_byte_size // 32)
+            
+            def generator():
+                nonlocal self, chunk_size_var, spc
+                offset = 0
+                n_slice = 0
+                
+                if offset < self.size:
+                    while True:
+                        current_size = chunk_size_var if chunk_size_var < self.size - offset else self.size - offset
+                        
+                        yield self.__class__(
+                            self.context,
+                            self.gpu,
+                            source_gpu=self.source_gpu,
+                            target_gpu=self.target_gpu,
+                            size=current_size,
+                            chunk_size=current_size, # Smaller piece is atomic
+                            __proto__=2,
+                            **self.additional_info,
+                        )
+                        
+                        n_slice += 1
+                        offset += current_size
+                        
+                        if not (n_slice < spc and offset < self.size):
+                            break
+            
+            return NCCLPrimitiveParallel(self.gpu, True, generator())
+        else:
+            raise ValueError("Simple protocol conversion requires slice_per_chunk > 0.")
 
-        result = NCCLPrimitiveParallel(self.gpu, True, generator())
-        return result
+        # n_chunks = self.size // self.chunk_size
+        # if n_chunks <= 1:
+        #     return self.__class__(
+        #         self.context,
+        #         self.gpu,
+        #         source_gpu=self.source_gpu,
+        #         target_gpu=self.target_gpu,
+        #         size=self.size,
+        #         __proto__=2,
+        #         **self.additional_info,
+        #     )
+
+        # def generator():
+        #     nonlocal self, n_chunks
+        #     for _ in range(n_chunks):
+        #         yield self.__class__(
+        #             self.context,
+        #             self.gpu,
+        #             source_gpu=self.source_gpu,
+        #             target_gpu=self.target_gpu,
+        #             size=self.chunk_size,
+        #             __proto__=2,
+        #             **self.additional_info,
+        #         )
+        #     remaining_size = self.size % self.chunk_size
+        #     if remaining_size > 0:
+        #         yield self.__class__(
+        #             self.context,
+        #             self.gpu,
+        #             source_gpu=self.source_gpu,
+        #             target_gpu=self.target_gpu,
+        #             size=remaining_size,
+        #             __proto__=2,
+        #             **self.additional_info,
+        #         )
+
+        # result = NCCLPrimitiveParallel(self.gpu, True, generator())
+        # return result
         # result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
         # for _ in range(n_chunks):
         #     result.add(self.__class__(
@@ -508,75 +555,6 @@ class NCCLSend(NCCLPrimitive):
             intra_node_send,
         )
 
-
-class NCCLRingOp(NCCLPrimitive):
-    def __init__(
-        self,
-        context: int,
-        gpu: GPUDevice,
-        *,
-        source_gpu: Optional[GPUDevice] = None,
-        target_gpu: Optional[GPUDevice] = None,
-        size: int = 0,
-        chunk_size: int = 0,
-        __proto__: int = -1,
-        reduce_received: bool = False,
-        copy_received: bool = False,
-    ):
-        super().__init__(
-            context,
-            gpu,
-            source_gpu=source_gpu,
-            target_gpu=target_gpu,
-            size=size,
-            chunk_size=chunk_size,
-            __proto__=__proto__,
-        )
-        self.additional_info["reduce_received"] = reduce_received
-        self.additional_info["copy_received"] = copy_received
-
-    def __repr__(self) -> str:
-        return f"NCCLRingOp(source_gpu={self.source_gpu}, target_gpu={self.target_gpu}, size={self.size})"
-
-    def _p_to_goal(
-        self,
-        gpu2goal_rank: Dict[GPUDevice, int],
-        cpu: int,
-        nic: int,
-        intra_node_send: bool,
-        intra_node_recv: bool,
-    ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
-        send = self.send_goal(
-            self_goal_rank,
-            gpu2goal_rank[self.target_gpu],
-            self.size,
-            cpu,
-            nic,
-            intra_node_send,
-        )
-        recv = self.recv_goal(
-            self_goal_rank,
-            gpu2goal_rank[self.source_gpu],
-            self.size,
-            cpu,
-            nic,
-            intra_node_recv,
-        )
-        copy_received = self.additional_info.get("copy_received", False)
-        reduce_received = self.additional_info.get("reduce_received", False)
-        if copy_received or reduce_received:
-            calc_time = 0
-            if reduce_received:
-                calc_time += reduction_time(self.size, self.__proto__)
-            if copy_received:
-                calc_time += copy_time(self.size, self.__proto__)
-            recv = GoalSequential(
-                [recv, GoalCalc(calc_time, self_goal_rank, cpu)], self_goal_rank, cpu
-            )
-        return GoalSequential([send, recv], self_goal_rank, cpu, dependency=False)
-
-
 class NCCLCopySend(NCCLPrimitive):
     def __repr__(self) -> str:
         return f"NCCLCopySend(target_gpu={self.target_gpu}, size={self.size})"
@@ -625,39 +603,6 @@ class NCCLRecv(NCCLPrimitive):
             nic,
             intra_node_recv,
         )
-
-
-class NCCLSendRecv(NCCLPrimitive):  # for use in ring algorithms
-    def __repr__(self) -> str:
-        return f"NCCLSendRecv(source_gpu={self.source_gpu}, target_gpu={self.target_gpu}, size={self.size})"
-
-    def _p_to_goal(
-        self,
-        gpu2goal_rank: Dict[GPUDevice, int],
-        cpu: int,
-        nic: int,
-        intra_node_send: bool,
-        intra_node_recv: bool,
-    ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
-        send = self.send_goal(
-            self_goal_rank,
-            gpu2goal_rank[self.target_gpu],
-            self.size,
-            cpu,
-            nic,
-            intra_node_send,
-        )
-        recv = self.recv_goal(
-            self_goal_rank,
-            gpu2goal_rank[self.source_gpu],
-            self.size,
-            cpu,
-            nic,
-            intra_node_recv,
-        )
-        return GoalParallel([send, recv], self_goal_rank, cpu)
-
 
 class NCCLReduce(NCCLPrimitive):
     def __repr__(self) -> str:

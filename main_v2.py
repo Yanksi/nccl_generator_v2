@@ -86,6 +86,7 @@ def construct_collectives(
 ) -> None:
     coll_info = coll_info.copy()
 
+    logger.info("constructing collective infos")
     coll_info["collInfo"] = coll_info.apply(
         lambda row: CollInfo(
             root_rank=row["root"],
@@ -94,8 +95,8 @@ def construct_collectives(
             proto=proto_mapping[row["proto"]],
             data_size=row["data_size"],
             type_size=row["type_size"],
-            chunk_size=row["chunkSize"],
-            chunk_count=row["chunkCount"],
+            # chunk_size=row["chunkSize"],
+            # chunk_count=row["chunkCount"],
             chunk_steps=row["chunkSteps"],
             slice_steps=row["sliceSteps"],
             step_size=row["stepSize"],
@@ -103,6 +104,7 @@ def construct_collectives(
         axis=1,
     )
 
+    logger.info("constructing channel infos")
     coll_kernels = coll_kernels.copy()
     coll_kernels["chnlInfo"] = coll_kernels.sort_values(
         ["association", "workOffset"]
@@ -127,12 +129,7 @@ def construct_collectives(
         coll_info[["association", "collInfo"]]
         .merge(coll_kernels, on="association", how="left")
         .merge(comm_data, left_on="association", right_on="eventId", how="inner")
-        .merge(
-            comm_info[["nodeId", "commHash", "commId"]].drop_duplicates(),
-            on=["nodeId", "commHash"],
-            how="left",
-        )
-        .drop(columns=["association", "text"])
+        .drop(columns=["association"])
     )
 
     if len(coll_info) == 0:
@@ -169,7 +166,7 @@ def construct_collectives(
         ),
         axis=1,
     )
-    for _, row in coll_info.iterrows():
+    for _, row in tqdm(coll_info.iterrows(), total=len(coll_info)):
         # if row['parallelism'] != "DP":
         row["gpu"].add_collective(
             row["stream"], row["collOp"], row["start"], row["end"], row["context_label"]
@@ -197,11 +194,6 @@ def construct_p2p(
             ]
         ]
         .merge(comm_data, left_on="association", right_on="eventId", how="inner")
-        .merge(
-            comm_info[["nodeId", "commHash", "commId"]].drop_duplicates(),
-            on=["nodeId", "commHash"],
-            how="left",
-        )
     )
     p2p_ops = {"Send": Send, "Recv": Recv}
     if len(p2p_kernels) == 0:
@@ -227,7 +219,7 @@ def construct_p2p(
         axis=1,
     )
 
-    for _, row in p2p_kernels.iterrows():
+    for _, row in tqdm(p2p_kernels.iterrows(), total=len(p2p_kernels)):
         row["gpu"].add_collective(
             row["stream"], row["p2pOp"], row["start"], row["end"], row["context_label"]
         )
@@ -240,24 +232,41 @@ if __name__ == "__main__":
     # get the parent directory
     parent_dir = script_path.parent
     trace_dir = parent_dir / "traces/Llama7B_N4_GPU16_TP1_PP1_DP16_BS32/sqlite"
+    output_dir = parent_dir / "Llama7B_N4_GPU16_TP1_PP1_DP16_BS32_output"
+    output_dir.mkdir(parents=True, exist_ok=True)
     traces = find_all_traces(trace_dir)
     kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)
 
+    kernel_events.to_csv(output_dir / "kernel_events.csv", index=False)
+
     comm_info, comm_ring_info, comm_tree_info = get_communicator_info(nvtx_events)
+    # save comm_info, comm_ring_info, comm_tree_info to csv for debugging
+    comm_info.to_csv(output_dir / "comm_info.csv", index=False)
+    comm_ring_info.to_csv(output_dir / "comm_ring_info.csv", index=False)
+    comm_tree_info.to_csv(output_dir / "comm_tree_info.csv", index=False)
     communicators, gpu_devices = construct_communicators(
         comm_info, comm_ring_info, comm_tree_info
     )
-
+    
     profiling_interval = get_profiling_interval(nvtx_events)
-    comm_data, coll_info, coll_kernels, p2p_kernels = get_event_info(nvtx_events)
+    profiling_interval.to_csv(output_dir / "profiling_interval.csv", index=False)
+    comm_data, coll_info, coll_kernels, p2p_kernels = get_event_info(nvtx_events, comm_info)
+    # comm_data.to_csv(output_dir / "comm_data.csv", index=False)
+    coll_info.to_csv(output_dir / "coll_info.csv", index=False)
+    coll_kernels.to_csv(output_dir / "coll_kernels.csv", index=False)
+    p2p_kernels.to_csv(output_dir / "p2p_kernels.csv", index=False)
+
     comm_data, kernel_events = associate_kernel_to_nvtx(comm_data, kernel_events)
+    comm_data.to_csv(output_dir / "comm_data.csv", index=False)
     comm_data = filter_time(profiling_interval, comm_data)
     comm_data = add_context_parallelism(comm_data)
 
+    logger.info("constructing collectives")
     construct_collectives(
         gpu_devices, communicators, coll_info, coll_kernels, comm_data, comm_info
     )
+    logger.info("constructing p2p operations")
     construct_p2p(gpu_devices, communicators, p2p_kernels, comm_data, comm_info)
 
     gpu2goal_rank = {gpu: i for i, gpu in enumerate(gpu_devices.values())}
@@ -278,11 +287,13 @@ if __name__ == "__main__":
     #             write_tasks.append(f.write(result))
     #         await asyncio.gather(*write_tasks)
     # asyncio.run(write_goals_buffered())
-    with open("trace_llama7b.goal", "w") as f:
+    goal_path = output_dir / "output.goal"
+    with open(goal_path, "w") as f:
         logger.info("writing goal file")
         gpus = gpu_devices.values()
         f.write(f"num_ranks {len(gpus)}\n")
         for gpu in tqdm(gpus):
+            gpu.merge_streams()
             f.write(f"rank {gpu2goal_rank[gpu]} {{\n")
             for line in gpu.generate_goal_lines(gpu2goal_rank, nic=0):
                 f.write(f"{line}\n")

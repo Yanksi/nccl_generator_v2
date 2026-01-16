@@ -9,3 +9,7 @@ wheels/
 # Virtual environments
 .venv
 traces/
+*.goal
+*.bin
+*.csv
+*.json

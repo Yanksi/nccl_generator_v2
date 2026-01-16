@@ -90,27 +90,26 @@ class GPUDevice:
     def add_collective(self, stream: str, coll: CommOp, start: int, end: int, context: int = -1) -> None:
         self.streams.setdefault(stream, GPUStream(self, context)).add_collective(coll, start, end)
 
-    def generate_goal(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int) -> int:
+    def generate_goal(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int, starting_cpu_id: int = 0) -> int:
         goal_result = []
-        starting_cpu_id = 0
         for stream_id, stream in self.streams_sorted():
             goal_op, starting_cpu_id = stream.generate_goal(starting_cpu_id, nic, gpu2goal_rank)
             goal_result.append(goal_op)
         return GoalParallel(goal_result, gpu2goal_rank[self], 0), starting_cpu_id
     
-    def generate_goal_lines(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int):
-        starting_cpu_id = 0
+    def generate_goal_lines(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int, starting_cpu_id: int = 0):
         for stream_id, stream in self.streams_sorted():
             starting_cpu_id = yield from stream.generate_goal_lines(starting_cpu_id, nic, gpu2goal_rank)
         return starting_cpu_id
-    
+
     def merge_streams(self) -> None:
+        streams_id = list(self.streams.keys())
         all_collectives = reduce(lambda a, b: a + b,
-                                  [stream.collectives for stream in self.streams])
+                                  [self.streams[stream].collectives for stream in streams_id])
         all_starts = reduce(lambda a, b: a + b,
-                                  [stream.coll_starts for stream in self.streams])
+                                  [self.streams[stream].coll_starts for stream in streams_id])
         all_ends = reduce(lambda a, b: a + b,
-                                  [stream.coll_ends for stream in self.streams])
+                                  [self.streams[stream].coll_ends for stream in streams_id])
         all_collectives_with_times = sorted(zip(all_starts, all_ends, all_collectives), key=lambda x: x[0])
         streams = [GPUStream(self)]
         for start, end, coll in all_collectives_with_times:
