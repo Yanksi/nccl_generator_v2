@@ -474,10 +474,10 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
         if intra_node and enable_intra_node_transfer:
             return GoalSequential(
                 [
-                    GoalCalc(intra_node_transfer_time(size), self_goal_rank, cpu),
                     GoalSend(
                         target_goal_rank, 0, nic, self.context, self_goal_rank, cpu
                     ),
+                    GoalCalc(intra_node_transfer_time(size), self_goal_rank, cpu),
                 ],
                 self_goal_rank,
                 cpu,
