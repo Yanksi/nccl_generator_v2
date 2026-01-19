@@ -11,6 +11,7 @@ from tqdm import tqdm
 from nccl_comm import *
 from nccl_primitives import *
 from nsys_events import *
+import argparse
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -154,7 +155,7 @@ def construct_collectives(
     coll_info = coll_info.merge(communicator_id_df, on="commId", how="left")
     
     coll_info["context_label"] = coll_info.apply(
-        lambda row: context_labels.get(row["parallelism"], 0) + row["comm_num_id"] * 100, axis=1
+        lambda row: context_labels.get(row["parallelism"], 0) + row["comm_num_id"] * 10, axis=1
     )
     coll_info["collOp"] = coll_info.apply(
         lambda row: collective_ops[row["collective"]](
@@ -228,12 +229,21 @@ def construct_p2p(
 if __name__ == "__main__":
     # %%
     # get the path of the current script
-    script_path = pathlib.Path(__file__).resolve()
-    # get the parent directory
-    parent_dir = script_path.parent
-    trace_dir = parent_dir / "traces/Llama7B_N4_GPU16_TP1_PP1_DP16_BS32/sqlite"
-    output_dir = parent_dir / "Llama7B_N4_GPU16_TP1_PP1_DP16_BS32_output"
+    parser = argparse.ArgumentParser(description="Process some paths.")
+    parser.add_argument("--trace_dir", type=str, required=True, help="Directory containing trace files")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save output files")
+    parser.add_argument("--merged", action='store_true', help="Whether the streams are merged")
+    args = parser.parse_args()
+    trace_dir = pathlib.Path(args.trace_dir).resolve()
+    output_dir = pathlib.Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    merged_streams = args.merged
+    # script_path = pathlib.Path(__file__).resolve()
+    # # get the parent directory
+    # parent_dir = script_path.parent
+    # trace_dir = parent_dir / "traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite"
+    # output_dir = parent_dir / "traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/goal_unmerged"
+    # output_dir.mkdir(parents=True, exist_ok=True)
     traces = find_all_traces(trace_dir)
     kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)
@@ -293,7 +303,9 @@ if __name__ == "__main__":
         gpus = gpu_devices.values()
         f.write(f"num_ranks {len(gpus)}\n")
         for gpu in tqdm(gpus):
-            gpu.merge_streams()
+            if merged_streams:
+                gpu.merge_streams()
+            # gpu.merge_streams()
             f.write(f"rank {gpu2goal_rank[gpu]} {{\n")
             for line in gpu.generate_goal_lines(gpu2goal_rank, nic=0):
                 f.write(f"{line}\n")

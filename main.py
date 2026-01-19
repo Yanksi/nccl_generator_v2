@@ -8,7 +8,7 @@ import logging
 from typing import Dict, Tuple
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import aiofiles
+# import aiofiles
 import pathlib
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -105,7 +105,8 @@ def construct_collectives(
     coll_info["context_label"] = coll_info.apply(lambda row: context_labels.get(row['parallelism'], 0), axis=1)
     coll_info["collOp"] = coll_info.apply(lambda row: collective_ops[row['collective']](row['gpu'], row['comm'], row['collInfo'], row['chnlInfo'], row['context_label']), axis=1)
     for _, row in coll_info.iterrows():
-        row['gpu'].add_collective(row['stream'], row['collOp'], row['start'], row['end'], row['context_label'])
+        if row['parallelism'] == "DP":
+            row['gpu'].add_collective(row['stream'], row['collOp'], row['start'], row['end'], row['context_label'])
 
 def construct_p2p(
     gpu_devices: Dict[Tuple[str, int], GPUDevice],
@@ -151,7 +152,7 @@ if __name__ == "__main__":
     
     communicators, gpu_devices = construct_communicators(comm_info, comm_ring_info, comm_tree_info)
     construct_collectives(gpu_devices, communicators, coll_info, coll_kernels, comm_data, comm_info)
-    construct_p2p(gpu_devices, communicators, p2p_kernels, comm_data, comm_info)
+    # construct_p2p(gpu_devices, communicators, p2p_kernels, comm_data, comm_info)
 
     gpu2goal_rank = {gpu: i for i, gpu in enumerate(gpu_devices.values())}
     gpu2node = {gpu: gpu_id[0] for gpu_id, gpu in gpu_devices.items()}

@@ -10,10 +10,36 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 # import aiofiles
 from collections import defaultdict
+import json
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-
+def construct_communicators(comm_info: dict):
+    communicators = {}
+    gpu_devices = {}
+    for comm_id, comm_data in comm_info.items():
+        curr_comm_gpus = []
+        for rank, rank_data in comm_data["rank_To_rankInfo"].items():
+            gpu_id = rank_data["gpuId"]
+            node_id = rank_data["goal_rank"]
+            gpu_devices.setdefault(gpu_id, GPUDevice(gpu_id, node_id))
+            curr_comm_gpus.append((int(rank), gpu_devices[gpu_id]))
+        curr_comm_gpus.sort(key=lambda x: x[0])
+        communicators[comm_id] = Communicator(comm_id, [gpu for _, gpu in curr_comm_gpus])
+        for rank, rank_data in comm_data["rank_To_rankInfo"].items():
+            gpu_id = rank_data["gpuId"]
+            comm = communicators[comm_id]
+            chnl_info = rank_data["channel_info"]
+            for ring_info in chnl_info["Ring"]:
+                comm.add_ring_topo(
+                    int(rank), int(ring_info["previous_rank"]), int(ring_info["next_rank"])
+                )
+            for tree_info in chnl_info["Tree"]:
+                children = [int(c) for c in (tree_info[f"child_{i}_rank"] for i in range(1, 4))]
+                comm.add_tree_topo(
+                    int(rank), int(tree_info["parent_rank"]), [c for c in children if c >= 0]
+                )
+    return communicators, gpu_devices
 #%%
 def construct_communicators(comm_info: pd.DataFrame, comm_ring_info: pd.DataFrame, comm_tree_info: pd.DataFrame) -> Tuple[Dict[str, Communicator], Dict[Tuple[str, int], GPUDevice]]:
     logger.info("constructing communicator objects")

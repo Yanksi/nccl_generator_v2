@@ -397,68 +397,66 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
             
             return NCCLPrimitiveParallel(self.gpu, True, generator())
         else:
-            raise ValueError("Simple protocol conversion requires slice_per_chunk > 0.")
+            n_chunks = self.size // self.chunk_size
+            if n_chunks <= 1:
+                return self.__class__(
+                    self.context,
+                    self.gpu,
+                    source_gpu=self.source_gpu,
+                    target_gpu=self.target_gpu,
+                    size=self.size,
+                    __proto__=2,
+                    **self.additional_info,
+                )
 
-        # n_chunks = self.size // self.chunk_size
-        # if n_chunks <= 1:
-        #     return self.__class__(
-        #         self.context,
-        #         self.gpu,
-        #         source_gpu=self.source_gpu,
-        #         target_gpu=self.target_gpu,
-        #         size=self.size,
-        #         __proto__=2,
-        #         **self.additional_info,
-        #     )
+            def generator():
+                nonlocal self, n_chunks
+                for _ in range(n_chunks):
+                    yield self.__class__(
+                        self.context,
+                        self.gpu,
+                        source_gpu=self.source_gpu,
+                        target_gpu=self.target_gpu,
+                        size=self.chunk_size,
+                        __proto__=2,
+                        **self.additional_info,
+                    )
+                remaining_size = self.size % self.chunk_size
+                if remaining_size > 0:
+                    yield self.__class__(
+                        self.context,
+                        self.gpu,
+                        source_gpu=self.source_gpu,
+                        target_gpu=self.target_gpu,
+                        size=remaining_size,
+                        __proto__=2,
+                        **self.additional_info,
+                    )
 
-        # def generator():
-        #     nonlocal self, n_chunks
-        #     for _ in range(n_chunks):
-        #         yield self.__class__(
-        #             self.context,
-        #             self.gpu,
-        #             source_gpu=self.source_gpu,
-        #             target_gpu=self.target_gpu,
-        #             size=self.chunk_size,
-        #             __proto__=2,
-        #             **self.additional_info,
-        #         )
-        #     remaining_size = self.size % self.chunk_size
-        #     if remaining_size > 0:
-        #         yield self.__class__(
-        #             self.context,
-        #             self.gpu,
-        #             source_gpu=self.source_gpu,
-        #             target_gpu=self.target_gpu,
-        #             size=remaining_size,
-        #             __proto__=2,
-        #             **self.additional_info,
-        #         )
+            result = NCCLPrimitiveParallel(self.gpu, True, generator())
+            return result
+            # result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
+            # for _ in range(n_chunks):
+            #     result.add(self.__class__(
+            #         self.context,
+            #         self.gpu,
+            #         source_gpu=self.source_gpu,
+            #         target_gpu=self.target_gpu,
+            #         size=self.chunk_size,
+            #         __proto__=2
+            #     ))
 
-        # result = NCCLPrimitiveParallel(self.gpu, True, generator())
-        # return result
-        # result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
-        # for _ in range(n_chunks):
-        #     result.add(self.__class__(
-        #         self.context,
-        #         self.gpu,
-        #         source_gpu=self.source_gpu,
-        #         target_gpu=self.target_gpu,
-        #         size=self.chunk_size,
-        #         __proto__=2
-        #     ))
-
-        # remaining_size = self.size % self.chunk_size
-        # if remaining_size > 0:
-        #     result.add(self.__class__(
-        #         self.context,
-        #         self.gpu,
-        #         source_gpu=self.source_gpu,
-        #         target_gpu=self.target_gpu,
-        #          size=remaining_size,
-        #         __proto__=2
-        #     ))
-        # return result
+            # remaining_size = self.size % self.chunk_size
+            # if remaining_size > 0:
+            #     result.add(self.__class__(
+            #         self.context,
+            #         self.gpu,
+            #         source_gpu=self.source_gpu,
+            #         target_gpu=self.target_gpu,
+            #         size=remaining_size,
+            #         __proto__=2
+            #     ))
+            # return result
 
     def send_goal(
         self,
