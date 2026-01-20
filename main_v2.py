@@ -155,7 +155,7 @@ def construct_collectives(
     coll_info = coll_info.merge(communicator_id_df, on="commId", how="left")
     
     coll_info["context_label"] = coll_info.apply(
-        lambda row: context_labels.get(row["parallelism"], 0) + row["comm_num_id"] * 10, axis=1
+        lambda row: context_labels.get(row["parallelism"], 0) + row["comm_num_id"] * 100, axis=1
     )
     coll_info["collOp"] = coll_info.apply(
         lambda row: collective_ops[row["collective"]](
