@@ -14,6 +14,8 @@ from tqdm import tqdm
 from nccl_comm import *
 from nccl_primitives import *
 from gpu import *
+from configure_topo import *
+from topo_viz import *
 import argparse
 import time
 
@@ -300,6 +302,24 @@ if __name__ == "__main__":
         comm_info.to_csv(output_dir / "comm_info.csv", index=False)
         comm_ring_info.to_csv(output_dir / "comm_ring_info.csv", index=False)
         comm_tree_info.to_csv(output_dir / "comm_tree_info.csv", index=False)
+
+    # ring_viz = NCCLRingVisualizer(comm_ring_info)
+    # ring_viz.render(commId="0x4e57ac7cb1bd5e2e", channelId=0, out_dir=trace_dir / "topo_figs", show_pid=True)
+    # tree_viz = NCCLTreeVisualizer(comm_tree_info)
+    # tree_viz.render(commId="0xea423830d83ec83b", channelId=0, out_dir=trace_dir / "topo_figs", show_pid=True)
+
+    node_topo = None
+    node_topo = parent_dir / "../node_topology/tree4.topo"  ## add an argument to specify node topology file
+    # node_topo = trace_dir / "../node_topology/tree4_1L.topo"  ## add an argument to specify node topology file
+    # node_topo = trace_dir / "../node_topology/tree4_2L.topo"  ## add an argument to specify node topology file
+    if node_topo is not None:
+        node_groups = get_node_groups(node_topo)
+        comm_info, comm_ring_info, comm_tree_info = update_topo_info(comm_info, comm_ring_info, comm_tree_info, node_groups)
+        ring_viz = NCCLRingVisualizer(comm_ring_info)
+        ring_viz.render(commId="0x4e57ac7cb1bd5e2e", channelId=0, out_dir=trace_dir / "topo_figs", show_pid=True)
+        tree_viz = NCCLTreeVisualizer(comm_tree_info)
+        tree_viz.render(commId="0xea423830d83ec83b", channelId=0, out_dir=trace_dir / "topo_figs", show_pid=True)
+
     
     comm_data, coll_info, coll_kernels, p2p_kernels, nvtx_events = get_event_info(nvtx_events, comm_info)
 
