@@ -233,11 +233,13 @@ if __name__ == "__main__":
     parser.add_argument("--trace_dir", type=str, required=True, help="Directory containing trace files")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save output files")
     parser.add_argument("--merged", action='store_true', help="Whether the streams are merged")
+    parser.add_argument("--intermediate_results", action='store_true', help="Whether to save intermediate results")
     args = parser.parse_args()
     trace_dir = pathlib.Path(args.trace_dir).resolve()
     output_dir = pathlib.Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     merged_streams = args.merged
+    intermediate_results = args.intermediate_results
     # script_path = pathlib.Path(__file__).resolve()
     # # get the parent directory
     # parent_dir = script_path.parent
@@ -247,28 +249,35 @@ if __name__ == "__main__":
     traces = find_all_traces(trace_dir)
     kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)
-
-    kernel_events.to_csv(output_dir / "kernel_events.csv", index=False)
+    
+    if intermediate_results:
+        kernel_events.to_csv(output_dir / "kernel_events.csv", index=False)
+        nvtx_events.to_csv(output_dir / "nvtx_events.csv", index=False)
 
     comm_info, comm_ring_info, comm_tree_info = get_communicator_info(nvtx_events)
     # save comm_info, comm_ring_info, comm_tree_info to csv for debugging
-    comm_info.to_csv(output_dir / "comm_info.csv", index=False)
-    comm_ring_info.to_csv(output_dir / "comm_ring_info.csv", index=False)
-    comm_tree_info.to_csv(output_dir / "comm_tree_info.csv", index=False)
+    if intermediate_results:
+        comm_info.to_csv(output_dir / "comm_info.csv", index=False)
+        comm_ring_info.to_csv(output_dir / "comm_ring_info.csv", index=False)
+        comm_tree_info.to_csv(output_dir / "comm_tree_info.csv", index=False)
     communicators, gpu_devices = construct_communicators(
         comm_info, comm_ring_info, comm_tree_info
     )
     
     profiling_interval = get_profiling_interval(nvtx_events)
-    profiling_interval.to_csv(output_dir / "profiling_interval.csv", index=False)
+    if intermediate_results:
+        profiling_interval.to_csv(output_dir / "profiling_interval.csv", index=False)
     comm_data, coll_info, coll_kernels, p2p_kernels = get_event_info(nvtx_events, comm_info)
-    # comm_data.to_csv(output_dir / "comm_data.csv", index=False)
-    coll_info.to_csv(output_dir / "coll_info.csv", index=False)
-    coll_kernels.to_csv(output_dir / "coll_kernels.csv", index=False)
-    p2p_kernels.to_csv(output_dir / "p2p_kernels.csv", index=False)
+
+    if intermediate_results:
+        comm_data.to_csv(output_dir / "comm_data_before.csv", index=False)
+        coll_info.to_csv(output_dir / "coll_info.csv", index=False)
+        coll_kernels.to_csv(output_dir / "coll_kernels.csv", index=False)
+        p2p_kernels.to_csv(output_dir / "p2p_kernels.csv", index=False)
 
     comm_data, kernel_events = associate_kernel_to_nvtx(comm_data, kernel_events)
-    comm_data.to_csv(output_dir / "comm_data.csv", index=False)
+    if intermediate_results:
+        comm_data.to_csv(output_dir / "comm_data_after.csv", index=False)
     comm_data = filter_time(profiling_interval, comm_data)
     comm_data = add_context_parallelism(comm_data)
 
