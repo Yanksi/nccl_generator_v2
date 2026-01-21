@@ -111,7 +111,7 @@ def construct_collectives(
         ["association", "workOffset"]
     ).apply(
         lambda row: CollChnlInfo(
-            n_warps=row["nWarps"],
+            # n_warps=row["nWarps"],
             count=row["count"],
             chunk_count=row["chunkCount"],
             work_count=row["workCount"],
@@ -167,6 +167,7 @@ def construct_collectives(
         ),
         axis=1,
     )
+    coll_info = coll_info.sort_values("start").reset_index(drop=True)
     for _, row in tqdm(coll_info.iterrows(), total=len(coll_info)):
         # if row['parallelism'] != "DP":
         row["gpu"].add_collective(
@@ -181,22 +182,22 @@ def construct_p2p(
     comm_data: pd.DataFrame,
     comm_info: pd.DataFrame,
 ) -> None:
-    p2p_kernels = (
-        p2p_kernels[
-            [
-                "Bytes",
-                "nWarps",
-                "peer",
-                "proto",
-                "countHi32",
-                "countLo32",
-                "chunkSize",
-                "association",
-            ]
-        ]
-        .merge(comm_data, left_on="association", right_on="eventId", how="inner")
+    logger.info("constructing p2p channel infos")
+    p2p_kernels = p2p_kernels.copy()
+    p2p_kernels["chnlInfo"] = p2p_kernels.apply(
+        lambda row: P2PChnlInfo(
+            Bytes=row["Bytes"],
+            proto=proto_mapping[row["proto"]],
+            count=row["countHi32"] << 32 | row["countLo32"],
+            chunk_size=row["chunkSize"],
+            peer_rank=row['peer']
+        ),
+        axis=1,
     )
-    p2p_ops = {"Send": Send, "Recv": Recv}
+    p2p_kernels = p2p_kernels.groupby("association").agg({"chnlInfo": list}).reset_index()
+    
+    p2p_kernels = p2p_kernels.merge(comm_data, left_on="association", right_on="eventId", how="inner")
+    
     if len(p2p_kernels) == 0:
         return
     p2p_kernels["gpu"] = p2p_kernels.apply(
@@ -205,26 +206,25 @@ def construct_p2p(
     p2p_kernels["comm"] = p2p_kernels.apply(
         lambda row: communicators[row["commId"]], axis=1
     )
+    p2p_ops = {"Send": Send, "Recv": Recv}
     p2p_kernels["context_label"] = p2p_kernels.apply(
         lambda row: context_labels.get(row["parallelism"], 0), axis=1
     )
     p2p_kernels["p2pOp"] = p2p_kernels.apply(
         lambda row: p2p_ops[row["collective"]](
             row["gpu"],
-            row["Bytes"],
-            row["peer"],
             row["comm"],
-            row["chunkSize"],
             row["context_label"],
+            row["chnlInfo"],
         ),
         axis=1,
     )
-
+    
+    p2p_kernels = p2p_kernels.sort_values("start").reset_index(drop=True)
     for _, row in tqdm(p2p_kernels.iterrows(), total=len(p2p_kernels)):
         row["gpu"].add_collective(
             row["stream"], row["p2pOp"], row["start"], row["end"], row["context_label"]
         )
-
 
 if __name__ == "__main__":
     # %%

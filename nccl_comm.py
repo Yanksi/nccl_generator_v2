@@ -61,24 +61,6 @@ class CommOp(ABC):
     def to_primitives(self) -> NCCLPrimitiveComm:
         pass
 
-class P2POp(CommOp, ABC):
-    def __init__(self, gpu: GPUDevice, size: int, peer_rank: int, comm: Communicator, chunk_size: int, context: int):
-        super().__init__(gpu, context)
-        self.size = size
-        self.peer_gpu = comm.rank2gpu[peer_rank]
-        if chunk_size < 0:
-            raise ValueError("chunk_size must be >= 0")
-        self.chunk_size = chunk_size
-
-class Send(P2POp):        
-    def to_primitives(self) -> NCCLPrimitiveComm:
-        return NCCLSend(self.context, self.gpu, target_gpu=self.peer_gpu, size=self.size, chunk_size=self.chunk_size).proto_simple()
-
-
-class Recv(P2POp):
-    def to_primitives(self) -> NCCLPrimitiveComm:
-        return NCCLRecv(self.context, self.gpu, source_gpu=self.peer_gpu, size=self.size, chunk_size=self.chunk_size).proto_simple()
-
 
 class AllToAll(CommOp):
     def __init__(self, gpu: GPUDevice, size_per_peer: int, comm: Communicator, chunk_size: int, context: int):
@@ -126,6 +108,51 @@ class AllToAll(CommOp):
         result = NCCLPrimitiveParallel(self.gpu, True, generator())
         return result
 
+@dataclass
+class P2PChnlInfo:
+    Bytes: int
+    proto: NCCLProto
+    count: int
+    chunk_size: int
+    peer_rank: int
+
+class P2POp(CommOp, ABC):
+    def __init__(self, gpu: GPUDevice, comm: Communicator, context: int, chnl_infos: List[P2PChnlInfo]):
+        super().__init__(gpu, context)
+        self.comm = comm
+        # self.peer_gpu = comm.rank2gpu[peer_rank]
+        self.chnl_infos = chnl_infos
+    
+    def to_primitives(self) -> NCCLPrimitiveComm:
+        if len(self.chnl_infos) == 1:
+            return self._to_primitives_chnl(self.chnl_infos[0])
+        else:
+            result = NCCLPrimitiveParallel(self.gpu)
+            for chnl_info in self.chnl_infos:
+                result.add(self._to_primitives_chnl(chnl_info))
+            return result
+
+    def _to_primitives_chnl(self, chnl_info: P2PChnlInfo) -> NCCLPrimitiveComm:
+        raise NotImplementedError()
+
+class Send(P2POp):
+    def _to_primitives_chnl(self, chnl_info: P2PChnlInfo) -> NCCLPrimitiveComm:
+        result = NCCLSend(self.context, self.gpu, target_gpu=self.comm.rank2gpu[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
+        if chnl_info.proto == NCCLProto.LL:
+            return result.proto_ll()
+        else:
+            return result.proto_simple()
+    # def to_primitives(self) -> NCCLPrimitiveComm:
+    #     return NCCLSend(self.context, self.gpu, target_gpu=self.comm.rank2gpu[self.peer_rank], size=self.size, chunk_size=self.chunk_size).proto_simple()
+
+
+class Recv(P2POp):
+    def _to_primitives_chnl(self, chnl_info: P2PChnlInfo) -> NCCLPrimitiveComm:
+        result = NCCLRecv(self.context, self.gpu, source_gpu=self.comm.rank2gpu[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
+        if chnl_info.proto == NCCLProto.LL:
+            return result.proto_ll()
+        else:
+            return result.proto_simple()
 
 @dataclass
 class CollInfo:
@@ -143,7 +170,7 @@ class CollInfo:
 
 @dataclass
 class CollChnlInfo:
-    n_warps: int
+    # n_warps: int
     count: int
     chunk_count: int
     work_count: int
