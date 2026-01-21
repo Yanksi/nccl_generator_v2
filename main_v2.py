@@ -214,8 +214,8 @@ def construct_p2p(
         lambda row: p2p_ops[row["collective"]](
             row["gpu"],
             row["comm"],
-            row["context_label"],
             row["chnlInfo"],
+            row["context_label"],
         ),
         axis=1,
     )

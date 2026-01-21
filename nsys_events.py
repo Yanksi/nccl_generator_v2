@@ -511,11 +511,16 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None, profiling
         p2p_kernel_grouped[("0", 0)] = pd.DataFrame(
             columns=list(p2p_kernel_data.columns) + ["association"]
         )
-    comm_data = pd.concat((df.drop(columns=["commHash"]) for df in comm_grouped.values()), ignore_index=True)
-    coll_info_data = pd.concat((df.drop(columns=["eventId", "start", "end", "commHash", "stream", "nodeId", "pid"]) for df in coll_info_grouped.values()), ignore_index=True)
-    coll_kernel_data = pd.concat((df.drop(columns=["eventId", "start", "end", "nodeId", "pid"]) for df in coll_kernel_grouped.values()), ignore_index=True)
-    p2p_kernel_data = pd.concat((df.drop(columns=["eventId", "start", "end", "nodeId", "pid"]) for df in p2p_kernel_grouped.values()), ignore_index=True)
-
+    
+    comm_data = pd.concat((df.drop(columns=["commHash"], inplace=True) for df in comm_grouped.values()), ignore_index=True)
+    coll_info_data = pd.concat((df.drop(columns=["eventId", "start", "end", "commHash", "stream", "nodeId", "pid"], inplace=True) for df in coll_info_grouped.values()), ignore_index=True)
+    coll_kernel_data = pd.concat((df.drop(columns=["eventId", "start", "end", "nodeId", "pid"], inplace=True) for df in coll_kernel_grouped.values()), ignore_index=True)
+    p2p_kernel_data = pd.concat((df.drop(columns=["eventId", "start", "end", "nodeId", "pid"], inplace=True) for df in p2p_kernel_grouped.values()), ignore_index=True)
+    
+    comm_grouped = {k: v.drop(columns=["commHash"], inplace=True) for k, v in comm_grouped.items()}
+    coll_info_grouped = {k: v.drop(columns=["eventId", "start", "end", "commHash", "stream", "nodeId", "pid"], inplace=True) for k, v in coll_info_grouped.items()}
+    coll_kernel_grouped = {k: v.drop(columns=["eventId", "start", "end", "nodeId", "pid"], inplace=True) for k, v in coll_kernel_grouped.items()}
+    p2p_kernel_grouped = {k: v.drop(columns=["eventId", "start", "end", "nodeId", "pid"], inplace=True) for k, v in p2p_kernel_grouped.items()}
     # get the events grouped by stream
     if profiling_interval is not None:
         logger.info("filtering events by profiling intervals")

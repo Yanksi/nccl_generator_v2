@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Dict, Type, Union, Optional
+from typing import List, Dict, Type, Union, Optional, Generator
 from dataclasses import dataclass
 from enum import Enum
 from math import ceil
@@ -117,13 +117,15 @@ class P2PChnlInfo:
     peer_rank: int
 
 class P2POp(CommOp, ABC):
-    def __init__(self, gpu: GPUDevice, comm: Communicator, context: int, chnl_infos: List[P2PChnlInfo]):
+    def __init__(self, gpu: GPUDevice, comm: Communicator, chnl_infos: Union[List[P2PChnlInfo], Generator[P2PChnlInfo]], context: int):
         super().__init__(gpu, context)
         self.comm = comm
         # self.peer_gpu = comm.rank2gpu[peer_rank]
         self.chnl_infos = chnl_infos
     
     def to_primitives(self) -> NCCLPrimitiveComm:
+        if not isinstance(self.chnl_infos, list):
+            self.chnl_infos = list(self.chnl_infos) # convert generator to list
         if len(self.chnl_infos) == 1:
             return self._to_primitives_chnl(self.chnl_infos[0])
         else:
@@ -181,7 +183,7 @@ class CollChnlInfo:
 
 
 class CollectiveOp(CommOp):
-    def __init__(self, gpu: GPUDevice, comm: Communicator, coll_info: CollInfo, coll_chnl_infos: List[CollChnlInfo], context: int):
+    def __init__(self, gpu: GPUDevice, comm: Communicator, coll_info: CollInfo, coll_chnl_infos: Union[List[CollChnlInfo], Generator[CollChnlInfo]], context: int):
         super().__init__(gpu, context)
         self.comm = comm
         self.coll_info = coll_info
@@ -206,6 +208,8 @@ class CollectiveOp(CommOp):
         return result
     
     def to_primitives(self) -> NCCLPrimitiveComm:
+        if not isinstance(self.coll_chnl_infos, list):
+            self.coll_chnl_infos = list(self.coll_chnl_infos) # convert generator to list
         result = None
         if self.coll_info.algo == CollAlgo.RING:
             result = self._to_primitives_ring()
