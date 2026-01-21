@@ -141,13 +141,13 @@ def update_ring_ingress_egress_df(ring_ingress_egress_df: pd.DataFrame, comm_nod
         ].iloc[0]['ingressRank']
 
     ## Then update across switch groups if there are more than one switch group
-    if(comm_nodes_groups.loc[comm_nodes_groups["commId"] == comm_id]["comm_switch_groupId"].nunique() > 1):
-        for line_idx in ring_ingress_egress_df.index:
-            row = ring_ingress_egress_df.loc[line_idx]
-            comm_id = row['commId']
-            channel_id = row['channelId']
-            node_id = row['nodeId']
+    for line_idx in ring_ingress_egress_df.index:
+        row = ring_ingress_egress_df.loc[line_idx]
+        comm_id = row['commId']
+        channel_id = row['channelId']
+        node_id = row['nodeId']
 
+        if(comm_nodes_groups.loc[comm_nodes_groups["commId"] == comm_id]["comm_switch_groupId"].nunique() > 1):
             comm_switch_group_id = comm_nodes_groups.loc[(comm_nodes_groups["commId"] == comm_id) & (comm_nodes_groups["nodeId"] == node_id)].iloc[0]["comm_switch_groupId"]
             local_id = comm_nodes_groups.loc[(comm_nodes_groups["commId"] == comm_id) & (comm_nodes_groups["nodeId"] == node_id)].iloc[0]["nodeId_in_comm_switch_group"]
             num_local_nodes = comm_nodes_groups.loc[(comm_nodes_groups["commId"] == comm_id) & (comm_nodes_groups["nodeId"] == node_id)].iloc[0]["num_nodes_in_comm_switch_group"]

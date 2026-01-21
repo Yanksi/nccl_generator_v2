@@ -1,10 +1,22 @@
 from pathlib import Path
 import pandas as pd
+import subprocess
 
 
 class NCCLRingVisualizer:
-    def __init__(self, df: pd.DataFrame):
-        self.df = df.copy()
+    def __init__(self, comm_info: pd.DataFrame, comm_ring_info: pd.DataFrame, out_dir="nccl_ring_topo", tag=None, fmt="pdf", ignore_invalid_comm=True):
+        self.comm_info = comm_info.copy()
+        self.comm_ring_info = comm_ring_info.copy()
+
+        if ignore_invalid_comm:
+            valid_comm_ids = self.comm_info.loc[self.comm_info["nRanks"] > 1, "commId"].unique()
+            self.comm_ring_info = self.comm_ring_info[self.comm_ring_info["commId"].isin(valid_comm_ids)].reset_index(drop=True)
+
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.tag = "ring_" + tag if tag else "ring"
+        self.fmt = fmt
 
         required_cols = {
             "commId",
@@ -14,9 +26,9 @@ class NCCLRingVisualizer:
             "nextRank",
             "nodeId",
         }
-        missing = required_cols - set(df.columns)
+        missing = required_cols - set(comm_ring_info.columns)
         if missing:
-            raise ValueError(f"Missing required columns: {missing}")
+            raise ValueError(f"Missing required comm_ring_info columns: {missing}")
 
     def generate_dot(
         self,
@@ -27,11 +39,8 @@ class NCCLRingVisualizer:
         """
         Generate Graphviz DOT string for one NCCL ring.
         """
-        df = self.df[
-            (self.df.commId == commId) & (self.df.channelId == channelId)
-        ]
-
-        if df.empty:
+        comm_ring_info_df = self.comm_ring_info[(self.comm_ring_info.commId == commId) & (self.comm_ring_info.channelId == channelId)]
+        if comm_ring_info_df.empty:
             raise ValueError(f"No data for commId={commId}, channelId={channelId}")
 
         lines = []
@@ -42,7 +51,7 @@ class NCCLRingVisualizer:
         lines.append("")
 
         # ---- cluster by nodeId ----
-        for nodeId, g in df.groupby("nodeId"):
+        for nodeId, g in comm_ring_info_df.groupby("nodeId"):
             lines.append(f'  subgraph cluster_node_{nodeId} {{')
             lines.append(f'    label="node {nodeId}";')
             lines.append("    style=rounded;")
@@ -61,48 +70,55 @@ class NCCLRingVisualizer:
             lines.append("")
 
         # ---- ring edges: myRank -> nextRank ----
-        for _, row in df.iterrows():
+        for _, row in comm_ring_info_df.iterrows():
             src = row["myRank"]
             dst = row["nextRank"]
-            if dst != -1:
-                lines.append(f"  {src} -> {dst};")
+            lines.append(f"  {src} -> {dst};")
 
         lines.append("}")
         return "\n".join(lines)
 
-    def render(
-        self,
-        commId,
-        channelId,
-        out_dir="nccl_ring_topo",
-        fmt="png",
-        **kwargs,
-    ):
+    def render(self, commId, channelId, **kwargs):
         """
-        Generate dot + rendered image (requires graphviz installed).
+        Generate dot + img (requirement: graphviz).
         """
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
         dot = self.generate_dot(commId, channelId, **kwargs)
 
-        dot_path = out_dir / f"comm_{commId}_ch_{channelId}.dot"
-        img_path = out_dir / f"comm_{commId}_ch_{channelId}.{fmt}"
+        dot_path = self.out_dir / f"comm_{commId}_ch_{channelId}_{self.tag}.dot"
+        img_path = self.out_dir / f"comm_{commId}_ch_{channelId}_{self.tag}.{self.fmt}"
 
         dot_path.write_text(dot)
 
-        import subprocess
         subprocess.run(
-            ["dot", f"-T{fmt}", str(dot_path), "-o", str(img_path)],
+            ["dot", f"-T{self.fmt}", str(dot_path), "-o", str(img_path)],
             check=True,
         )
 
-        return dot_path, img_path
+        return
+    
+    def render_all(self, **kwargs):
+        """
+        Generate dot + rendered image for all commId/channelId combinations.
+        """
+        for (commId, channelId), group in self.comm_ring_info.groupby(["commId", "channelId"]):
+            self.render(commId=commId, channelId=channelId, show_pid=True)
 
+        return
 
 class NCCLTreeVisualizer:
-    def __init__(self, df: pd.DataFrame):
-        self.df = df.copy()
+    def __init__(self, comm_info: pd.DataFrame, comm_tree_info: pd.DataFrame, out_dir="nccl_tree_topo", tag=None, fmt="pdf", ignore_invalid_comm=True):
+        self.comm_info = comm_info.copy()
+        self.comm_tree_info = comm_tree_info.copy()
+
+        if ignore_invalid_comm:
+            valid_comm_ids = self.comm_info.loc[self.comm_info["nRanks"] > 1, "commId"].unique()
+            self.comm_tree_info = self.comm_tree_info[self.comm_tree_info["commId"].isin(valid_comm_ids)].reset_index(drop=True)
+
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.tag = "tree_" + tag if tag else "tree"
+        self.fmt = fmt
 
         required_cols = {
             "commId",
@@ -114,9 +130,9 @@ class NCCLTreeVisualizer:
             "child3Rank",
             "nodeId",
         }
-        missing = required_cols - set(df.columns)
+        missing = required_cols - set(comm_tree_info.columns)
         if missing:
-            raise ValueError(f"Missing required columns: {missing}")
+            raise ValueError(f"Missing required comm_tree_info columns: {missing}")
 
     def _escape(self, x):
         return str(x).replace("-", "_")
@@ -131,11 +147,8 @@ class NCCLTreeVisualizer:
         """
         Generate Graphviz DOT string for one NCCL tree.
         """
-        df = self.df[
-            (self.df.commId == commId) & (self.df.channelId == channelId)
-        ]
-
-        if df.empty:
+        comm_tree_info_df = self.comm_tree_info[(self.comm_tree_info.commId == commId) & (self.comm_tree_info.channelId == channelId)]
+        if comm_tree_info_df.empty:
             raise ValueError(f"No data for commId={commId}, channelId={channelId}")
 
         lines = []
@@ -146,7 +159,7 @@ class NCCLTreeVisualizer:
         lines.append("")
 
         # ---- cluster by nodeId ----
-        for nodeId, g in df.groupby("nodeId"):
+        for nodeId, g in comm_tree_info_df.groupby("nodeId"):
             lines.append(f'  subgraph cluster_node_{nodeId} {{')
             lines.append(f'    label="node {nodeId}";')
             lines.append("    style=rounded;")
@@ -165,50 +178,47 @@ class NCCLTreeVisualizer:
             lines.append("  }")
             lines.append("")
 
-        # ---- edges (parent -> child) ----
-        for _, row in df.iterrows():
-            src = row["myRank"]
+        # ---- tree edges (child -> parent) ----
+        for _, row in comm_tree_info_df.iterrows():
+            dst = row["myRank"]
 
             for c in ["child1Rank", "child2Rank", "child3Rank"]:
-                dst = row[c]
-                if dst != -1:
+                src = row[c]
+                if src != -1:
                     lines.append(f"  {src} -> {dst};")
 
             if show_parent_edge and row["parentRank"] != -1:
                 parent = row["parentRank"]
                 lines.append(
-                    f"  {parent} -> {src} [style=dashed, color=blue];"
+                    f"  {parent} -> {dst} [style=dashed, color=blue];"
                 )
 
         lines.append("}")
         return "\n".join(lines)
 
-    def render(
-        self,
-        commId,
-        channelId,
-        out_dir="nccl_topo",
-        fmt="png",
-        **kwargs,
-    ):
+    def render(self, commId, channelId, **kwargs):
         """
-        Generate dot + rendered image (requires graphviz installed).
+        Generate dot + img (requirement: graphviz).
         """
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
         dot = self.generate_dot(commId, channelId, **kwargs)
 
-        dot_path = out_dir / f"comm_{commId}_ch_{channelId}.dot"
-        img_path = out_dir / f"comm_{commId}_ch_{channelId}.{fmt}"
+        dot_path = self.out_dir / f"comm_{commId}_ch_{channelId}_{self.tag}.dot"
+        img_path = self.out_dir / f"comm_{commId}_ch_{channelId}_{self.tag}.{self.fmt}"
 
         dot_path.write_text(dot)
 
-        import subprocess
-
         subprocess.run(
-            ["dot", f"-T{fmt}", str(dot_path), "-o", str(img_path)],
+            ["dot", f"-T{self.fmt}", str(dot_path), "-o", str(img_path)],
             check=True,
         )
 
-        return dot_path, img_path
+        return
+    
+    def render_all(self, **kwargs):
+        """
+        Generate dot + rendered image for all commId/channelId combinations.
+        """
+        for (commId, channelId), group in self.comm_tree_info.groupby(["commId", "channelId"]):
+            self.render(commId=commId, channelId=channelId, show_pid=True)
+
+        return

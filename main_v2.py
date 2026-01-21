@@ -303,10 +303,10 @@ if __name__ == "__main__":
         comm_ring_info.to_csv(output_dir / "comm_ring_info.csv", index=False)
         comm_tree_info.to_csv(output_dir / "comm_tree_info.csv", index=False)
 
-    # ring_viz = NCCLRingVisualizer(comm_ring_info)
-    # ring_viz.render(commId="0x4e57ac7cb1bd5e2e", channelId=0, out_dir=trace_dir / "topo_figs", show_pid=True)
-    # tree_viz = NCCLTreeVisualizer(comm_tree_info)
-    # tree_viz.render(commId="0xea423830d83ec83b", channelId=0, out_dir=trace_dir / "topo_figs", show_pid=True)
+    ring_viz = NCCLRingVisualizer(comm_info=comm_info, comm_ring_info=comm_ring_info, out_dir=trace_dir / "topo_figs", tag="original")
+    ring_viz.render_all()
+    tree_viz = NCCLTreeVisualizer(comm_info=comm_info, comm_tree_info=comm_tree_info, out_dir=trace_dir / "topo_figs", tag="original")
+    tree_viz.render_all()
 
     node_topo = None
     node_topo = parent_dir / "../node_topology/tree4.topo"  ## add an argument to specify node topology file
@@ -315,10 +315,10 @@ if __name__ == "__main__":
     if node_topo is not None:
         node_groups = get_node_groups(node_topo)
         comm_info, comm_ring_info, comm_tree_info = update_topo_info(comm_info, comm_ring_info, comm_tree_info, node_groups)
-        ring_viz = NCCLRingVisualizer(comm_ring_info)
-        ring_viz.render(commId="0x4e57ac7cb1bd5e2e", channelId=0, out_dir=trace_dir / "topo_figs", show_pid=True)
-        tree_viz = NCCLTreeVisualizer(comm_tree_info)
-        tree_viz.render(commId="0xea423830d83ec83b", channelId=0, out_dir=trace_dir / "topo_figs", show_pid=True)
+        ring_viz = NCCLRingVisualizer(comm_info=comm_info, comm_ring_info=comm_ring_info, out_dir=trace_dir / "topo_figs", tag="updated")
+        ring_viz.render_all()
+        tree_viz = NCCLTreeVisualizer(comm_info=comm_info, comm_tree_info=comm_tree_info, out_dir=trace_dir / "topo_figs", tag="updated")
+        tree_viz.render_all()
 
     
     comm_data, coll_info, coll_kernels, p2p_kernels, nvtx_events = get_event_info(nvtx_events, comm_info)
