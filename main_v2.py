@@ -80,10 +80,10 @@ context_labels = {"Other": 0, "PP": 1, "DP": 2}
 def construct_collectives(
     gpu_devices: Dict[Tuple[str, int], GPUDevice],
     communicators: Dict[str, Communicator],
-    coll_info: pd.DataFrame,
-    coll_kernels: pd.DataFrame,
-    comm_data: pd.DataFrame,
-    comm_info: pd.DataFrame,
+    coll_info: Dict[Tuple[str, int], pd.DataFrame],
+    coll_kernels: Dict[Tuple[str, int], pd.DataFrame],
+    comm_data: Dict[Tuple[str, int], pd.DataFrame],
+    comm_id_numeric: pd.DataFrame,
 ) -> None:
     coll_info = coll_info.copy()
 
@@ -149,10 +149,7 @@ def construct_collectives(
         "Reduce": Reduce,
     }
     
-    # create a unique numerical id for each communicator
-    communicator_ids = [[i, comm_id] for i, comm_id in enumerate(comm_info["commId"].unique())]
-    communicator_id_df = pd.DataFrame(communicator_ids, columns=["comm_num_id", "commId"])
-    coll_info = coll_info.merge(communicator_id_df, on="commId", how="left")
+    coll_info = coll_info.merge(comm_id_numeric, on="commId", how="left")
     
     coll_info["context_label"] = coll_info.apply(
         lambda row: context_labels.get(row["parallelism"], 0) + row["comm_num_id"] * 100, axis=1
@@ -180,7 +177,7 @@ def construct_p2p(
     communicators: Dict[str, Communicator],
     p2p_kernels: pd.DataFrame,
     comm_data: pd.DataFrame,
-    comm_info: pd.DataFrame,
+    comm_id_numeric: pd.DataFrame,
 ) -> None:
     logger.info("constructing p2p channel infos")
     p2p_kernels = p2p_kernels.copy()
@@ -240,33 +237,29 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
     merged_streams = args.merged
     intermediate_results = args.intermediate_results
-    # script_path = pathlib.Path(__file__).resolve()
-    # # get the parent directory
-    # parent_dir = script_path.parent
-    # trace_dir = parent_dir / "traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite"
-    # output_dir = parent_dir / "traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/goal_unmerged"
-    # output_dir.mkdir(parents=True, exist_ok=True)
     traces = find_all_traces(trace_dir)
-    kernel_events = get_kernel_events(traces)
-    nvtx_events = get_nvtx_events(traces)
-    # if intermediate_results:
-    #     kernel_events.to_csv(output_dir / "kernel_events.csv", index=False)
-    #     nvtx_events.to_csv(output_dir / "nvtx_events.csv", index=False)
+    _nvtx_events = get_nvtx_events(traces)
+    nvtx_events = _nvtx_events
 
     comm_info, comm_ring_info, comm_tree_info, nvtx_events = get_communicator_info(nvtx_events)
+    communicator_ids_numeric = [[i, comm_id] for i, comm_id in enumerate(comm_info["commId"].unique())]
+    communicator_ids_numeric_df = pd.DataFrame(communicator_ids_numeric, columns=["comm_num_id", "commId"])
+
     # save comm_info, comm_ring_info, comm_tree_info to csv for debugging
     if intermediate_results:
         comm_info.to_csv(output_dir / "comm_info.csv", index=False)
         comm_ring_info.to_csv(output_dir / "comm_ring_info.csv", index=False)
         comm_tree_info.to_csv(output_dir / "comm_tree_info.csv", index=False)
-    communicators, gpu_devices = construct_communicators(
-        comm_info, comm_ring_info, comm_tree_info
-    )
     
+    comm_data, coll_info, coll_kernels, p2p_kernels, nvtx_events = get_event_info(nvtx_events, comm_info)
+
     profiling_interval, nvtx_events = get_profiling_interval(nvtx_events)
     if intermediate_results:
         profiling_interval.to_csv(output_dir / "profiling_interval.csv", index=False)
-    comm_data, coll_info, coll_kernels, p2p_kernels, nvtx_events = get_event_info(nvtx_events, comm_info)
+
+    communicators, gpu_devices = construct_communicators(
+        comm_info, comm_ring_info, comm_tree_info
+    )
 
     if intermediate_results:
         for data, name in zip([comm_data, coll_info, coll_kernels, p2p_kernels], ["comm_data", "coll_info", "coll_kernels", "p2p_kernels"]):
@@ -274,19 +267,51 @@ if __name__ == "__main__":
             curr_dir.mkdir(parents=True, exist_ok=True)
             for k, v in data.items():
                 v.to_csv(curr_dir / f"{k[0]}_{k[1]}.csv", index=False)
-
-    comm_data, kernel_events = associate_kernel_to_nvtx(comm_data, kernel_events)
+    
+    del nvtx_events
+    del _nvtx_events
+    
+    kernel_events = get_kernel_events(traces)
+    comm_data = associate_kernel_to_nvtx(comm_data, kernel_events)
     if intermediate_results:
         comm_data.to_csv(output_dir / "comm_data_after.csv", index=False)
     comm_data = filter_time(profiling_interval, comm_data)
     comm_data = add_context_parallelism(comm_data)
 
-    logger.info("constructing collectives")
-    construct_collectives(
-        gpu_devices, communicators, coll_info, coll_kernels, comm_data, comm_info
-    )
-    logger.info("constructing p2p operations")
-    construct_p2p(gpu_devices, communicators, p2p_kernels, comm_data, comm_info)
+
+    logger.info("initilizing GPU devices from dataframes")
+    comm_ops = {
+        "AllReduce": AllReduce,
+        "AllGather": AllGather,
+        "ReduceScatter": ReduceScatter,
+        "Broadcast": Broadcast,
+        "Reduce": Reduce,
+        "Send": Send,
+        "Recv": Recv,
+    }
+    for gpu_id, gpu in tqdm(gpu_devices.items()):
+        coll_info_gpu = coll_info[gpu_id]
+        coll_info_gpu["algo"] = coll_info_gpu["algo"].map(algo_mapping)
+        coll_info_gpu["proto"] = coll_info_gpu["proto"].map(proto_mapping)
+        coll_kernel_gpu = coll_kernels[gpu_id]
+        p2p_kernel_gpu = p2p_kernels[gpu_id]
+        p2p_kernel_gpu["proto"] = p2p_kernel_gpu["proto"].map(proto_mapping)
+        p2p_kernel_gpu["count"] = p2p_kernel_gpu["countHi32"] << 32 | p2p_kernel_gpu["countLo32"]
+        p2p_kernel_gpu.drop(columns=["countHi32", "countLo32"], inplace=True)
+        comm_data_gpu = comm_data[gpu_id]
+        comm_data_gpu = comm_data_gpu.merge(communicator_ids_numeric_df, on="commId", how="left")
+        comm_data_gpu["collective"] = comm_data_gpu["collective"].map(comm_ops)
+        comm_data_gpu["communicator"] = comm_data_gpu["commId"].map(communicators)
+        comm_data_gpu["context_label"] = comm_data_gpu.apply(
+            lambda row: context_labels.get(row["parallelism"], 0) + row["comm_num_id"] * 100, axis=1
+        )
+        comm_data_gpu.drop(columns=["commId", "parallelism", "comm_num_id"], inplace=True)
+        gpu.init_from_dfs(
+            coll_info_gpu,
+            coll_kernel_gpu,
+            p2p_kernel_gpu,
+            comm_data_gpu
+        )
 
     gpu2goal_rank = {gpu: i for i, gpu in enumerate(gpu_devices.values())}
     gpu2node = {gpu: gpu_id[0] for gpu_id, gpu in gpu_devices.items()}

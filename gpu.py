@@ -1,7 +1,6 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from nccl_comm import CommOp
+# from nccl_comm import CommOp, CollectiveOp, P2POp
 # from nccl_comm import CommOp
 from goal import GoalOp, GoalCalc, GoalSequential, GoalParallel
 from typing import List, Dict, Type, Union, Optional, Tuple
@@ -13,14 +12,59 @@ class GPUStream:
     def __init__(self, self_gpu: GPUDevice, context_info: int = -1):
         self.context_info: int = context_info
         self.self_gpu: GPUDevice = self_gpu
-        self.collectives: List[CommOp] = []
+        self.collectives: List[Union[CommOp, int]] = []
         self.coll_starts: List[int] = []
         self.coll_ends: List[int] = []
 
-    def add_collective(self, coll: CommOp, start: int, end: int) -> None:
+    def add_collective(self, coll: Union[CommOp, int], start: int, end: int) -> None:
         self.collectives.append(coll)
         self.coll_starts.append(start)
         self.coll_ends.append(end)
+    
+    def construct_collective(self, event_id: int):
+        from nccl_comm import P2POp, CollectiveOp
+        comm_data = self.self_gpu.dfs["comm_data"].loc[event_id]
+        coll_class = comm_data["collective"]
+        if issubclass(coll_class, CollectiveOp):
+            from nccl_comm import CollInfo, CollChnlInfo
+            if event_id not in self.self_gpu.dfs["coll_info"].index:
+                print(f"Event ID {event_id} not found in coll_info for GPU {self.self_gpu.id}.")
+                return None
+            coll_info = self.self_gpu.dfs["coll_info"].loc[event_id]
+            coll_info = CollInfo(
+                root_rank=coll_info["root"],
+                red_op=coll_info["redOp"],
+                algo=coll_info["algo"],
+                proto=coll_info["proto"],
+                data_size=coll_info["data_size"],
+                type_size=coll_info["type_size"],
+                chunk_steps=coll_info["chunkSteps"],
+                slice_steps=coll_info["sliceSteps"],
+                step_size=coll_info["stepSize"],
+            )
+            coll_chnl_infos = self.self_gpu.dfs["coll_kernels"][event_id].apply(
+                lambda row: CollChnlInfo(
+                    count=row["count"],
+                    chunk_count=row["chunkCount"],
+                    work_count=row["workCount"],
+                    last_chunk_count=row["lastChunkCount"],
+                    work_offset=row["workOffset"],
+                    send_buff=row["sendbuff"],
+                    recv_buff=row["recvbuff"],
+                ),
+                axis=1
+            )
+            return coll_class(self.self_gpu, comm_data["communicator"], coll_info, coll_chnl_infos, comm_data["context_label"])
+            
+        elif issubclass(coll_class, P2POp):
+            from nccl_comm import P2PChnlInfo
+            # p2p_chnl_infos = self.self_gpu.dfs["p2p_kernels"][event_id].apply(
+            #     lambda row: P2PChnlInfo(
+            #         Bytes=row["bytes"],
+            pass
+        else:
+            raise ValueError(f"Unknown collective class {coll_class} for event ID {event_id}.")
+
     
     def generate_goal(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
         curr_cpu = starting_cpu_id
@@ -28,6 +72,10 @@ class GPUStream:
         prev_end = -1
         goal_ops = []
         for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
+            if isinstance(coll, int):
+                # generate the collective
+                assert self.self_gpu.dfs is not None, "DFS data must be attached to GPUDevice to generate integer collectives."
+                raise NotImplementedError("Integer collectives are not implemented in goal generation.")
             primitives = coll.to_primitives()
             goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
             last_cpu = max(last_cpu, _last_cpu)
@@ -45,6 +93,10 @@ class GPUStream:
             prev_end = -1
             # for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
             for start, end, coll in tqdm(sorted(zip(self.coll_starts, self.coll_ends, self.collectives)), leave=False, total=len(self.collectives)):
+                if isinstance(coll, int):
+                    # generate the collective
+                    assert self.self_gpu.dfs is not None, "DFS data must be attached to GPUDevice to generate integer collectives."
+                    raise NotImplementedError("Integer collectives are not implemented in goal generation.")
                 primitives = coll.to_primitives()
                 goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
                 last_cpu = max(last_cpu, _last_cpu)
@@ -66,10 +118,11 @@ class GPUStream:
         return f"GPUStream(context_info={self.context_info}, self_gpu={self.self_gpu}, num_collectives={len(self.collectives)})"
 
 class GPUDevice:
-    def __init__(self, id: int, node_id: int = -1):
+    def __init__(self, id: int, node_id: int = -1, reference_mode: bool = False):
         self.id: int = id
         self.streams: Dict[str, GPUStream] = {}
         self.node_id: int = node_id
+        self.dfs = None
     
     def __repr__(self):
         return f"GPUDevice(id={self.id})"
@@ -81,13 +134,29 @@ class GPUDevice:
 
     def __hash__(self):
         return hash(self.id)
+
+    def init_from_dfs(self, coll_info, coll_kernels, p2p_kernels, comm_data):
+        self.dfs = {
+            "coll_info": coll_info.set_index("association"),
+            "coll_kernels": {k:v.sort_values("workOffset") for k,v in coll_kernels.groupby("association")},
+            "p2p_kernels": {k:v for k,v in p2p_kernels.groupby("association")},
+            "comm_data": comm_data.set_index("eventId")
+        }
+        for event_id, rows in tqdm(self.dfs["comm_data"].iterrows()):
+            self.add_collective(
+                stream=rows["stream"],
+                coll=event_id,
+                start=rows["start"],
+                end=rows["end"],
+                context=rows["context_label"]
+            )
     
     def streams_sorted(self):
         sorted_stream_keys = sorted(self.streams.keys(), key=lambda x: (self.streams[x].context_info, len(self.streams[x]), x))
         for key in sorted_stream_keys:
             yield key, self.streams[key]
 
-    def add_collective(self, stream: str, coll: CommOp, start: int, end: int, context: int = -1) -> None:
+    def add_collective(self, stream: str, coll: Union[CommOp, int], start: int, end: int, context: int = -1) -> None:
         self.streams.setdefault(stream, GPUStream(self, context)).add_collective(coll, start, end)
 
     def generate_goal(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int, starting_cpu_id: int = 0) -> int:
