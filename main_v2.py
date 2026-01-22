@@ -273,6 +273,8 @@ if __name__ == "__main__":
     
     kernel_events = get_kernel_events(traces)
     comm_data = associate_kernel_to_nvtx(comm_data, kernel_events)
+    del kernel_events
+    
     if intermediate_results:
         comm_data.to_csv(output_dir / "comm_data_after.csv", index=False)
     comm_data = filter_time(profiling_interval, comm_data)
@@ -296,7 +298,9 @@ if __name__ == "__main__":
         coll_kernel_gpu = coll_kernels[gpu_id]
         p2p_kernel_gpu = p2p_kernels[gpu_id]
         p2p_kernel_gpu["proto"] = p2p_kernel_gpu["proto"].map(proto_mapping)
-        p2p_kernel_gpu["count"] = p2p_kernel_gpu["countHi32"] << 32 | p2p_kernel_gpu["countLo32"]
+        p2p_kernel_gpu["count"] = p2p_kernel_gpu[["countHi32", "countLo32"]].apply(
+            lambda row: row["countHi32"] << 32 | row["countLo32"], axis=1
+        )
         p2p_kernel_gpu.drop(columns=["countHi32", "countLo32"], inplace=True)
         comm_data_gpu = comm_data[gpu_id]
         comm_data_gpu = comm_data_gpu.merge(communicator_ids_numeric_df, on="commId", how="left")

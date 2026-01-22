@@ -1,7 +1,8 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 # from nccl_comm import CommOp, CollectiveOp, P2POp
-# from nccl_comm import CommOp
+if TYPE_CHECKING:
+    from nccl_comm import CommOp
 from goal import GoalOp, GoalCalc, GoalSequential, GoalParallel
 from typing import List, Dict, Type, Union, Optional, Tuple
 from tqdm import tqdm
@@ -58,10 +59,17 @@ class GPUStream:
             
         elif issubclass(coll_class, P2POp):
             from nccl_comm import P2PChnlInfo
-            # p2p_chnl_infos = self.self_gpu.dfs["p2p_kernels"][event_id].apply(
-            #     lambda row: P2PChnlInfo(
-            #         Bytes=row["bytes"],
-            pass
+            p2p_chnl_infos = self.self_gpu.dfs["p2p_kernels"][event_id].apply(
+                lambda row: P2PChnlInfo(
+                    Bytes=row["Bytes"],
+                    proto=row["proto"],
+                    count=row["count"],
+                    chunk_size=row["chunkSize"],
+                    peer_rank=row["peer"],
+                ),
+                axis=1
+            )
+            return coll_class(self.self_gpu, comm_data["communicator"], p2p_chnl_infos, comm_data["context_label"])
         else:
             raise ValueError(f"Unknown collective class {coll_class} for event ID {event_id}.")
 
@@ -75,7 +83,9 @@ class GPUStream:
             if isinstance(coll, int):
                 # generate the collective
                 assert self.self_gpu.dfs is not None, "DFS data must be attached to GPUDevice to generate integer collectives."
-                raise NotImplementedError("Integer collectives are not implemented in goal generation.")
+                coll = self.construct_collective(coll)
+                if coll is None:
+                    continue
             primitives = coll.to_primitives()
             goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
             last_cpu = max(last_cpu, _last_cpu)
@@ -96,7 +106,9 @@ class GPUStream:
                 if isinstance(coll, int):
                     # generate the collective
                     assert self.self_gpu.dfs is not None, "DFS data must be attached to GPUDevice to generate integer collectives."
-                    raise NotImplementedError("Integer collectives are not implemented in goal generation.")
+                    coll = self.construct_collective(coll)
+                    if coll is None:
+                        continue
                 primitives = coll.to_primitives()
                 goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
                 last_cpu = max(last_cpu, _last_cpu)
@@ -142,7 +154,7 @@ class GPUDevice:
             "p2p_kernels": {k:v for k,v in p2p_kernels.groupby("association")},
             "comm_data": comm_data.set_index("eventId")
         }
-        for event_id, rows in tqdm(self.dfs["comm_data"].iterrows()):
+        for event_id, rows in self.dfs["comm_data"].iterrows():
             self.add_collective(
                 stream=rows["stream"],
                 coll=event_id,
