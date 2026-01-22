@@ -451,16 +451,18 @@ def update_comm_tree_info(comm_tree_info: pd.DataFrame, tree_ingress_egress_df: 
                 (comm_tree_info['myRank'] == ingressMaybeRank_0)
             )
 
+        internal_child_rank = -1
         maybe_internal_child_rank = comm_tree_info.loc[mask, 'child1Rank'].iloc[0]
-        maybe_internal_child_node = comm_tree_info.loc[
-                                        (comm_tree_info['commId'] == comm_id) &
-                                        (comm_tree_info['channelId'] == channel_id) &
-                                        (comm_tree_info['myRank'] == maybe_internal_child_rank)
-                                    ].iloc[0]['nodeId']
-        if maybe_internal_child_node != node_id:
-            internal_child_rank = -1
-        else:
-            internal_child_rank = maybe_internal_child_rank
+        if maybe_internal_child_rank != -1:
+            # print(f"line_idx: {line_idx}, comm_id: {comm_id}, channel_id: {channel_id}, maybe_internal_child_rank: {maybe_internal_child_rank}")
+            maybe_internal_child_node = comm_tree_info.loc[
+                                            (comm_tree_info['commId'] == comm_id) &
+                                            (comm_tree_info['channelId'] == channel_id) &
+                                            (comm_tree_info['myRank'] == maybe_internal_child_rank)
+                                        ].iloc[0]['nodeId']
+            if maybe_internal_child_node == node_id:
+                internal_child_rank = maybe_internal_child_rank
+        
         
         children_list = []
         for child in [internal_child_rank, external_child_0_rank, external_child_1_rank]:
