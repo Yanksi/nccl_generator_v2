@@ -97,15 +97,15 @@ def get_ring_same_switch_neighbor_node_id(comm_nodes_groups, comm_id, node_id, l
 
     return expected_row["nodeId"]
 
-def get_ring_neighbor_switch_node_id(comm_nodes_groups, comm_id, node_id, switch_id_offset):
+def get_ring_neighbor_switch_node_id(comm_nodes_groups, comm_id, channel_id, node_id, switch_id_offset, local_id_offset):
     row = comm_nodes_groups.loc[(comm_nodes_groups["commId"] == comm_id) & (comm_nodes_groups["nodeId"] == node_id)].iloc[0]
 
     num_switch_groups = comm_nodes_groups.loc[comm_nodes_groups["commId"] == comm_id]["comm_switch_groupId"].nunique()
     expected_comm_switch_group_id = (row["comm_switch_groupId"] + switch_id_offset + num_switch_groups) % num_switch_groups
 
     expected_comm_switch_group_first_node_row = comm_nodes_groups.loc[(comm_nodes_groups["commId"] == comm_id) & (comm_nodes_groups["comm_switch_groupId"] == expected_comm_switch_group_id) & (comm_nodes_groups["nodeId_in_comm_switch_group"] == 0)].iloc[0]
-    expected_comm_switch_group = expected_comm_switch_group_first_node_row["num_nodes_in_comm_switch_group"]
-    expected_node_local_id = (row["nodeId_in_comm_switch_group"] + switch_id_offset + expected_comm_switch_group) % expected_comm_switch_group
+    expected_comm_switch_group_num_nodes = expected_comm_switch_group_first_node_row["num_nodes_in_comm_switch_group"]
+    expected_node_local_id = (channel_id + local_id_offset + expected_comm_switch_group_num_nodes) % expected_comm_switch_group_num_nodes
     
     expected_row = comm_nodes_groups.loc[(comm_nodes_groups["commId"] == comm_id) & (comm_nodes_groups["comm_switch_groupId"] == expected_comm_switch_group_id) & (comm_nodes_groups["nodeId_in_comm_switch_group"] == expected_node_local_id)].iloc[0]
 
@@ -152,18 +152,8 @@ def update_ring_ingress_egress_df(ring_ingress_egress_df: pd.DataFrame, comm_nod
             local_id = comm_nodes_groups.loc[(comm_nodes_groups["commId"] == comm_id) & (comm_nodes_groups["nodeId"] == node_id)].iloc[0]["nodeId_in_comm_switch_group"]
             num_local_nodes = comm_nodes_groups.loc[(comm_nodes_groups["commId"] == comm_id) & (comm_nodes_groups["nodeId"] == node_id)].iloc[0]["num_nodes_in_comm_switch_group"]
 
-            if local_id == channel_id % num_local_nodes or num_local_nodes == 1:  ## ingress to the switch group, modify prev
-                new_prevRank_nodeId = get_ring_neighbor_switch_node_id(comm_nodes_groups, comm_id, node_id, 1)
-
-                ring_ingress_egress_df.loc[line_idx, 'prevRank_nodeId'] = new_prevRank_nodeId
-                ring_ingress_egress_df.loc[line_idx, 'prevRank'] = ring_ingress_egress_df.loc[
-                    (ring_ingress_egress_df['commId'] == comm_id) &
-                    (ring_ingress_egress_df['channelId'] == channel_id) &
-                    (ring_ingress_egress_df['nodeId'] == new_prevRank_nodeId)
-                ].iloc[0]['egressRank']
-
-            if local_id == (channel_id + 1) % num_local_nodes or num_local_nodes == 1:  ## engress to the switch group, modify next
-                new_nextRank_nodeId = get_ring_neighbor_switch_node_id(comm_nodes_groups, comm_id, node_id, -1)
+            if local_id == channel_id % num_local_nodes:  ## egress to the switch group, modify next, comm_switch_group_id: my - 1, locai_id: ch + 1 
+                new_nextRank_nodeId = get_ring_neighbor_switch_node_id(comm_nodes_groups, comm_id, channel_id, node_id, -1, 1)
 
                 ring_ingress_egress_df.loc[line_idx, 'nextRank_nodeId'] = new_nextRank_nodeId
                 ring_ingress_egress_df.loc[line_idx, 'nextRank'] = ring_ingress_egress_df.loc[
@@ -171,6 +161,16 @@ def update_ring_ingress_egress_df(ring_ingress_egress_df: pd.DataFrame, comm_nod
                     (ring_ingress_egress_df['channelId'] == channel_id) &
                     (ring_ingress_egress_df['nodeId'] == new_nextRank_nodeId)
                 ].iloc[0]['ingressRank']
+
+            if local_id == (channel_id + 1) % num_local_nodes:  ## ingress to the switch group, modify prev, comm_switch_group_id: my - 1, locai_id: ch
+                new_prevRank_nodeId = get_ring_neighbor_switch_node_id(comm_nodes_groups, comm_id, channel_id, node_id, 1, 0)
+
+                ring_ingress_egress_df.loc[line_idx, 'prevRank_nodeId'] = new_prevRank_nodeId
+                ring_ingress_egress_df.loc[line_idx, 'prevRank'] = ring_ingress_egress_df.loc[
+                    (ring_ingress_egress_df['commId'] == comm_id) &
+                    (ring_ingress_egress_df['channelId'] == channel_id) &
+                    (ring_ingress_egress_df['nodeId'] == new_prevRank_nodeId)
+                ].iloc[0]['egressRank']
 
     return ring_ingress_egress_df
 
