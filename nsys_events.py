@@ -47,7 +47,7 @@ def get_kernel_events(traces: List[os.PathLike]) -> pd.DataFrame:
         df_tmp["collective"] = df_tmp["value"].str.extract(r"ncclDevKernel_([a-zA-Z]+)")
         kernel_dfs.append(df_tmp)
 
-    kernel_df = pd.concat(kernel_dfs, ignore_index=True)
+    kernel_df = pd.concat(kernel_dfs, ignore_index=True, copy=False)
     kernel_df.drop(columns=["value"], inplace=True)
     # kernel_df['eventId'] = range(len(kernel_df))  # Add unique ID to each row
     # kernel_df["stream"] = kernel_df[["deviceId", "streamId"]].apply(lambda x: f"{x['deviceId']}-{x['streamId']}", axis=1)
@@ -69,7 +69,7 @@ def get_nvtx_events(traces: List[os.PathLike]) -> pd.DataFrame:
         df_tmp["nodeId"] = node_id
         nvtx_dfs.append(df_tmp)
 
-    nvtx_df = pd.concat(nvtx_dfs, ignore_index=True)
+    nvtx_df = pd.concat(nvtx_dfs, ignore_index=True, copy=False)
     nvtx_df["eventId"] = range(len(nvtx_df))  # Add unique ID to each row
     return nvtx_df
 
@@ -95,7 +95,9 @@ def get_communicator_info(data: pd.DataFrame):
     comm_info_pattern = (
         r"commHash (0x[0-9a-f]+) commId (0x[0-9a-f]+) rank (\d+) nranks (\d+) pid (\d+)"
     )
-    comm_info = data[data["text"].str.match(comm_info_pattern)].copy()
+    comm_info_pattern_matching_indexs = data["text"].str.match(comm_info_pattern)
+    comm_info = data[comm_info_pattern_matching_indexs].copy()
+    data = data[~comm_info_pattern_matching_indexs]
     comm_info[["commHash", "commId", "rank", "nRanks", "pid"]] = comm_info[
         "text"
     ].str.extract(comm_info_pattern)
@@ -113,7 +115,9 @@ def get_communicator_info(data: pd.DataFrame):
     comm_ring_pattern = (
         r"commHash (0x[0-9a-f]+) Rings \[(\d+)\] (\d+)->(\d+)->(\d+) pid (\d+)"
     )
-    comm_ring_info = data[data["text"].str.match(comm_ring_pattern)].copy()
+    comm_ring_pattern_matching_indexs = data["text"].str.match(comm_ring_pattern)
+    comm_ring_info = data[comm_ring_pattern_matching_indexs].copy()
+    data = data[~comm_ring_pattern_matching_indexs]
     comm_ring_info[
         ["commHash", "channelId", "prevRank", "myRank", "nextRank", "pid"]
     ] = comm_ring_info["text"].str.extract(comm_ring_pattern)
@@ -126,7 +130,9 @@ def get_communicator_info(data: pd.DataFrame):
 
     logger.info("extracting communicator trees")
     comm_tree_pattern = r"commHash (0x[0-9a-f]+) Trees \[(\d+)\] (-?\d+)/(-?\d+)/(-?\d+)->(-?\d+)->(-?\d+) pid (\d+)"
-    comm_tree_info = data[data["text"].str.match(comm_tree_pattern)].copy()
+    comm_tree_pattern_matching_indexs = data["text"].str.match(comm_tree_pattern)
+    comm_tree_info = data[comm_tree_pattern_matching_indexs].copy()
+    data = data[~comm_tree_pattern_matching_indexs]
     comm_tree_info[
         [
             "commHash",
@@ -155,7 +161,7 @@ def get_communicator_info(data: pd.DataFrame):
         .drop(columns=["commHash", "text", "start", "end", "eventId"])
         .drop_duplicates()
     )
-    return comm_info, comm_ring_info, comm_tree_info
+    return comm_info, comm_ring_info, comm_tree_info, data
 
 
 def get_profiling_interval(data: pd.DataFrame) -> pd.DataFrame:
@@ -163,8 +169,11 @@ def get_profiling_interval(data: pd.DataFrame) -> pd.DataFrame:
     data = data[["nodeId", "start", "text"]].copy()
     profile_start_pattern = r"nsys profiling start, pid: (\d+)"
     profile_end_pattern = r"nsys profiling stopped, pid: (\d+)"
-    profile_start_info = data[data["text"].str.match(profile_start_pattern)].copy()
-    profile_end_info = data[data["text"].str.match(profile_end_pattern)].copy()
+    profile_start_pattern_matching_indexs = data["text"].str.match(profile_start_pattern)
+    profile_end_pattern_matching_indexs = data["text"].str.match(profile_end_pattern)
+    profile_start_info = data[profile_start_pattern_matching_indexs].copy()
+    profile_end_info = data[profile_end_pattern_matching_indexs].copy()
+    data = data[~(profile_start_pattern_matching_indexs | profile_end_pattern_matching_indexs)]
     profile_start_info["pid"] = (
         profile_start_info["text"].str.extract(profile_start_pattern).astype("Int64")
     )
@@ -177,7 +186,7 @@ def get_profiling_interval(data: pd.DataFrame) -> pd.DataFrame:
     )
     return profile_start_info.merge(profile_end_info, on=["nodeId", "pid"])[
         ["nodeId", "pid", "start", "end"]
-    ]
+    ], data
 
 
 @numba.njit
@@ -355,12 +364,15 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None, profiling
 
     kernel_group_start_pattern = r"ncclGroupStart\(\): pid (\d+)"
     kernel_group_end_pattern = r"ncclGroupEnd\(\): pid (\d+)"
+    kernel_group_start_pattern_matching_indexs = data["text"].str.match(kernel_group_start_pattern)
+    kernel_group_end_pattern_matching_indexs = data["text"].str.match(kernel_group_end_pattern)
     kernel_group_start_info = data[
-        data["text"].str.match(kernel_group_start_pattern)
+        kernel_group_start_pattern_matching_indexs
     ].copy()
     kernel_group_end_info = data[
-        data["text"].str.match(kernel_group_end_pattern)
+        kernel_group_end_pattern_matching_indexs
     ].copy()
+    data = data[~(kernel_group_start_pattern_matching_indexs | kernel_group_end_pattern_matching_indexs)]
     kernel_group_start_info["pid"] = (
         kernel_group_start_info["text"]
         .str.extract(kernel_group_start_pattern)
@@ -371,6 +383,7 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None, profiling
         .str.extract(kernel_group_end_pattern)
         .astype("Int64")
     )
+
     kernel_group_start_info.drop(columns=["text"], inplace=True)
     kernel_group_end_info.drop(columns=["text"], inplace=True)
     kernel_group_start_info["isStart"] = True
@@ -390,7 +403,7 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None, profiling
         group_starts = group[group["isStart"]].rename(columns={"start": "group_start"})[
             ["groupId", "group_start"]
         ]
-        group_ends = group[~group["isStart"]].rename(columns={"end": "group_end"})[
+        group_ends = group[~group["isStart"]].rename(columns={"start": "group_end"})[
             ["groupId", "group_end"]
         ]
         group = group_starts.merge(group_ends, on=["groupId"], how="inner")
@@ -512,43 +525,47 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None, profiling
             columns=list(p2p_kernel_data.columns) + ["association"]
         )
     
-    comm_data = pd.concat((df.drop(columns=["commHash"], inplace=True) for df in comm_grouped.values()), ignore_index=True)
-    coll_info_data = pd.concat((df.drop(columns=["eventId", "start", "end", "commHash", "stream", "nodeId", "pid"], inplace=True) for df in coll_info_grouped.values()), ignore_index=True)
-    coll_kernel_data = pd.concat((df.drop(columns=["eventId", "start", "end", "nodeId", "pid"], inplace=True) for df in coll_kernel_grouped.values()), ignore_index=True)
-    p2p_kernel_data = pd.concat((df.drop(columns=["eventId", "start", "end", "nodeId", "pid"], inplace=True) for df in p2p_kernel_grouped.values()), ignore_index=True)
+    # comm_data = pd.concat((df.drop(columns=["commHash"]) for df in comm_grouped.values()), ignore_index=True)
+    # coll_info_data = pd.concat((df.drop(columns=["eventId", "start", "end", "commHash", "stream", "nodeId", "pid"]) for df in coll_info_grouped.values()), ignore_index=True)
+    # coll_kernel_data = pd.concat((df.drop(columns=["eventId", "start", "end", "nodeId", "pid"]) for df in coll_kernel_grouped.values()), ignore_index=True)
+    # p2p_kernel_data = pd.concat((df.drop(columns=["eventId", "start", "end", "nodeId", "pid"]) for df in p2p_kernel_grouped.values()), ignore_index=True)
     
-    comm_grouped = {k: v.drop(columns=["commHash"], inplace=True) for k, v in comm_grouped.items()}
-    coll_info_grouped = {k: v.drop(columns=["eventId", "start", "end", "commHash", "stream", "nodeId", "pid"], inplace=True) for k, v in coll_info_grouped.items()}
-    coll_kernel_grouped = {k: v.drop(columns=["eventId", "start", "end", "nodeId", "pid"], inplace=True) for k, v in coll_kernel_grouped.items()}
-    p2p_kernel_grouped = {k: v.drop(columns=["eventId", "start", "end", "nodeId", "pid"], inplace=True) for k, v in p2p_kernel_grouped.items()}
-    # get the events grouped by stream
-    if profiling_interval is not None:
-        logger.info("filtering events by profiling intervals")
-        comm_data = filter_time(profiling_interval, comm_data)
-        coll_info_data = coll_info_data.merge(
-            comm_data[["eventId"]],
-            left_on=["association"],
-            right_on=["eventId"],
-            how="inner",
-            suffixes=("", "_comm"),
-        ).drop(columns=["eventId_comm"])
+    # return comm_data, coll_info_data, coll_kernel_data, p2p_kernel_data, data
+    
+    comm_grouped = {k: v.drop(columns=["commHash"]) for k, v in comm_grouped.items()}
+    coll_info_grouped = {k: v.drop(columns=["eventId", "start", "end", "commHash", "stream", "nodeId", "pid"]) for k, v in coll_info_grouped.items()}
+    coll_kernel_grouped = {k: v.drop(columns=["eventId", "start", "end", "nodeId", "pid"]) for k, v in coll_kernel_grouped.items()}
+    p2p_kernel_grouped = {k: v.drop(columns=["eventId", "start", "end", "nodeId", "pid"]) for k, v in p2p_kernel_grouped.items()}
+    return comm_grouped, coll_info_grouped, coll_kernel_grouped, p2p_kernel_grouped, data
+    
+    # # get the events grouped by stream
+    # if profiling_interval is not None:
+    #     logger.info("filtering events by profiling intervals")
+    #     comm_data = filter_time(profiling_interval, comm_data)
+    #     coll_info_data = coll_info_data.merge(
+    #         comm_data[["eventId"]],
+    #         left_on=["association"],
+    #         right_on=["eventId"],
+    #         how="inner",
+    #         suffixes=("", "_comm"),
+    #     ).drop(columns=["eventId_comm"])
 
-        coll_kernel_data = coll_kernel_data.merge(
-            comm_data[["eventId"]],
-            left_on=["association"],
-            right_on=["eventId"],
-            how="inner",
-            suffixes=("", "_comm"),
-        ).drop(columns=["eventId_comm"])
+    #     coll_kernel_data = coll_kernel_data.merge(
+    #         comm_data[["eventId"]],
+    #         left_on=["association"],
+    #         right_on=["eventId"],
+    #         how="inner",
+    #         suffixes=("", "_comm"),
+    #     ).drop(columns=["eventId_comm"])
 
-        p2p_kernel_data = p2p_kernel_data.merge(
-            comm_data[["eventId"]],
-            left_on=["association"],
-            right_on=["eventId"],
-            how="inner",
-            suffixes=("", "_comm"),
-        ).drop(columns=["eventId_comm"])
-    return comm_data, coll_info_data, coll_kernel_data, p2p_kernel_data
+    #     p2p_kernel_data = p2p_kernel_data.merge(
+    #         comm_data[["eventId"]],
+    #         left_on=["association"],
+    #         right_on=["eventId"],
+    #         how="inner",
+    #         suffixes=("", "_comm"),
+    #     ).drop(columns=["eventId_comm"])
+    # return comm_data, coll_info_data, coll_kernel_data, p2p_kernel_data
 
 
 def associate_kernel_to_nvtx(
@@ -712,6 +729,20 @@ def add_context_parallelism(comm_data: pd.DataFrame):
         "Send": "F"
     }
 
+    rules = []
+    def register_rule(parallelism_name):
+        def decorator(func):
+            rules.append((parallelism_name, func))
+            return func
+        return decorator
+    
+    def get_rule(label_seq):
+        for parallelism_name, rule_func in rules:
+            if rule_func(label_seq):
+                return parallelism_name
+        return "Other"
+
+    @register_rule("DP")
     def rule_dp(label_seq):
         # for fully sharded data parallelism, the collective sequence should be like AAADDDAAADDD...
         # get the number of starting As
@@ -730,7 +761,8 @@ def add_context_parallelism(comm_data: pd.DataFrame):
             if label_seq[i+n_a:i+2*n_a] != "D" * n_a and i + n_a < len(label_seq):
                 return False
         return True
-
+    
+    @register_rule("PP")
     def rule_pp(label_seq):
         # for pipeline parallelism, it should just be a sequence of alternating E and F
         # the length of the sequence should be even
@@ -743,14 +775,25 @@ def add_context_parallelism(comm_data: pd.DataFrame):
             if label_seq[i : i + 2] != first_two:
                 return False
         return True
-
-    def get_rule(label_seq):
-        if rule_dp(label_seq):
-            return "DP"
-        elif rule_pp(label_seq):
-            return "PP"
-        else:
-            return "Other"
+    
+    @register_rule("PP")
+    def rule_pp2(label_seq):
+        # for pipeline parallelism variant, it should just be a sequence of alternating E and F with possible multiple Es or Fs in a row
+        # e.g., EEEFFFEFEEFF
+        label_seq = "".join(c for c in label_seq if c in ["E", "F"])
+        if len(label_seq) < 2:
+            return False
+        first_char = label_seq[0]
+        second_char = "F" if first_char == "E" else "E"
+        expecting_first = True
+        for c in label_seq:
+            if expecting_first:
+                if c != first_char:
+                    expecting_first = False
+            else:
+                if c != second_char:
+                    expecting_first = True
+        return True
 
     comm_data = comm_data.copy().sort_values("start").reset_index(drop=True)
     comm_data["label"] = comm_data["collective"].map(collective_labels)

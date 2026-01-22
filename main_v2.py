@@ -249,12 +249,11 @@ if __name__ == "__main__":
     traces = find_all_traces(trace_dir)
     kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)
-    
-    if intermediate_results:
-        kernel_events.to_csv(output_dir / "kernel_events.csv", index=False)
-        nvtx_events.to_csv(output_dir / "nvtx_events.csv", index=False)
+    # if intermediate_results:
+    #     kernel_events.to_csv(output_dir / "kernel_events.csv", index=False)
+    #     nvtx_events.to_csv(output_dir / "nvtx_events.csv", index=False)
 
-    comm_info, comm_ring_info, comm_tree_info = get_communicator_info(nvtx_events)
+    comm_info, comm_ring_info, comm_tree_info, nvtx_events = get_communicator_info(nvtx_events)
     # save comm_info, comm_ring_info, comm_tree_info to csv for debugging
     if intermediate_results:
         comm_info.to_csv(output_dir / "comm_info.csv", index=False)
@@ -264,16 +263,17 @@ if __name__ == "__main__":
         comm_info, comm_ring_info, comm_tree_info
     )
     
-    profiling_interval = get_profiling_interval(nvtx_events)
+    profiling_interval, nvtx_events = get_profiling_interval(nvtx_events)
     if intermediate_results:
         profiling_interval.to_csv(output_dir / "profiling_interval.csv", index=False)
-    comm_data, coll_info, coll_kernels, p2p_kernels = get_event_info(nvtx_events, comm_info)
+    comm_data, coll_info, coll_kernels, p2p_kernels, nvtx_events = get_event_info(nvtx_events, comm_info)
 
     if intermediate_results:
-        comm_data.to_csv(output_dir / "comm_data_before.csv", index=False)
-        coll_info.to_csv(output_dir / "coll_info.csv", index=False)
-        coll_kernels.to_csv(output_dir / "coll_kernels.csv", index=False)
-        p2p_kernels.to_csv(output_dir / "p2p_kernels.csv", index=False)
+        for data, name in zip([comm_data, coll_info, coll_kernels, p2p_kernels], ["comm_data", "coll_info", "coll_kernels", "p2p_kernels"]):
+            curr_dir = output_dir / name
+            curr_dir.mkdir(parents=True, exist_ok=True)
+            for k, v in data.items():
+                v.to_csv(curr_dir / f"{k[0]}_{k[1]}.csv", index=False)
 
     comm_data, kernel_events = associate_kernel_to_nvtx(comm_data, kernel_events)
     if intermediate_results:
