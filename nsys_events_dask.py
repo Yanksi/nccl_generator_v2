@@ -155,7 +155,7 @@ def process_nvtx_by_category(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     coll_kernel = df[df["category"] == "coll_kernel"].copy()
     if len(coll_kernel) > 0:
         coll_kernel[["count", "chunkCount", "workCount", "lastChunkCount", "workOffset", "sendbuff", "recvbuff", "pid"]] = coll_kernel["text"].str.extract(NVTX_PATTERNS["coll_kernel"])
-        coll_kernel[["count", "chunkCount", "workCount", "workOffset", "sendbuff", "recvbuff", "pid"]] = coll_kernel[["count", "chunkCount", "workCount", "workOffset", "sendbuff", "recvbuff", "pid"]].astype("UInt64")
+        coll_kernel[["count", "chunkCount", "workCount", "lastChunkCount", "workOffset", "sendbuff", "recvbuff", "pid"]] = coll_kernel[["count", "chunkCount", "workCount", "lastChunkCount", "workOffset", "sendbuff", "recvbuff", "pid"]].astype("UInt64")
         coll_kernel = coll_kernel.drop(columns=["text", "category"])
     result["coll_kernel"] = coll_kernel
     
