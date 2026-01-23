@@ -216,7 +216,12 @@ class GoalSequential(GoalOp):
         if self.consumed:
             raise ValueError("This GoalSequential has already been consumed and it is single-use.")
         iterator = iter(self.ops)
-        self.starting_op = next(iterator)
+        try:
+            self.starting_op = next(iterator)
+        except StopIteration:
+            # Empty generator - nothing to generate
+            self.consumed = True and self.single_use
+            return
         self.ending_op = self.starting_op
         prev_op = self.starting_op
         yield from self.starting_op.generate_lines()

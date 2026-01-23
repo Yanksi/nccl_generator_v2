@@ -24,11 +24,24 @@ def find_all_traces(directory):
     return list(pathlib.Path(directory).rglob("*.sqlite"))
 
 
+def extract_node_id(filename: str) -> str:
+    """Extract node ID from trace filename. Supports both nid and profile_job_node_rank formats."""
+    # Try nid format first (e.g., "profile_nid007654_123.sqlite")
+    match = re.search(r"nid(\d+)", filename)
+    if match:
+        return match.group(1)
+    # Try profile_job_node_rank format (e.g., "profile_6405_0_0.sqlite")
+    match = re.search(r"profile_\d+_(\d+)_\d+\.sqlite", filename)
+    if match:
+        return match.group(1)
+    raise ValueError(f"Could not extract node ID from filename: {filename}")
+
+
 def get_kernel_events(traces: List[os.PathLike]) -> pd.DataFrame:
     logger.info("querying for kernel events")
     kernel_dfs = []
     for trace_file in tqdm(traces):
-        node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
+        node_id = extract_node_id(trace_file.name)
         conn = sqlite3.connect(trace_file)
         df_tmp = pd.read_sql_query(
             "SELECT start, end, value, deviceId, streamId, globalPid / 0x1000000 % 0x1000000 AS pid FROM CUPTI_ACTIVITY_KIND_KERNEL cakk, StringIds si WHERE cakk.demangledName = si.id and si.value LIKE 'nccl%'",
@@ -58,7 +71,7 @@ def get_nvtx_events(traces: List[os.PathLike]) -> pd.DataFrame:
     logger.info("querying for nvtx events")
     nvtx_dfs = []
     for trace_file in tqdm(traces):
-        node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
+        node_id = extract_node_id(trace_file.name)
         conn = sqlite3.connect(trace_file)
         df_tmp = pd.read_sql_query(
             "SELECT start, end, text FROM NVTX_EVENTS",
@@ -97,18 +110,56 @@ def get_communicator_info(data: pd.DataFrame):
     comm_info_pattern_matching_indexs = data["text"].str.match(comm_info_pattern)
     comm_info = data[comm_info_pattern_matching_indexs].copy()
     data = data[~comm_info_pattern_matching_indexs]
-    comm_info[["commHash", "commId", "rank", "nRanks", "pid"]] = comm_info[
-        "text"
-    ].str.extract(comm_info_pattern)
-    comm_info = convert_numeric(comm_info, [], ["rank", "nRanks", "pid"])
-    # comm_info[["nRanks", "rank", "pid"]] = comm_info[["nRanks", "rank", "pid"]].astype(
-    #     "Int64"
-    # )
-    comm_info = comm_info.drop(
-        columns=["text", "start", "end", "eventId"]
-    ).drop_duplicates()
-
-    comm_hash2id = comm_info[["nodeId", "commHash", "commId"]].drop_duplicates()
+    
+    if len(comm_info) > 0:
+        # Standard NCCL 2.20 format with full init markers
+        comm_info[["commHash", "commId", "rank", "nRanks", "pid"]] = comm_info[
+            "text"
+        ].str.extract(comm_info_pattern)
+        comm_info = convert_numeric(comm_info, [], ["rank", "nRanks", "pid"])
+        comm_info = comm_info.drop(
+            columns=["text", "start", "end", "eventId"]
+        ).drop_duplicates()
+        comm_hash2id = comm_info[["nodeId", "commHash", "commId"]].drop_duplicates()
+    else:
+        # NCCL 2.28 format: no init markers, synthesize from collective calls
+        logger.warning("No communicator init markers found - synthesizing from collective calls")
+        
+        # Extract commHash from collective calls
+        coll_pattern = r"nccl[a-zA-Z]+\(\): commHash (0x[0-9a-f]+),.*pid (\d+)"
+        coll_matches = data["text"].str.extract(coll_pattern)
+        coll_matches.columns = ["commHash", "pid"]
+        coll_matches = coll_matches.dropna()
+        coll_matches["nodeId"] = data.loc[coll_matches.index, "nodeId"]
+        coll_matches["pid"] = coll_matches["pid"].astype("Int64")
+        
+        # Get unique (nodeId, pid, commHash) combinations
+        unique_gpus = coll_matches[["nodeId", "pid"]].drop_duplicates().reset_index(drop=True)
+        unique_comms = coll_matches["commHash"].unique()
+        
+        # Synthesize comm_info
+        comm_info_rows = []
+        for commHash in unique_comms:
+            # Use commHash as commId too (since we don't have separate commId)
+            gpus_in_comm = coll_matches[coll_matches["commHash"] == commHash][["nodeId", "pid"]].drop_duplicates()
+            nRanks = len(gpus_in_comm)
+            for rank, (_, row) in enumerate(gpus_in_comm.sort_values(["nodeId", "pid"]).iterrows()):
+                comm_info_rows.append({
+                    "nodeId": row["nodeId"],
+                    "commHash": commHash,
+                    "commId": commHash,  # Use commHash as commId
+                    "rank": rank,
+                    "nRanks": nRanks,
+                    "pid": row["pid"]
+                })
+        
+        if comm_info_rows:
+            comm_info = pd.DataFrame(comm_info_rows)
+            comm_info = convert_numeric(comm_info, [], ["rank", "nRanks", "pid"])
+        else:
+            comm_info = pd.DataFrame(columns=["nodeId", "commHash", "commId", "rank", "nRanks", "pid"])
+        
+        comm_hash2id = comm_info[["nodeId", "commHash", "commId"]].drop_duplicates()
 
     logger.info("extracting communicator rings")
     comm_ring_pattern = (
@@ -117,47 +168,113 @@ def get_communicator_info(data: pd.DataFrame):
     comm_ring_pattern_matching_indexs = data["text"].str.match(comm_ring_pattern)
     comm_ring_info = data[comm_ring_pattern_matching_indexs].copy()
     data = data[~comm_ring_pattern_matching_indexs]
-    comm_ring_info[
-        ["commHash", "channelId", "prevRank", "myRank", "nextRank", "pid"]
-    ] = comm_ring_info["text"].str.extract(comm_ring_pattern)
-    comm_ring_info = convert_numeric(comm_ring_info, [], ["channelId", "prevRank", "myRank", "nextRank", "pid"]
-                                     )
-    comm_ring_info = (
-        comm_ring_info.merge(comm_hash2id, on=["nodeId", "commHash"], how="left")
-        .drop(columns=["commHash", "text", "start", "end", "eventId"])
-        .drop_duplicates()
-    )
+    
+    if len(comm_ring_info) > 0:
+        comm_ring_info[
+            ["commHash", "channelId", "prevRank", "myRank", "nextRank", "pid"]
+        ] = comm_ring_info["text"].str.extract(comm_ring_pattern)
+        comm_ring_info = convert_numeric(comm_ring_info, [], ["channelId", "prevRank", "myRank", "nextRank", "pid"])
+        comm_ring_info = (
+            comm_ring_info.merge(comm_hash2id, on=["nodeId", "commHash"], how="left")
+            .drop(columns=["commHash", "text", "start", "end", "eventId"])
+            .drop_duplicates()
+        )
+    else:
+        # Synthesize ring topology for NCCL 2.28
+        # Create ring topology for multiple channels (up to 32, the NCCL default max)
+        logger.warning("No ring topology markers found - synthesizing simple ring with 32 channels")
+        num_channels = 32
+        ring_rows = []
+        for commId in comm_info["commId"].unique():
+            comm_ranks = comm_info[comm_info["commId"] == commId].sort_values("rank")
+            nRanks = len(comm_ranks)
+            for channelId in range(num_channels):
+                for _, row in comm_ranks.iterrows():
+                    myRank = row["rank"]
+                    prevRank = (myRank - 1) % nRanks
+                    nextRank = (myRank + 1) % nRanks
+                    ring_rows.append({
+                        "commId": commId,
+                        "channelId": channelId,
+                        "prevRank": prevRank,
+                        "myRank": myRank,
+                        "nextRank": nextRank,
+                        "pid": row["pid"],
+                        "nodeId": row["nodeId"]
+                    })
+        if ring_rows:
+            comm_ring_info = pd.DataFrame(ring_rows)
+            comm_ring_info = convert_numeric(comm_ring_info, [], ["channelId", "prevRank", "myRank", "nextRank", "pid"])
+        else:
+            comm_ring_info = pd.DataFrame(columns=["commId", "channelId", "prevRank", "myRank", "nextRank", "pid", "nodeId"])
 
     logger.info("extracting communicator trees")
     comm_tree_pattern = r"commHash (0x[0-9a-f]+) Trees \[(\d+)\] (-?\d+)/(-?\d+)/(-?\d+)->(-?\d+)->(-?\d+) pid (\d+)"
     comm_tree_pattern_matching_indexs = data["text"].str.match(comm_tree_pattern)
     comm_tree_info = data[comm_tree_pattern_matching_indexs].copy()
     data = data[~comm_tree_pattern_matching_indexs]
-    comm_tree_info[
-        [
-            "commHash",
-            "channelId",
-            "child1Rank",
-            "child2Rank",
-            "child3Rank",
-            "myRank",
-            "parentRank",
-            "pid",
-        ]
-    ] = comm_tree_info["text"].str.extract(comm_tree_pattern)
-    comm_tree_info = convert_numeric(comm_tree_info,
-        [
-            "child1Rank",
-            "child2Rank",
-            "child3Rank",
-            "parentRank"
-        ],["channelId","myRank","pid"]
-    )
-    comm_tree_info = (
-        comm_tree_info.merge(comm_hash2id, on=["nodeId", "commHash"], how="left")
-        .drop(columns=["commHash", "text", "start", "end", "eventId"])
-        .drop_duplicates()
-    )
+    
+    if len(comm_tree_info) > 0:
+        comm_tree_info[
+            [
+                "commHash",
+                "channelId",
+                "child1Rank",
+                "child2Rank",
+                "child3Rank",
+                "myRank",
+                "parentRank",
+                "pid",
+            ]
+        ] = comm_tree_info["text"].str.extract(comm_tree_pattern)
+        comm_tree_info = convert_numeric(comm_tree_info,
+            [
+                "child1Rank",
+                "child2Rank",
+                "child3Rank",
+                "parentRank"
+            ],["channelId","myRank","pid"]
+        )
+        comm_tree_info = (
+            comm_tree_info.merge(comm_hash2id, on=["nodeId", "commHash"], how="left")
+            .drop(columns=["commHash", "text", "start", "end", "eventId"])
+            .drop_duplicates()
+        )
+    else:
+        # Synthesize tree topology for NCCL 2.28 (simple binary tree with 32 channels)
+        logger.warning("No tree topology markers found - synthesizing simple tree with 32 channels")
+        num_channels = 32
+        tree_rows = []
+        for commId in comm_info["commId"].unique():
+            comm_ranks = comm_info[comm_info["commId"] == commId].sort_values("rank")
+            nRanks = len(comm_ranks)
+            for channelId in range(num_channels):
+                for _, row in comm_ranks.iterrows():
+                    myRank = row["rank"]
+                    # Simple binary tree: parent is (rank-1)//2, children are 2*rank+1, 2*rank+2
+                    parentRank = (myRank - 1) // 2 if myRank > 0 else -1
+                    child1Rank = 2 * myRank + 1 if 2 * myRank + 1 < nRanks else -1
+                    child2Rank = 2 * myRank + 2 if 2 * myRank + 2 < nRanks else -1
+                    tree_rows.append({
+                        "commId": commId,
+                        "channelId": channelId,
+                        "child1Rank": child1Rank,
+                        "child2Rank": child2Rank,
+                        "child3Rank": -1,
+                        "myRank": myRank,
+                        "parentRank": parentRank,
+                        "pid": row["pid"],
+                        "nodeId": row["nodeId"]
+                    })
+        if tree_rows:
+            comm_tree_info = pd.DataFrame(tree_rows)
+            comm_tree_info = convert_numeric(comm_tree_info,
+                ["child1Rank", "child2Rank", "child3Rank", "parentRank"],
+                ["channelId", "myRank", "pid"]
+            )
+        else:
+            comm_tree_info = pd.DataFrame(columns=["commId", "channelId", "child1Rank", "child2Rank", "child3Rank", "myRank", "parentRank", "pid", "nodeId"])
+    
     return comm_info, comm_ring_info, comm_tree_info, data
 
 
@@ -312,6 +429,7 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None):
             "count",
             "chunkCount",
             "workCount",
+            "lastChunkCount",
             "workOffset",
             "sendbuff",
             "recvbuff",
@@ -477,8 +595,11 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None):
             coll_kernel_grouped[gpu] = coll_kernels
 
         p2p_comm = comm[(comm["collective"] == "Send") | (comm["collective"] == "Recv")]
-        p2p_kernels = p2p_kernel_grouped[gpu]
-        if len(p2p_comm) > 0:
+        if gpu in p2p_kernel_grouped:
+            p2p_kernels = p2p_kernel_grouped[gpu]
+        else:
+            p2p_kernels = pd.DataFrame()
+        if len(p2p_comm) > 0 and len(p2p_kernels) > 0:
             p2p_types = {
                 "Send": "1",
                 "Recv": "2",
@@ -512,25 +633,25 @@ def associate_kernel_to_nvtx(
     kernel_events: pd.DataFrame,
     profiling_interval: pd.DataFrame = None,
 ):
+    """Associate kernel events to NVTX events using time-based matching.
+    
+    For NCCL 2.28+ traces, kernel events run on many CUDA streams while NVTX
+    events only track a few streams. We use time overlap to associate kernels
+    to their corresponding NVTX collective calls.
+    """
     if profiling_interval is not None:
         logger.info("filtering kernel events by profiling intervals")
         kernel_events = filter_time(profiling_interval, kernel_events)
-    logger.info("associating kernels to nvtx events")
+    logger.info("associating kernels to nvtx events (time-based matching)")
     kernel_df_grouped = {
         name: group for name, group in kernel_events.groupby(["nodeId", "pid"])
     }
+    
     for gpu in tqdm(kernel_df_grouped.keys()):
-        collective_labels = {
-            "AllGather": "A",
-            "AllReduce": "B",
-            "Broadcast": "C",
-            "ReduceScatter": "D",
-            "Recv": "E",
-            "Send": "E",
-            "SendRecv": "E",
-        }
         kernels = kernel_df_grouped[gpu].sort_values(by="start").reset_index(drop=True)
         nvtxs = comm_grouped[gpu].sort_values(by="start").reset_index(drop=True)
+        
+        # Handle grouped vs non-grouped NVTX events
         non_grouped_nvtxs = nvtxs[nvtxs["groupId"] == -1]
         grouped_nvtxs = nvtxs[nvtxs["groupId"] != -1]
 
@@ -547,111 +668,64 @@ def associate_kernel_to_nvtx(
             .sort_values(by="start")
             .reset_index(drop=True)
         )
-        kernels["label"] = kernels["collective"].map(collective_labels)
-        nvtxs["label"] = nvtxs["collective"].map(collective_labels)
-
-        kernel_stream_collectives = (
-            kernels.groupby(["streamId"])
-            .agg(
-                {
-                    "label": lambda x: "".join(x),
-                    "start": "first",
-                }
-            )
-            .reset_index()
-        )
-        kernel_stream_collectives["fingerPrint"] = kernel_stream_collectives[
-            "label"
-        ].map(lambda x: hex(hash(x) & 0xFFFFFFFFFFFFFFFF))
-        # give index based on the start time to avoid hash collision
-        kernel_stream_collectives = kernel_stream_collectives.sort_values(by=["fingerPrint", "start"]).reset_index(drop=True)
-        kernel_stream_collectives["index"] = kernel_stream_collectives.groupby("fingerPrint").cumcount()
         
-
-        nvtx_stream_collectives = (
-            nvtxs.groupby(["stream"])
-            .agg(
-                {
-                    "label": lambda x: "".join(x),
-                    "start": "first",
-                }
-            )
-            .reset_index()
+        # Time-based association: assign each kernel to the NVTX event that contains it
+        # Use the NVTX start/end times to create intervals
+        nvtx_starts = nvtxs["start"].to_numpy()
+        nvtx_ends = nvtxs["end"].to_numpy()
+        nvtx_event_ids = nvtxs["eventId"].to_numpy()
+        kernel_starts = kernels["start"].to_numpy()
+        
+        # Associate kernels to NVTX events by finding which NVTX interval contains each kernel
+        kernel_associations = _associate_events(
+            nvtx_starts,
+            nvtx_ends,
+            nvtx_event_ids,
+            kernel_starts,
         )
-        nvtx_stream_collectives["fingerPrint"] = nvtx_stream_collectives["label"].map(
-            lambda x: hex(hash(x) & 0xFFFFFFFFFFFFFFFF)
-        )
-        nvtx_stream_collectives = nvtx_stream_collectives.sort_values(by=["fingerPrint", "start"]).reset_index(drop=True)
-        nvtx_stream_collectives["index"] = nvtx_stream_collectives.groupby("fingerPrint").cumcount()
-
-        stream_correspondence = kernel_stream_collectives.merge(
-            nvtx_stream_collectives,
-            on=["fingerPrint", "index"],
-            suffixes=("_kernel", "_nvtx"),
-            how="outer",
-        )
-        if len(stream_correspondence) != max(
-            len(kernel_stream_collectives), len(nvtx_stream_collectives)
-        ):
-            raise ValueError("Mismatch in number of unique stream fingerprints")
-        # check for unmatched streams
-        unmatched_kernel_streams = stream_correspondence[
-            stream_correspondence["stream"].isna()
-        ]
-        if len(unmatched_kernel_streams) != 0:
-            logger.error(
-                f"GPU {gpu}: unmatched kernel streams: {unmatched_kernel_streams['streamId'].tolist()}"
-            )
-            for row in unmatched_kernel_streams.itertuples():
-                logger.error(
-                    f"  kernel streamId: {row.streamId}, label: {row.label_kernel}, fingerprint: {row.fingerPrint}"
-                )
-            raise ValueError("Unmatched kernel streams found")
-
-        nvtxs["inStreamEventId"] = nvtxs.groupby("stream").cumcount()
-        kernels["inStreamEventId"] = kernels.groupby("streamId").cumcount()
-        kernels = (
-            kernels.merge(
-                stream_correspondence[["streamId", "stream"]],
-                on=["streamId"],
-                how="left",
-            )
-            .merge(
-                nvtxs[["stream", "inStreamEventId", "eventId"]],
-                on=["stream", "inStreamEventId"],
-                how="left",
-            )
-            .drop(columns=["inStreamEventId", "stream", "label"])
-            .rename(columns={"eventId": "association"})
-        )
+        kernels["association"] = kernel_associations
+        
+        # For kernels that couldn't be associated (outside any NVTX interval),
+        # try to associate by finding the closest preceding NVTX event
+        unassociated_mask = kernels["association"] == -1
+        if unassociated_mask.any():
+            unassociated_times = kernels.loc[unassociated_mask, "start"].to_numpy()
+            # Find the closest preceding NVTX event
+            associations = np.searchsorted(nvtx_starts, unassociated_times, side='right') - 1
+            associations = np.clip(associations, 0, len(nvtx_event_ids) - 1)
+            kernels.loc[unassociated_mask, "association"] = nvtx_event_ids[associations]
 
         kernel_df_grouped[gpu] = kernels
-        nvtxs = (
-            nvtxs.drop(columns=["label", "inStreamEventId", "start", "end"])
-            .merge(
-                kernels[["start", "end", "association"]],
-                left_on=["eventId"],
-                right_on=["association"],
+        
+        # Update NVTX events with kernel timing info
+        # Use first and last kernel times for each NVTX event
+        kernel_times = kernels.groupby("association").agg(
+            kernel_start=("start", "min"),
+            kernel_end=("end", "max")
+        ).reset_index().rename(columns={"association": "eventId"})
+        
+        nvtxs = nvtxs.merge(kernel_times, on="eventId", how="left")
+        # Use kernel times if available, otherwise keep original NVTX times
+        nvtxs["start"] = nvtxs["kernel_start"].fillna(nvtxs["start"]).astype("Int64")
+        nvtxs["end"] = nvtxs["kernel_end"].fillna(nvtxs["end"]).astype("Int64")
+        nvtxs = nvtxs.drop(columns=["kernel_start", "kernel_end"])
+
+        # Handle dropped NVTX events (grouped events after the first)
+        if len(dropped_nvtxs) > 0:
+            dropped_nvtxs = dropped_nvtxs.drop(columns=["start", "end"], errors='ignore')
+            # Get end time from the group's first NVTX
+            group_ends = nvtxs[["groupId", "end"]].drop_duplicates()
+            dropped_nvtxs = dropped_nvtxs.merge(group_ends, on="groupId", how="left")
+            dropped_nvtxs["start"] = dropped_nvtxs["end"]
+            
+            nvtxs = (
+                pd.concat([nvtxs, dropped_nvtxs], ignore_index=True)
+                .sort_values(by=["start"])
+                .reset_index(drop=True)
             )
-            .drop(columns=["association"])
-        )
-
-        dropped_nvtxs = dropped_nvtxs.drop(columns=["start", "end"]).merge(
-            nvtxs[["end", "groupId"]], on=["groupId"], how="left"
-        )
-
-        dropped_nvtxs["start"] = dropped_nvtxs[
-            "end"
-        ]  # assign the end time of the previous nvtx as the start time of the dropped nvtx
-        nvtxs = (
-            pd.concat([nvtxs, dropped_nvtxs], ignore_index=True)
-            .sort_values(by=["start"])
-            .reset_index(drop=True)
-        )
 
         comm_grouped[gpu] = nvtxs
 
-    # comm_data = pd.concat(list(comm_grouped.values()), ignore_index=True)
     return comm_grouped
     
 def add_context_parallelism(comm_datas: Dict[Tuple[int, int], pd.DataFrame]):

@@ -7,6 +7,7 @@ from goal import GoalOp, GoalCalc, GoalSequential, GoalParallel
 from typing import List, Dict, Type, Union, Optional, Tuple
 from tqdm import tqdm
 from functools import reduce
+import pandas as pd
 
 
 class GPUStream:
@@ -31,27 +32,30 @@ class GPUStream:
             if event_id not in self.self_gpu.dfs["coll_info"].index:
                 print(f"Event ID {event_id} not found in coll_info for GPU {self.self_gpu.id}.")
                 return None
-            coll_info = self.self_gpu.dfs["coll_info"].loc[event_id]
+            coll_info_data = self.self_gpu.dfs["coll_info"].loc[event_id]
+            # Handle case where there are multiple rows for the same event_id (NCCL 2.28)
+            if isinstance(coll_info_data, pd.DataFrame):
+                coll_info_data = coll_info_data.iloc[0]
             coll_info = CollInfo(
-                root_rank=coll_info["root"],
-                red_op=coll_info["redOp"],
-                algo=coll_info["algo"],
-                proto=coll_info["proto"],
-                data_size=coll_info["data_size"],
-                type_size=coll_info["type_size"],
-                chunk_steps=coll_info["chunkSteps"],
-                slice_steps=coll_info["sliceSteps"],
-                step_size=coll_info["stepSize"],
+                root_rank=int(coll_info_data["root"]),
+                red_op=int(coll_info_data["redOp"]),
+                algo=coll_info_data["algo"],
+                proto=coll_info_data["proto"],
+                data_size=int(coll_info_data["data_size"]),
+                type_size=int(coll_info_data["type_size"]),
+                chunk_steps=int(coll_info_data["chunkSteps"]),
+                slice_steps=int(coll_info_data["sliceSteps"]),
+                step_size=int(coll_info_data["stepSize"]),
             )
             coll_chnl_infos = self.self_gpu.dfs["coll_kernels"][event_id].apply(
                 lambda row: CollChnlInfo(
-                    count=row["count"],
-                    chunk_count=row["chunkCount"],
-                    work_count=row["workCount"],
-                    last_chunk_count=row["lastChunkCount"],
-                    work_offset=row["workOffset"],
-                    send_buff=row["sendbuff"],
-                    recv_buff=row["recvbuff"],
+                    count=int(row["count"]),
+                    chunk_count=int(row["chunkCount"]),
+                    work_count=int(row["workCount"]),
+                    last_chunk_count=int(row["lastChunkCount"]),
+                    work_offset=int(row["workOffset"]),
+                    send_buff=int(row["sendbuff"]),
+                    recv_buff=int(row["recvbuff"]),
                 ),
                 axis=1
             )
@@ -113,7 +117,9 @@ class GPUStream:
                 goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
                 last_cpu = max(last_cpu, _last_cpu)
                 if prev_end > 0:
-                    yield GoalCalc(start - prev_end, gpu2goal_rank[self.self_gpu], curr_cpu)
+                    gap = max(0, start - prev_end)  # Clamp negative gaps to 0
+                    if gap > 0:
+                        yield GoalCalc(gap, gpu2goal_rank[self.self_gpu], curr_cpu)
                     # yield GoalCalc(112123, gpu2goal_rank[self.self_gpu], curr_cpu)
                 yield goal_op
                 prev_end = end
@@ -149,9 +155,9 @@ class GPUDevice:
 
     def init_from_dfs(self, coll_info, coll_kernels, p2p_kernels, comm_data):
         self.dfs = {
-            "coll_info": coll_info.set_index("association"),
-            "coll_kernels": {k:v.sort_values("workOffset") for k,v in coll_kernels.groupby("association")},
-            "p2p_kernels": {k:v for k,v in p2p_kernels.groupby("association")},
+            "coll_info": coll_info.set_index("association") if not coll_info.empty else coll_info,
+            "coll_kernels": {k:v.sort_values("workOffset") for k,v in coll_kernels.groupby("association")} if not coll_kernels.empty and "association" in coll_kernels.columns else {},
+            "p2p_kernels": {k:v for k,v in p2p_kernels.groupby("association")} if not p2p_kernels.empty and "association" in p2p_kernels.columns else {},
             "comm_data": comm_data.set_index("eventId")
         }
         for event_id, rows in self.dfs["comm_data"].iterrows():

@@ -113,8 +113,21 @@ if __name__ == "__main__":
     comm_data, coll_info, coll_kernels, p2p_kernels, nvtx_events = get_event_info(nvtx_events, comm_info)
 
     profiling_interval, nvtx_events = get_profiling_interval(nvtx_events)
-    if intermediate_results:
-        profiling_interval.to_csv(output_dir / "profiling_interval.csv", index=False)
+    
+    # Handle traces without profiling start/stop markers
+    if len(profiling_interval) == 0:
+        logger.warning("No profiling intervals found - using full trace duration")
+        # Skip time filtering, keep all data
+        has_profiling_interval = False
+    else:
+        has_profiling_interval = True
+        if intermediate_results:
+            # Convert dict to DataFrame for saving
+            prof_df = pd.DataFrame([
+                {"nodeId": k[0], "pid": k[1], "start": v[0], "end": v[1]}
+                for k, v in profiling_interval.items()
+            ])
+            prof_df.to_csv(output_dir / "profiling_interval.csv", index=False)
 
     if intermediate_results:
         for data, name in zip([comm_data, coll_info, coll_kernels, p2p_kernels], ["comm_data", "coll_info", "coll_kernels", "p2p_kernels"]):
@@ -141,7 +154,9 @@ if __name__ == "__main__":
         for k, v in comm_data.items():
             v.to_csv(curr_dir / f"{k[0]}_{k[1]}.csv", index=False)
 
-    comm_data = filter_time(profiling_interval, comm_data)
+    # Only filter by time if profiling intervals exist
+    if has_profiling_interval:
+        comm_data = filter_time(profiling_interval, comm_data)
     comm_data = add_context_parallelism(comm_data)
 
 
@@ -156,16 +171,18 @@ if __name__ == "__main__":
         "Recv": Recv,
     }
     for gpu_id, gpu in tqdm(gpu_devices.items()):
-        coll_info_gpu = coll_info[gpu_id]
-        coll_info_gpu["algo"] = coll_info_gpu["algo"].map(algo_mapping)
-        coll_info_gpu["proto"] = coll_info_gpu["proto"].map(proto_mapping)
-        coll_kernel_gpu = coll_kernels[gpu_id]
-        p2p_kernel_gpu = p2p_kernels[gpu_id]
-        p2p_kernel_gpu["proto"] = p2p_kernel_gpu["proto"].map(proto_mapping)
-        p2p_kernel_gpu["count"] = p2p_kernel_gpu[["countHi32", "countLo32"]].apply(
-            lambda row: row["countHi32"] << 32 | row["countLo32"], axis=1
-        )
-        p2p_kernel_gpu.drop(columns=["countHi32", "countLo32"], inplace=True)
+        coll_info_gpu = coll_info.get(gpu_id, pd.DataFrame())
+        if not coll_info_gpu.empty:
+            coll_info_gpu["algo"] = coll_info_gpu["algo"].map(algo_mapping)
+            coll_info_gpu["proto"] = coll_info_gpu["proto"].map(proto_mapping)
+        coll_kernel_gpu = coll_kernels.get(gpu_id, pd.DataFrame())
+        p2p_kernel_gpu = p2p_kernels.get(gpu_id, pd.DataFrame())
+        if not p2p_kernel_gpu.empty:
+            p2p_kernel_gpu["proto"] = p2p_kernel_gpu["proto"].map(proto_mapping)
+            p2p_kernel_gpu["count"] = p2p_kernel_gpu[["countHi32", "countLo32"]].apply(
+                lambda row: row["countHi32"] << 32 | row["countLo32"], axis=1
+            )
+            p2p_kernel_gpu.drop(columns=["countHi32", "countLo32"], inplace=True)
         comm_data_gpu = comm_data[gpu_id]
         comm_data_gpu = comm_data_gpu.merge(communicator_ids_numeric_df, on="commId", how="left")
         comm_data_gpu["collective"] = comm_data_gpu["collective"].map(comm_ops)
