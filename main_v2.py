@@ -98,9 +98,9 @@ if __name__ == "__main__":
         from nsys_events import *
 
     traces = find_all_traces(trace_dir)
-    _nvtx_events = get_nvtx_events(traces)
+    nvtx_events = get_nvtx_events(traces)
 
-    comm_info, comm_ring_info, comm_tree_info, nvtx_events = get_communicator_info(_nvtx_events)
+    comm_info, comm_ring_info, comm_tree_info, nvtx_events = get_communicator_info(nvtx_events)
     communicator_ids_numeric = [[i, comm_id] for i, comm_id in enumerate(comm_info["commId"].unique())]
     communicator_ids_numeric_df = pd.DataFrame(communicator_ids_numeric, columns=["comm_num_id", "commId"])
 
@@ -125,7 +125,6 @@ if __name__ == "__main__":
     
     
     del nvtx_events
-    del _nvtx_events
     
     kernel_events = get_kernel_events(traces)
     comm_data = associate_kernel_to_nvtx(comm_data, kernel_events)
