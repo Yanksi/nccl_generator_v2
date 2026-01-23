@@ -1,10 +1,11 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 # from nccl_comm import CommOp, CollectiveOp, P2POp
 if TYPE_CHECKING:
     from nccl_comm import CommOp
+from nccl_primitives import GpuId
 from goal import GoalOp, GoalCalc, GoalSequential, GoalParallel
-from typing import List, Dict, Type, Union, Optional, Tuple
+from typing import List, Dict, Type, Union, Optional
 from tqdm import tqdm
 from functools import reduce
 
@@ -55,7 +56,7 @@ class GPUStream:
                 ),
                 axis=1
             )
-            return coll_class(self.self_gpu, comm_data["communicator"], coll_info, coll_chnl_infos, comm_data["context_label"])
+            return coll_class(self.self_gpu.gpu_id, comm_data["communicator"], coll_info, coll_chnl_infos, comm_data["context_label"])
             
         elif issubclass(coll_class, P2POp):
             from nccl_comm import P2PChnlInfo
@@ -69,17 +70,19 @@ class GPUStream:
                 ),
                 axis=1
             )
-            return coll_class(self.self_gpu, comm_data["communicator"], p2p_chnl_infos, comm_data["context_label"])
+            return coll_class(self.self_gpu.gpu_id, comm_data["communicator"], p2p_chnl_infos, comm_data["context_label"])
         else:
             raise ValueError(f"Unknown collective class {coll_class} for event ID {event_id}.")
 
     
-    def generate_goal(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int]) -> Tuple[GoalOp, int]:
+    def generate_goal(self, starting_cpu_id: int, nic: int, gpu_id2goal_rank: Dict[GpuId, int]) -> Tuple[GoalOp, int]:
         curr_cpu = starting_cpu_id
         last_cpu = curr_cpu
         prev_end = -1
         goal_ops = []
-        for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
+        gpu_id = self.self_gpu.gpu_id
+        # for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
+        for coll, start, end in zip(self.collectives, self.coll_starts, self.coll_ends):
             if isinstance(coll, int):
                 # generate the collective
                 assert self.self_gpu.dfs is not None, "DFS data must be attached to GPUDevice to generate integer collectives."
@@ -87,22 +90,24 @@ class GPUStream:
                 if coll is None:
                     continue
             primitives = coll.to_primitives()
-            goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
+            goal_op, _last_cpu = primitives.to_goal(gpu_id2goal_rank, starting_cpu_id, nic)
             last_cpu = max(last_cpu, _last_cpu)
             if prev_end > 0:
-                goal_ops.append(GoalCalc(start - prev_end, gpu2goal_rank[self.self_gpu], curr_cpu))
+                goal_ops.append(GoalCalc(start - prev_end, gpu_id2goal_rank[gpu_id], curr_cpu))
             goal_ops.append(goal_op)
             prev_end = end
-        return GoalSequential(goal_ops, gpu2goal_rank[self.self_gpu], starting_cpu_id), last_cpu
+        return GoalSequential(goal_ops, gpu_id2goal_rank[gpu_id], starting_cpu_id), last_cpu
     
-    def generate_goal_lines(self, starting_cpu_id: int, nic: int, gpu2goal_rank: Dict[GPUDevice, int]):
+    def generate_goal_lines(self, starting_cpu_id: int, nic: int, gpu_id2goal_rank: Dict[GpuId, int]):
         curr_cpu = starting_cpu_id
         last_cpu = curr_cpu
+        gpu_id = self.self_gpu.gpu_id
         def goal_gen():
             nonlocal curr_cpu, last_cpu
             prev_end = -1
             # for coll, start, end in tqdm(zip(self.collectives, self.coll_starts, self.coll_ends), leave=False, total=len(self.collectives)):
-            for start, end, coll in tqdm(sorted(zip(self.coll_starts, self.coll_ends, self.collectives)), leave=False, total=len(self.collectives)):
+            # for start, end, coll in tqdm(sorted(zip(self.coll_starts, self.coll_ends, self.collectives)), leave=False, total=len(self.collectives)):
+            for start, end, coll in sorted(zip(self.coll_starts, self.coll_ends, self.collectives)):
                 if isinstance(coll, int):
                     # generate the collective
                     assert self.self_gpu.dfs is not None, "DFS data must be attached to GPUDevice to generate integer collectives."
@@ -110,17 +115,17 @@ class GPUStream:
                     if coll is None:
                         continue
                 primitives = coll.to_primitives()
-                goal_op, _last_cpu = primitives.to_goal(gpu2goal_rank, starting_cpu_id, nic)
+                goal_op, _last_cpu = primitives.to_goal(gpu_id2goal_rank, starting_cpu_id, nic)
                 last_cpu = max(last_cpu, _last_cpu)
                 if prev_end > 0:
-                    yield GoalCalc(start - prev_end, gpu2goal_rank[self.self_gpu], curr_cpu)
-                    # yield GoalCalc(112123, gpu2goal_rank[self.self_gpu], curr_cpu)
+                    yield GoalCalc(start - prev_end, gpu_id2goal_rank[gpu_id], curr_cpu)
+                    # yield GoalCalc(112123, gpu_id2goal_rank[gpu_id], curr_cpu)
                 yield goal_op
                 prev_end = end
-        goal_op = GoalSequential(goal_gen(), gpu2goal_rank[self.self_gpu], starting_cpu_id)
+        goal_op = GoalSequential(goal_gen(), gpu_id2goal_rank[gpu_id], starting_cpu_id)
         for line in goal_op.generate_lines():
             yield line
-        tqdm.write(f"Generated goals for stream on GPU {self.self_gpu.id} with context {self.context_info} for {len(self.collectives)} collectives.")
+        # tqdm.write(f"Generated goals for stream on GPU {self.self_gpu.id} with context {self.context_info} for {len(self.collectives)} collectives.")
         return last_cpu
     
     def __len__(self):
@@ -130,11 +135,17 @@ class GPUStream:
         return f"GPUStream(context_info={self.context_info}, self_gpu={self.self_gpu}, num_collectives={len(self.collectives)})"
 
 class GPUDevice:
-    def __init__(self, id: int, node_id: int = -1, reference_mode: bool = False):
-        self.id: int = id
+    def __init__(self, rank: int, node_id: str = "", pid: int = 0, reference_mode: bool = False):
+        self.id: int = rank  # Sequential rank for display/goal file
+        self.pid: int = pid  # Actual process ID from trace
         self.streams: Dict[str, GPUStream] = {}
-        self.node_id: int = node_id
+        self.node_id: str = node_id
         self.dfs = None
+    
+    @property
+    def gpu_id(self) -> GpuId:
+        """Return the GPU ID as a (node_id, pid) tuple."""
+        return (self.node_id, self.pid)
     
     def __repr__(self):
         return f"GPUDevice(id={self.id})"
@@ -171,16 +182,16 @@ class GPUDevice:
     def add_collective(self, stream: str, coll: Union[CommOp, int], start: int, end: int, context: int = -1) -> None:
         self.streams.setdefault(stream, GPUStream(self, context)).add_collective(coll, start, end)
 
-    def generate_goal(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int, starting_cpu_id: int = 0) -> int:
+    def generate_goal(self, gpu_id2goal_rank: Dict[GpuId, int], nic: int, starting_cpu_id: int = 0) -> int:
         goal_result = []
         for stream_id, stream in self.streams_sorted():
-            goal_op, starting_cpu_id = stream.generate_goal(starting_cpu_id, nic, gpu2goal_rank)
+            goal_op, starting_cpu_id = stream.generate_goal(starting_cpu_id, nic, gpu_id2goal_rank)
             goal_result.append(goal_op)
-        return GoalParallel(goal_result, gpu2goal_rank[self], 0), starting_cpu_id
+        return GoalParallel(goal_result, gpu_id2goal_rank[self.gpu_id], 0), starting_cpu_id
     
-    def generate_goal_lines(self, gpu2goal_rank: Dict[GPUDevice, int], nic: int, starting_cpu_id: int = 0):
+    def generate_goal_lines(self, gpu_id2goal_rank: Dict[GpuId, int], nic: int, starting_cpu_id: int = 0):
         for stream_id, stream in self.streams_sorted():
-            starting_cpu_id = yield from stream.generate_goal_lines(starting_cpu_id, nic, gpu2goal_rank)
+            starting_cpu_id = yield from stream.generate_goal_lines(starting_cpu_id, nic, gpu_id2goal_rank)
         return starting_cpu_id
 
     def merge_streams(self) -> None:

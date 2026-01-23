@@ -18,43 +18,43 @@ class NCCLProto(Enum):
 
 @dataclass
 class TreeTopoNode:
-    parent: GPUDevice
-    children: List[GPUDevice]
+    parent: GpuId
+    children: List[GpuId]
 
 @dataclass
 class RingTopoNode:
-    prev: GPUDevice
-    nxt: GPUDevice
+    prev: GpuId
+    nxt: GpuId
 
 class Communicator:
-    def __init__(self, comm_id: str, gpus: List[GPUDevice]):
+    def __init__(self, comm_id: str, gpu_ids: List[GpuId]):
         self.comm_id: str = comm_id
-        self.rank2gpu: List[GPUDevice] = gpus
-        self.gpu2rank: Dict[GPUDevice, int] = {gpu: i for i, gpu in enumerate(gpus)}
-        self.n_ranks = len(gpus)
-        self.tree_topo: Dict[GPUDevice, List[TreeTopoNode]] = {gpu: [] for gpu in gpus}
-        self.ring_topo: Dict[GPUDevice, List[RingTopoNode]] = {gpu: [] for gpu in gpus}
-        self.rank2gpu.append(None) # when query rank -1, return None
+        self.rank2gpu_id: List[GpuId] = gpu_ids
+        self.gpu_id2rank: Dict[GpuId, int] = {gpu_id: i for i, gpu_id in enumerate(gpu_ids)}
+        self.n_ranks = len(gpu_ids)
+        self.tree_topo: Dict[GpuId, List[TreeTopoNode]] = {gpu_id: [] for gpu_id in gpu_ids}
+        self.ring_topo: Dict[GpuId, List[RingTopoNode]] = {gpu_id: [] for gpu_id in gpu_ids}
+        self.rank2gpu_id.append(None) # when query rank -1, return None
     
     def add_tree_topo(self, gpu_rank: int, parent_rank: int, children_ranks: List[int]):
-        gpu = self.rank2gpu[gpu_rank]
-        parent = self.rank2gpu[parent_rank]
-        children = [self.rank2gpu[child_rank] for child_rank in children_ranks]
-        self.tree_topo[gpu].append(TreeTopoNode(parent, children))
+        gpu_id = self.rank2gpu_id[gpu_rank]
+        parent = self.rank2gpu_id[parent_rank]
+        children = [self.rank2gpu_id[child_rank] for child_rank in children_ranks]
+        self.tree_topo[gpu_id].append(TreeTopoNode(parent, children))
 
     def add_ring_topo(self, gpu_rank: int, prev_rank: int, nxt_rank: int):
-        gpu = self.rank2gpu[gpu_rank]
-        prev = self.rank2gpu[prev_rank]
-        nxt = self.rank2gpu[nxt_rank]
-        self.ring_topo[gpu].append(RingTopoNode(prev, nxt))
+        gpu_id = self.rank2gpu_id[gpu_rank]
+        prev = self.rank2gpu_id[prev_rank]
+        nxt = self.rank2gpu_id[nxt_rank]
+        self.ring_topo[gpu_id].append(RingTopoNode(prev, nxt))
     
     def __repr__(self) -> str:
         return f"Communicator(id={self.comm_id}, n_ranks={self.n_ranks})"
 
 
 class CommOp(ABC):
-    def __init__(self, gpu: GPUDevice, context: int):
-        self.gpu = gpu
+    def __init__(self, gpu_id: GpuId, context: int):
+        self.gpu_id = gpu_id
         self.context = context
 
     @abstractmethod
@@ -63,8 +63,8 @@ class CommOp(ABC):
 
 
 class AllToAll(CommOp):
-    def __init__(self, gpu: GPUDevice, size_per_peer: int, comm: Communicator, chunk_size: int, context: int):
-        super().__init__(gpu, context)
+    def __init__(self, gpu_id: GpuId, size_per_peer: int, comm: Communicator, chunk_size: int, context: int):
+        super().__init__(gpu_id, context)
         self.size_per_peer = size_per_peer
         self.comm = comm
         self.chunk_size = chunk_size
@@ -72,40 +72,40 @@ class AllToAll(CommOp):
     def to_primitives(self) -> NCCLPrimitiveComm:
         n_ranks = self.comm.n_ranks
         def generator():
-            for peer_rank in range(self.comm.gpu2rank[self.gpu]):
+            for peer_rank in range(self.comm.gpu_id2rank[self.gpu_id]):
                 # Recv from peer
                 yield NCCLRecv(
                     self.context,
-                    self.gpu,
-                    source_gpu=self.comm.rank2gpu[peer_rank],
+                    self.gpu_id,
+                    source_gpu_id=self.comm.rank2gpu_id[peer_rank],
                     size=self.size_per_peer,
                     chunk_size=self.chunk_size
                 ).proto_simple()
                 yield NCCLSend(
                     self.context,
-                    self.gpu,
-                    target_gpu=self.comm.rank2gpu[peer_rank],
+                    self.gpu_id,
+                    target_gpu_id=self.comm.rank2gpu_id[peer_rank],
                     size=self.size_per_peer,
                     chunk_size=self.chunk_size
                 ).proto_simple()
-            for peer_rank in range(self.comm.gpu2rank[self.gpu] + 1, n_ranks):
+            for peer_rank in range(self.comm.gpu_id2rank[self.gpu_id] + 1, n_ranks):
                 # Send to peer
                 yield NCCLSend(
                     self.context,
-                    self.gpu,
-                    target_gpu=self.comm.rank2gpu[peer_rank],
+                    self.gpu_id,
+                    target_gpu_id=self.comm.rank2gpu_id[peer_rank],
                     size=self.size_per_peer,
                     chunk_size=self.chunk_size
                 ).proto_simple()
                 yield NCCLRecv(
                     self.context,
-                    self.gpu,
-                    source_gpu=self.comm.rank2gpu[peer_rank],
+                    self.gpu_id,
+                    source_gpu_id=self.comm.rank2gpu_id[peer_rank],
                     size=self.size_per_peer,
                     chunk_size=self.chunk_size
                 ).proto_simple()
     
-        result = NCCLPrimitiveParallel(self.gpu, True, generator())
+        result = NCCLPrimitiveParallel(self.gpu_id, True, generator())
         return result
 
 @dataclass
@@ -117,10 +117,10 @@ class P2PChnlInfo:
     peer_rank: int
 
 class P2POp(CommOp, ABC):
-    def __init__(self, gpu: GPUDevice, comm: Communicator, chnl_infos: Union[List[P2PChnlInfo], Generator[P2PChnlInfo]], context: int):
-        super().__init__(gpu, context)
+    def __init__(self, gpu_id: GpuId, comm: Communicator, chnl_infos: Union[List[P2PChnlInfo], Generator[P2PChnlInfo]], context: int):
+        super().__init__(gpu_id, context)
         self.comm = comm
-        # self.peer_gpu = comm.rank2gpu[peer_rank]
+        # self.peer_gpu_id = comm.rank2gpu_id[peer_rank]
         self.chnl_infos = chnl_infos
     
     def to_primitives(self) -> NCCLPrimitiveComm:
@@ -129,7 +129,7 @@ class P2POp(CommOp, ABC):
         if len(self.chnl_infos) == 1:
             return self._to_primitives_chnl(self.chnl_infos[0])
         else:
-            result = NCCLPrimitiveParallel(self.gpu)
+            result = NCCLPrimitiveParallel(self.gpu_id)
             for chnl_info in self.chnl_infos:
                 result.add(self._to_primitives_chnl(chnl_info))
             return result
@@ -139,18 +139,18 @@ class P2POp(CommOp, ABC):
 
 class Send(P2POp):
     def _to_primitives_chnl(self, chnl_info: P2PChnlInfo) -> NCCLPrimitiveComm:
-        result = NCCLSend(self.context, self.gpu, target_gpu=self.comm.rank2gpu[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
+        result = NCCLSend(self.context, self.gpu_id, target_gpu_id=self.comm.rank2gpu_id[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
         if chnl_info.proto == NCCLProto.LL:
             return result.proto_ll()
         else:
             return result.proto_simple()
     # def to_primitives(self) -> NCCLPrimitiveComm:
-    #     return NCCLSend(self.context, self.gpu, target_gpu=self.comm.rank2gpu[self.peer_rank], size=self.size, chunk_size=self.chunk_size).proto_simple()
+    #     return NCCLSend(self.context, self.gpu_id, target_gpu_id=self.comm.rank2gpu_id[self.peer_rank], size=self.size, chunk_size=self.chunk_size).proto_simple()
 
 
 class Recv(P2POp):
     def _to_primitives_chnl(self, chnl_info: P2PChnlInfo) -> NCCLPrimitiveComm:
-        result = NCCLRecv(self.context, self.gpu, source_gpu=self.comm.rank2gpu[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
+        result = NCCLRecv(self.context, self.gpu_id, source_gpu_id=self.comm.rank2gpu_id[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
         if chnl_info.proto == NCCLProto.LL:
             return result.proto_ll()
         else:
@@ -183,8 +183,8 @@ class CollChnlInfo:
 
 
 class CollectiveOp(CommOp):
-    def __init__(self, gpu: GPUDevice, comm: Communicator, coll_info: CollInfo, coll_chnl_infos: Union[List[CollChnlInfo], Generator[CollChnlInfo]], context: int):
-        super().__init__(gpu, context)
+    def __init__(self, gpu_id: GpuId, comm: Communicator, coll_info: CollInfo, coll_chnl_infos: Union[List[CollChnlInfo], Generator[CollChnlInfo]], context: int):
+        super().__init__(gpu_id, context)
         self.comm = comm
         self.coll_info = coll_info
         self.coll_chnl_infos = coll_chnl_infos
@@ -196,13 +196,13 @@ class CollectiveOp(CommOp):
         raise NotImplementedError()
 
     def _to_primitives_tree(self) -> NCCLPrimitiveComm:
-        result = NCCLPrimitiveParallel(self.gpu)
+        result = NCCLPrimitiveParallel(self.gpu_id)
         for chnl_id in range(len(self.coll_chnl_infos)):
             result.add(self._to_primitives_tree_chnl(chnl_id))
         return result
     
     def _to_primitives_ring(self) -> NCCLPrimitiveComm:
-        result = NCCLPrimitiveParallel(self.gpu)
+        result = NCCLPrimitiveParallel(self.gpu_id)
         for chnl_id in range(len(self.coll_chnl_infos)):
             result.add(self._to_primitives_ring_chnl(chnl_id))
         return result
@@ -216,11 +216,13 @@ class CollectiveOp(CommOp):
         elif self.coll_info.algo == CollAlgo.TREE:
             result = self._to_primitives_tree()
         else:
-            raise ValueError(f"Unknown algo: {self.coll_info.algo}")
-        if self.coll_info.proto == NCCLProto.LL:
+            raise ValueError(f"Unsupported algo: {self.coll_info.algo}")
+        if self.coll_info.proto == NCCLProto.LL or self.coll_info.proto == NCCLProto.LL128: # TODO: distinguish LL and LL128
             result = result.proto_ll()
         elif self.coll_info.proto == NCCLProto.SIMPLE:
             result = result.proto_simple()
+        else:
+            raise ValueError(f"Unsupported proto: {self.coll_info.proto}")
         return result
             
 
@@ -228,11 +230,11 @@ class AllReduce(CollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         n_ranks = comm.n_ranks
-        ring_topo_node = comm.ring_topo[self.gpu][chnl_id]
+        ring_topo_node = comm.ring_topo[self.gpu_id][chnl_id]
 
-        ring_ix = self.comm.gpu2rank[self.gpu]
-        prev_gpu = ring_topo_node.prev
-        nxt_gpu = ring_topo_node.nxt
+        ring_ix = self.comm.gpu_id2rank[self.gpu_id]
+        prev_gpu_id = ring_topo_node.prev
+        nxt_gpu_id = ring_topo_node.nxt
         
         coll_chnl_info = self.coll_chnl_infos[chnl_id]
         chunk_count = coll_chnl_info.chunk_count
@@ -244,7 +246,7 @@ class AllReduce(CollectiveOp):
         slice_size = self.coll_info.slice_steps * self.coll_info.step_size
         slice_per_chunk = self.coll_info.chunk_steps // self.coll_info.slice_steps
 
-        chunk_comm = NCCLPrimitiveParallel(self.gpu, single_executer=True)
+        chunk_comm = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
         for elem_offset in range(0, channel_count, loop_count):
             rem_count = channel_count - elem_offset            
             
@@ -258,8 +260,8 @@ class AllReduce(CollectiveOp):
                 
             chunk_comm.add(NCCLSend(
                 self.context,
-                self.gpu,
-                target_gpu=nxt_gpu,
+                self.gpu_id,
+                target_gpu_id=nxt_gpu_id,
                 size=n_elems * self.coll_info.type_size,
                 chunk_size=slice_size,
                 slice_per_chunk=slice_per_chunk
@@ -273,9 +275,9 @@ class AllReduce(CollectiveOp):
                 slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
                 chunk_comm.add(NCCLRecvReduceSend(
                     self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    source_gpu_id=prev_gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems * self.coll_info.type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -288,9 +290,9 @@ class AllReduce(CollectiveOp):
             slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
             chunk_comm.add(NCCLRecvReduceCopySend(
                 self.context,
-                self.gpu,
-                source_gpu=prev_gpu,
-                target_gpu=nxt_gpu,
+                self.gpu_id,
+                source_gpu_id=prev_gpu_id,
+                target_gpu_id=nxt_gpu_id,
                 size=n_elems * self.coll_info.type_size,
                 chunk_size=slice_size,
                 slice_per_chunk=slice_per_chunk
@@ -304,9 +306,9 @@ class AllReduce(CollectiveOp):
                 slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
                 chunk_comm.add(NCCLRecvCopySend(
                     self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    source_gpu_id=prev_gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems * self.coll_info.type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -318,8 +320,8 @@ class AllReduce(CollectiveOp):
             slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
             chunk_comm.add(NCCLRecv(
                 self.context,
-                self.gpu,
-                source_gpu=prev_gpu,
+                self.gpu_id,
+                source_gpu_id=prev_gpu_id,
                 size=n_elems * self.coll_info.type_size,
                 chunk_size=slice_size,
                 slice_per_chunk=slice_per_chunk
@@ -330,61 +332,61 @@ class AllReduce(CollectiveOp):
     
     def _to_primitives_tree_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
-        tree_topo_node = comm.tree_topo[self.gpu][chnl_id]
-        children = tree_topo_node.children
-        parent = tree_topo_node.parent
+        tree_topo_node = comm.tree_topo[self.gpu_id][chnl_id]
+        children_gpu_ids = tree_topo_node.children
+        parent_gpu_id = tree_topo_node.parent
         
         coll_chnl_info = self.coll_chnl_infos[chnl_id]
         chunk_count = coll_chnl_info.chunk_count
         channel_count = coll_chnl_info.work_count
 
-        result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
+        result = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
         for chunk_offset in range(0, channel_count, chunk_count):
             n_elems = min(chunk_count, max(0, channel_count - chunk_offset))
             slice_size = self.coll_info.slice_steps * self.coll_info.step_size
             slice_per_chunk = self.coll_info.chunk_steps // self.coll_info.slice_steps
             # slice_size = max(ceil(n_elems / 16 * slice_per_chunk) * 16, slice_size // 32)
-            chunk_comm = NCCLPrimitiveSequential(self.gpu)
+            chunk_comm = NCCLPrimitiveSequential(self.gpu_id)
 
-            if parent is None and len(children) > 0: # root node
-                reduction_comm = NCCLPrimitiveParallel(self.gpu, single_executer=True)
-                for child in children[:-1]:
+            if parent_gpu_id is None and len(children_gpu_ids) > 0: # root node
+                reduction_comm = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
+                for child_gpu_id in children_gpu_ids[:-1]:
                     reduction_comm.add(NCCLRecvReduce(
                         self.context,
-                        self.gpu,
-                        source_gpu=child,
+                        self.gpu_id,
+                        source_gpu_id=child_gpu_id,
                         size=n_elems * self.coll_info.type_size,
                         chunk_size=slice_size,
                         slice_per_chunk=slice_per_chunk
                     ))
                 reduction_comm.add(NCCLRecvReduceCopy(
                     self.context,
-                    self.gpu,
-                    source_gpu=children[-1],
+                    self.gpu_id,
+                    source_gpu_id=children_gpu_ids[-1],
                     size=n_elems * self.coll_info.type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
                 ))
                 chunk_comm.append(reduction_comm)
 
-                broadcast_comm = NCCLPrimitiveParallel(self.gpu, single_executer=True)
-                for child in children:
+                broadcast_comm = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
+                for child_gpu_id in children_gpu_ids:
                     broadcast_comm.add(NCCLSend(
                         self.context,
-                        self.gpu,
-                        target_gpu=child,
+                        self.gpu_id,
+                        target_gpu_id=child_gpu_id,
                         size=n_elems * self.coll_info.type_size,
                         chunk_size=slice_size,
                         slice_per_chunk=slice_per_chunk
                     ))
                 chunk_comm.append(broadcast_comm)
             
-            elif parent is not None and len(children) == 0: # leaf node
+            elif parent_gpu_id is not None and len(children_gpu_ids) == 0: # leaf node
                 # step 0: send the data to parent
                 chunk_comm.append(NCCLSend(
                     self.context,
-                    self.gpu,
-                    target_gpu=parent,
+                    self.gpu_id,
+                    target_gpu_id=parent_gpu_id,
                     size=n_elems * self.coll_info.type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -392,20 +394,20 @@ class AllReduce(CollectiveOp):
                 # step 1: recv the reduced data from parent
                 chunk_comm.append(NCCLRecv(
                     self.context,
-                    self.gpu,
-                    source_gpu=parent,
+                    self.gpu_id,
+                    source_gpu_id=parent_gpu_id,
                     size=n_elems * self.coll_info.type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
                 ))
             
-            elif parent is not None and len(children) > 0: # internal node
-                reduction_comm = NCCLPrimitiveParallel(self.gpu, single_executer=True)
-                for child in children:
+            elif parent_gpu_id is not None and len(children_gpu_ids) > 0: # internal node
+                reduction_comm = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
+                for child_gpu_id in children_gpu_ids:
                     reduction_comm.add(NCCLRecvReduce(
                         self.context,
-                        self.gpu,
-                        source_gpu=child,
+                        self.gpu_id,
+                        source_gpu_id=child_gpu_id,
                         size=n_elems * self.coll_info.type_size,
                         chunk_size=slice_size,
                         slice_per_chunk=slice_per_chunk
@@ -413,27 +415,27 @@ class AllReduce(CollectiveOp):
                 chunk_comm.append(reduction_comm)
                 chunk_comm.append(NCCLSend(
                     self.context,
-                    self.gpu,
-                    target_gpu=parent,
+                    self.gpu_id,
+                    target_gpu_id=parent_gpu_id,
                     size=n_elems * self.coll_info.type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
                 ))
                 chunk_comm.append(NCCLRecv(
                     self.context,
-                    self.gpu,
-                    source_gpu=parent,
+                    self.gpu_id,
+                    source_gpu_id=parent_gpu_id,
                     size=n_elems * self.coll_info.type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
                 ))
                 
-                broadcast_comm = NCCLPrimitiveParallel(self.gpu, single_executer=True)
-                for child in children:
+                broadcast_comm = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
+                for child_gpu_id in children_gpu_ids:
                     broadcast_comm.add(NCCLSend(
                         self.context,
-                        self.gpu,
-                        target_gpu=child,
+                        self.gpu_id,
+                        target_gpu_id=child_gpu_id,
                         size=n_elems * self.coll_info.type_size,
                         chunk_size=slice_size,
                         slice_per_chunk=slice_per_chunk
@@ -447,9 +449,9 @@ class AllGather(CollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         n_ranks = comm.n_ranks
-        ring_topo_node = comm.ring_topo[self.gpu][chnl_id]
-        prev_gpu = ring_topo_node.prev
-        nxt_gpu = ring_topo_node.nxt
+        ring_topo_node = comm.ring_topo[self.gpu_id][chnl_id]
+        prev_gpu_id = ring_topo_node.prev
+        nxt_gpu_id = ring_topo_node.nxt
         
         coll_chnl_info = self.coll_chnl_infos[chnl_id]
         chunk_count = coll_chnl_info.chunk_count
@@ -457,9 +459,9 @@ class AllGather(CollectiveOp):
         count = coll_chnl_info.count
         send_buff = coll_chnl_info.send_buff
         recv_buff = coll_chnl_info.recv_buff
-        ring_ix = self.comm.gpu2rank[self.gpu]
+        ring_ix = self.comm.gpu_id2rank[self.gpu_id]
 
-        chunk_comm = NCCLPrimitiveParallel(self.gpu, single_executer=True)
+        chunk_comm = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
         for chunk_offset in range(0, channel_count, chunk_count):
             n_elems = min(chunk_count, max(0, channel_count - chunk_offset))
             slice_size = self.coll_info.slice_steps * self.coll_info.step_size
@@ -468,8 +470,8 @@ class AllGather(CollectiveOp):
             if send_buff == recv_buff + (ring_ix * count): # in place send
                 chunk_comm.add(NCCLSend(
                     self.context,
-                    self.gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -477,8 +479,8 @@ class AllGather(CollectiveOp):
             else: # CopySend
                 chunk_comm.add(NCCLCopySend(
                     self.context,
-                    self.gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -488,9 +490,9 @@ class AllGather(CollectiveOp):
             for _ in range(n_ranks - 2):
                 chunk_comm.add(NCCLRecvCopySend(
                     self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    source_gpu_id=prev_gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -499,8 +501,8 @@ class AllGather(CollectiveOp):
             # step k-1: recv the slice of data from prev
             chunk_comm.add(NCCLRecv(
                 self.context,
-                self.gpu,
-                source_gpu=prev_gpu,
+                self.gpu_id,
+                source_gpu_id=prev_gpu_id,
                 size=n_elems,
                 chunk_size=slice_size,
                 slice_per_chunk=slice_per_chunk
@@ -513,15 +515,15 @@ class ReduceScatter(CollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         n_ranks = comm.n_ranks
-        ring_topo_node = comm.ring_topo[self.gpu][chnl_id]
-        prev_gpu = ring_topo_node.prev
-        nxt_gpu = ring_topo_node.nxt
+        ring_topo_node = comm.ring_topo[self.gpu_id][chnl_id]
+        prev_gpu_id = ring_topo_node.prev
+        nxt_gpu_id = ring_topo_node.nxt
         
         coll_chnl_info = self.coll_chnl_infos[chnl_id]
         chunk_count = coll_chnl_info.chunk_count
         channel_count = coll_chnl_info.work_count
         
-        chunk_comm = NCCLPrimitiveParallel(self.gpu, single_executer=True)
+        chunk_comm = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
         # for each chunk, the following communications will be performed
         for chunk_offset in range(0, channel_count, chunk_count):
             n_elems = min(chunk_count, max(0, channel_count - chunk_offset))
@@ -531,8 +533,8 @@ class ReduceScatter(CollectiveOp):
             # step 0: send the slice of data to nxt
             chunk_comm.add(NCCLSend(
                 self.context,
-                self.gpu,
-                target_gpu=nxt_gpu,
+                self.gpu_id,
+                target_gpu_id=nxt_gpu_id,
                 size=n_elems * self.coll_info.type_size,
                 chunk_size=slice_size,
                 slice_per_chunk=slice_per_chunk
@@ -542,9 +544,9 @@ class ReduceScatter(CollectiveOp):
             for _ in range(n_ranks - 2):
                 chunk_comm.add(NCCLRecvReduceSend(
                     self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    source_gpu_id=prev_gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems * self.coll_info.type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -553,8 +555,8 @@ class ReduceScatter(CollectiveOp):
             # step k-1: recv the reduced data from prev
             chunk_comm.add(NCCLRecvReduceCopy(
                 self.context,
-                self.gpu,
-                source_gpu=prev_gpu,
+                self.gpu_id,
+                source_gpu_id=prev_gpu_id,
                 size=n_elems * self.coll_info.type_size,
                 chunk_size=slice_size,
                 slice_per_chunk=slice_per_chunk
@@ -566,40 +568,40 @@ class ReduceScatter(CollectiveOp):
 class Reduce(CollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
-        ring_topo_node = comm.ring_topo[self.gpu][chnl_id]
-        prev_gpu = ring_topo_node.prev
-        nxt_gpu = ring_topo_node.nxt
+        ring_topo_node = comm.ring_topo[self.gpu_id][chnl_id]
+        prev_gpu_id = ring_topo_node.prev
+        nxt_gpu_id = ring_topo_node.nxt
         
         coll_chnl_info = self.coll_chnl_infos[chnl_id]
         chunk_count = coll_chnl_info.chunk_count
         channel_count = coll_chnl_info.work_count
 
         coll_info = self.coll_info
-        root_gpu = comm.rank2gpu[coll_info.root_rank]
+        root_gpu_id = comm.rank2gpu_id[coll_info.root_rank]
         type_size = coll_info.type_size
 
         
         slice_size = self.coll_info.slice_steps * self.coll_info.step_size
         slice_per_chunk = self.coll_info.chunk_steps // self.coll_info.slice_steps
 
-        result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
+        result = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
         for chunk_offset in range(0, channel_count, chunk_count):
             n_elems = min(chunk_count, max(0, channel_count - chunk_offset))
             
-            if self.gpu == root_gpu: # RecvReduceCopy
+            if self.gpu_id == root_gpu_id: # RecvReduceCopy
                 result.add(NCCLRecvReduceCopy(
                     self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
+                    self.gpu_id,
+                    source_gpu_id=prev_gpu_id,
                     size=n_elems * type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
                 ))
-            elif prev_gpu == root_gpu: # Send
+            elif prev_gpu_id == root_gpu_id: # Send
                 result.add(NCCLSend(
                     self.context,
-                    self.gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems * type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -607,9 +609,9 @@ class Reduce(CollectiveOp):
             else: # RecvReduceSend
                 result.add(NCCLRecvReduceSend(
                     self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    source_gpu_id=prev_gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems * type_size,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -620,38 +622,38 @@ class Reduce(CollectiveOp):
 class Broadcast(CollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
-        ring_topo_node = comm.ring_topo[self.gpu][chnl_id]
-        prev_gpu = ring_topo_node.prev
-        nxt_gpu = ring_topo_node.nxt
+        ring_topo_node = comm.ring_topo[self.gpu_id][chnl_id]
+        prev_gpu_id = ring_topo_node.prev
+        nxt_gpu_id = ring_topo_node.nxt
 
         coll_chnl_info = self.coll_chnl_infos[chnl_id]
         chunk_count = coll_chnl_info.chunk_count
         channel_count = coll_chnl_info.work_count
 
         coll_info = self.coll_info
-        root_gpu = comm.rank2gpu[coll_info.root_rank]
+        root_gpu_id = comm.rank2gpu_id[coll_info.root_rank]
         type_size = coll_info.type_size
 
-        result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
+        result = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
         for chunk_offset in range(0, channel_count, chunk_count):
             n_elems = min(chunk_count, max(0, channel_count - chunk_offset))
             slice_size = self.coll_info.slice_steps * self.coll_info.step_size
             slice_per_chunk = self.coll_info.chunk_steps // self.coll_info.slice_steps
 
-            if self.gpu == root_gpu: # Send
+            if self.gpu_id == root_gpu_id: # Send
                 result.add(NCCLSend(
                     self.context,
-                    self.gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
                 ))
-            elif nxt_gpu == root_gpu: # Recv
+            elif nxt_gpu_id == root_gpu_id: # Recv
                 result.add(NCCLRecv(
                     self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
+                    self.gpu_id,
+                    source_gpu_id=prev_gpu_id,
                     size=n_elems,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk
@@ -659,9 +661,9 @@ class Broadcast(CollectiveOp):
             else: # RecvCopySend
                 result.add(NCCLRecvCopySend(
                     self.context,
-                    self.gpu,
-                    source_gpu=prev_gpu,
-                    target_gpu=nxt_gpu,
+                    self.gpu_id,
+                    source_gpu_id=prev_gpu_id,
+                    target_gpu_id=nxt_gpu_id,
                     size=n_elems,
                     chunk_size=slice_size,
                     slice_per_chunk=slice_per_chunk

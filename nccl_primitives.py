@@ -11,7 +11,9 @@ import numpy as np
 from scipy import interpolate
 
 from goal import GoalCalc, GoalOp, GoalParallel, GoalRecv, GoalSend, GoalSequential
-from gpu import GPUDevice
+
+# GpuId is a tuple of (nodeId, pid) identifying a GPU
+GpuId = Tuple[str, int]
 
 zero_price_reduction_copy = False
 zero_price_communication = False
@@ -131,8 +133,8 @@ def copy_time(data_size: int, proto: int) -> int:
 
 
 class NCCLPrimitiveComm(ABC):
-    def __init__(self, gpu: GPUDevice):
-        self.gpu = gpu
+    def __init__(self, gpu_id: GpuId):
+        self.gpu_id = gpu_id
 
     @abstractmethod
     def proto_ll(self) -> NCCLPrimitiveComm:
@@ -148,26 +150,26 @@ class NCCLPrimitiveComm(ABC):
 
     @abstractmethod
     def _to_goal(
-        self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int
+        self, gpu_id2goal_rank: Dict[GpuId, int], cpu: int, nic: int
     ) -> Tuple[GoalOp, int]:
         pass
 
     def to_goal(
-        self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int
+        self, gpu_id2goal_rank: Dict[GpuId, int], cpu: int, nic: int
     ) -> Tuple[GoalOp, int]:
         if not hasattr(self, "goal_cache"):
-            self.goal_cache = self._to_goal(gpu2goal_rank, cpu, nic)
+            self.goal_cache = self._to_goal(gpu_id2goal_rank, cpu, nic)
         return self.goal_cache
 
 
 class NCCLPrimitiveParallel(NCCLPrimitiveComm):
     def __init__(
         self,
-        gpu: GPUDevice,
+        gpu_id: GpuId,
         single_executer: bool = False,
         primitives: Optional[Generator[NCCLPrimitiveComm]] = None,
     ):
-        super().__init__(gpu)
+        super().__init__(gpu_id)
         self.single_executer = single_executer
         self.single_use = primitives is not None
         self.consumed = False
@@ -188,7 +190,7 @@ class NCCLPrimitiveParallel(NCCLPrimitiveComm):
                 "This NCCLPrimitiveParallel has already been consumed and it is single-use."
             )
         result = NCCLPrimitiveParallel(
-            self.gpu, self.single_executer, (p.proto_ll() for p in self.primitives)
+            self.gpu_id, self.single_executer, (p.proto_ll() for p in self.primitives)
         )
         self.consumed = True and self.single_use
         return result
@@ -199,13 +201,13 @@ class NCCLPrimitiveParallel(NCCLPrimitiveComm):
                 "This NCCLPrimitiveParallel has already been consumed and it is single-use."
             )
         result = NCCLPrimitiveParallel(
-            self.gpu, self.single_executer, (p.proto_simple() for p in self.primitives)
+            self.gpu_id, self.single_executer, (p.proto_simple() for p in self.primitives)
         )
         self.consumed = True and self.single_use
         return result
 
     def _to_goal(
-        self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int
+        self, gpu_id2goal_rank: Dict[GpuId, int], cpu: int, nic: int
     ) -> Tuple[GoalOp, int]:
         if self.consumed:
             raise ValueError(
@@ -213,18 +215,18 @@ class NCCLPrimitiveParallel(NCCLPrimitiveComm):
             )
         self.consumed = True and self.single_use
         if self.single_executer:
-            ops = [p.to_goal(gpu2goal_rank, cpu, nic) for p in self.primitives]
+            ops = [p.to_goal(gpu_id2goal_rank, cpu, nic) for p in self.primitives]
             max_cpu = max(op[1] for op in ops)
             return GoalParallel(
-                list(op[0] for op in ops), gpu2goal_rank[self.gpu], cpu
+                list(op[0] for op in ops), gpu_id2goal_rank[self.gpu_id], cpu
             ), max_cpu
         else:
             ops = []
             curr_cpu_start = cpu
             for p in self.primitives:
-                op, curr_cpu_start = p.to_goal(gpu2goal_rank, curr_cpu_start, nic)
+                op, curr_cpu_start = p.to_goal(gpu_id2goal_rank, curr_cpu_start, nic)
                 ops.append(op)
-            return GoalParallel(ops, gpu2goal_rank[self.gpu], cpu), curr_cpu_start
+            return GoalParallel(ops, gpu_id2goal_rank[self.gpu_id], cpu), curr_cpu_start
 
     def __repr__(self) -> str:
         indent = "  "
@@ -244,8 +246,8 @@ class NCCLPrimitiveParallel(NCCLPrimitiveComm):
 
 
 class NCCLPrimitiveSequential(NCCLPrimitiveComm):
-    def __init__(self, gpu: GPUDevice, primitives: Generator[NCCLPrimitiveComm] = None):
-        super().__init__(gpu)
+    def __init__(self, gpu_id: GpuId, primitives: Generator[NCCLPrimitiveComm] = None):
+        super().__init__(gpu_id)
         self.single_use = primitives is not None
         self.consumed = False
         self.primitives: Union[
@@ -265,7 +267,7 @@ class NCCLPrimitiveSequential(NCCLPrimitiveComm):
                 "This NCCLPrimitiveSequential has already been consumed and it is single-use."
             )
         result = NCCLPrimitiveSequential(
-            self.gpu, (p.proto_ll() for p in self.primitives)
+            self.gpu_id, (p.proto_ll() for p in self.primitives)
         )
         self.consumed = True and self.single_use
         return result
@@ -276,23 +278,23 @@ class NCCLPrimitiveSequential(NCCLPrimitiveComm):
                 "This NCCLPrimitiveSequential has already been consumed and it is single-use."
             )
         result = NCCLPrimitiveSequential(
-            self.gpu, (p.proto_simple() for p in self.primitives)
+            self.gpu_id, (p.proto_simple() for p in self.primitives)
         )
         self.consumed = True and self.single_use
         return result
 
     def _to_goal(
-        self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int
+        self, gpu_id2goal_rank: Dict[GpuId, int], cpu: int, nic: int
     ) -> Tuple[GoalOp, int]:
         if self.consumed:
             raise ValueError(
                 "This NCCLPrimitiveSequential has already been consumed and it is single-use."
             )
         self.consumed = True and self.single_use
-        ops = [p.to_goal(gpu2goal_rank, cpu, nic) for p in self.primitives]
+        ops = [p.to_goal(gpu_id2goal_rank, cpu, nic) for p in self.primitives]
         max_cpu = max(op[1] for op in ops)
         return GoalSequential(
-            list(op[0] for op in ops), gpu2goal_rank[self.gpu], cpu
+            list(op[0] for op in ops), gpu_id2goal_rank[self.gpu_id], cpu
         ), max_cpu
 
     def __repr__(self) -> str:
@@ -314,19 +316,19 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
     def __init__(
         self,
         context: int,
-        gpu: GPUDevice,
+        gpu_id: GpuId,
         *,
-        source_gpu: Optional[GPUDevice] = None,
-        target_gpu: Optional[GPUDevice] = None,
+        source_gpu_id: Optional[GpuId] = None,
+        target_gpu_id: Optional[GpuId] = None,
         size: int = 0,
         chunk_size: int = 0,
         slice_per_chunk: int = 0,
         __proto__: int = -1,
     ):
-        super().__init__(gpu)
+        super().__init__(gpu_id)
         self.context = context
-        self.source_gpu = source_gpu
-        self.target_gpu = target_gpu
+        self.source_gpu_id = source_gpu_id
+        self.target_gpu_id = target_gpu_id
         self.size = size
         self.chunk_size = chunk_size if chunk_size > 0 else size
         self.slice_per_chunk = slice_per_chunk
@@ -340,9 +342,9 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
         n_packets = ceil(self.size / 8)
         return self.__class__(
             self.context,
-            self.gpu,
-            source_gpu=self.source_gpu,
-            target_gpu=self.target_gpu,
+            self.gpu_id,
+            source_gpu_id=self.source_gpu_id,
+            target_gpu_id=self.target_gpu_id,
             size=n_packets * 8,
             __proto__=0,
             **self.additional_info,
@@ -380,9 +382,9 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
                         
                         yield self.__class__(
                             self.context,
-                            self.gpu,
-                            source_gpu=self.source_gpu,
-                            target_gpu=self.target_gpu,
+                            self.gpu_id,
+                            source_gpu_id=self.source_gpu_id,
+                            target_gpu_id=self.target_gpu_id,
                             size=current_size,
                             chunk_size=current_size, # Smaller piece is atomic
                             __proto__=2,
@@ -395,15 +397,15 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
                         if not (n_slice < spc and offset < self.size):
                             break
             
-            return NCCLPrimitiveParallel(self.gpu, True, generator())
+            return NCCLPrimitiveParallel(self.gpu_id, True, generator())
         else:
             n_chunks = self.size // self.chunk_size
             if n_chunks <= 1:
                 return self.__class__(
                     self.context,
-                    self.gpu,
-                    source_gpu=self.source_gpu,
-                    target_gpu=self.target_gpu,
+                    self.gpu_id,
+                    source_gpu_id=self.source_gpu_id,
+                    target_gpu_id=self.target_gpu_id,
                     size=self.size,
                     __proto__=2,
                     **self.additional_info,
@@ -414,9 +416,9 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
                 for _ in range(n_chunks):
                     yield self.__class__(
                         self.context,
-                        self.gpu,
-                        source_gpu=self.source_gpu,
-                        target_gpu=self.target_gpu,
+                        self.gpu_id,
+                        source_gpu_id=self.source_gpu_id,
+                        target_gpu_id=self.target_gpu_id,
                         size=self.chunk_size,
                         __proto__=2,
                         **self.additional_info,
@@ -425,17 +427,17 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
                 if remaining_size > 0:
                     yield self.__class__(
                         self.context,
-                        self.gpu,
-                        source_gpu=self.source_gpu,
-                        target_gpu=self.target_gpu,
+                        self.gpu_id,
+                        source_gpu_id=self.source_gpu_id,
+                        target_gpu_id=self.target_gpu_id,
                         size=remaining_size,
                         __proto__=2,
                         **self.additional_info,
                     )
 
-            result = NCCLPrimitiveParallel(self.gpu, True, generator())
+            result = NCCLPrimitiveParallel(self.gpu_id, True, generator())
             return result
-            # result = NCCLPrimitiveParallel(self.gpu, single_executer=True)
+            # result = NCCLPrimitiveParallel(self.gpu_id, single_executer=True)
             # for _ in range(n_chunks):
             #     result.add(self.__class__(
             #         self.context,
@@ -509,7 +511,7 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
     @abstractmethod
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
@@ -518,35 +520,36 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
         pass
 
     def _to_goal(
-        self, gpu2goal_rank: Dict[GPUDevice, int], cpu: int, nic: int
+        self, gpu_id2goal_rank: Dict[GpuId, int], cpu: int, nic: int
     ) -> Tuple[GoalOp, int]:
         # check whether the send and recv are intra-node
+        # GpuId is (nodeId, pid), so gpu_id[0] gives the node
         if self.__proto__ == -1:
             raise ValueError("Primitive protocol not specified.")
         intra_send = (
-            self.gpu.node_id == self.target_gpu.node_id if self.target_gpu else False
+            self.gpu_id[0] == self.target_gpu_id[0] if self.target_gpu_id else False
         )
         intra_recv = (
-            self.gpu.node_id == self.source_gpu.node_id if self.source_gpu else False
+            self.gpu_id[0] == self.source_gpu_id[0] if self.source_gpu_id else False
         )
-        return self._p_to_goal(gpu2goal_rank, cpu, nic, intra_send, intra_recv), cpu + 1
+        return self._p_to_goal(gpu_id2goal_rank, cpu, nic, intra_send, intra_recv), cpu + 1
 
 
 class NCCLSend(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLSend(target_gpu={self.target_gpu}, size={self.size})"
+        return f"NCCLSend(target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
         return self.send_goal(
-            gpu2goal_rank[self.gpu],
-            gpu2goal_rank[self.target_gpu],
+            gpu_id2goal_rank[self.gpu_id],
+            gpu_id2goal_rank[self.target_gpu_id],
             self.size,
             cpu,
             nic,
@@ -555,20 +558,20 @@ class NCCLSend(NCCLPrimitive):
 
 class NCCLCopySend(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLCopySend(target_gpu={self.target_gpu}, size={self.size})"
+        return f"NCCLCopySend(target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         send = self.send_goal(
             self_goal_rank,
-            gpu2goal_rank[self.target_gpu],
+            gpu_id2goal_rank[self.target_gpu_id],
             self.size,
             cpu,
             nic,
@@ -583,19 +586,19 @@ class NCCLCopySend(NCCLPrimitive):
 
 class NCCLRecv(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLRecv(source_gpu={self.source_gpu}, size={self.size})"
+        return f"NCCLRecv(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
         return self.recv_goal(
-            gpu2goal_rank[self.gpu],
-            gpu2goal_rank[self.source_gpu],
+            gpu_id2goal_rank[self.gpu_id],
+            gpu_id2goal_rank[self.source_gpu_id],
             self.size,
             cpu,
             nic,
@@ -604,17 +607,17 @@ class NCCLRecv(NCCLPrimitive):
 
 class NCCLReduce(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLReduce(source_gpu={self.source_gpu}, size={self.size})"
+        return f"NCCLReduce(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         return GoalCalc(reduction_time(self.size, self.__proto__), self_goal_rank, cpu)
 
 
@@ -624,13 +627,13 @@ class NCCLCopy(NCCLPrimitive):
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         return GoalCalc(copy_time(self.size, self.__proto__), self_goal_rank, cpu)
 
 
@@ -640,13 +643,13 @@ class NCCLReduceCopy(NCCLPrimitive):
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         return GoalCalc(
             reduction_time(self.size, self.__proto__)
             + copy_time(self.size, self.__proto__),
@@ -657,20 +660,20 @@ class NCCLReduceCopy(NCCLPrimitive):
 
 class NCCLRecvReduce(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLRecvReduce(source_gpu={self.source_gpu}, size={self.size})"
+        return f"NCCLRecvReduce(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         recv = self.recv_goal(
             self_goal_rank,
-            gpu2goal_rank[self.source_gpu],
+            gpu_id2goal_rank[self.source_gpu_id],
             self.size,
             cpu,
             nic,
@@ -690,20 +693,20 @@ class NCCLRecvReduce(NCCLPrimitive):
 
 class NCCLRecvReduceCopy(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLRecvReduceCopy(source_gpu={self.source_gpu}, size={self.size})"
+        return f"NCCLRecvReduceCopy(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         recv = self.recv_goal(
             self_goal_rank,
-            gpu2goal_rank[self.source_gpu],
+            gpu_id2goal_rank[self.source_gpu_id],
             self.size,
             cpu,
             nic,
@@ -726,20 +729,20 @@ class NCCLRecvReduceCopy(NCCLPrimitive):
 
 class NCCLRecvCopySend(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLRecvCopySend(source_gpu={self.source_gpu}, target_gpu={self.target_gpu}, size={self.size})"
+        return f"NCCLRecvCopySend(source_gpu_id={self.source_gpu_id}, target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         recv = self.recv_goal(
             self_goal_rank,
-            gpu2goal_rank[self.source_gpu],
+            gpu_id2goal_rank[self.source_gpu_id],
             self.size,
             cpu,
             nic,
@@ -747,7 +750,7 @@ class NCCLRecvCopySend(NCCLPrimitive):
         )
         send = self.send_goal(
             self_goal_rank,
-            gpu2goal_rank[self.target_gpu],
+            gpu_id2goal_rank[self.target_gpu_id],
             self.size,
             cpu,
             nic,
@@ -766,20 +769,20 @@ class NCCLRecvCopySend(NCCLPrimitive):
 
 class NCCLRecvCopy(NCCLPrimitive):
     def __repr__(self):
-        return f"NCCLRecvCopy(source_gpu={self.source_gpu}, size={self.size})"
+        return f"NCCLRecvCopy(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         recv = self.recv_goal(
             self_goal_rank,
-            gpu2goal_rank[self.source_gpu],
+            gpu_id2goal_rank[self.source_gpu_id],
             self.size,
             cpu,
             nic,
@@ -794,20 +797,20 @@ class NCCLRecvCopy(NCCLPrimitive):
 
 class NCCLRecvReduceSend(NCCLPrimitive):
     def __repr__(self):
-        return f"NCCLRecvReduceSend(source_gpu={self.source_gpu.id}, target_gpu={self.target_gpu.id}, size={self.size})"
+        return f"NCCLRecvReduceSend(source_gpu_id={self.source_gpu_id}, target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         recv = self.recv_goal(
             self_goal_rank,
-            gpu2goal_rank[self.source_gpu],
+            gpu_id2goal_rank[self.source_gpu_id],
             self.size,
             cpu,
             nic,
@@ -815,7 +818,7 @@ class NCCLRecvReduceSend(NCCLPrimitive):
         )
         send = self.send_goal(
             self_goal_rank,
-            gpu2goal_rank[self.target_gpu],
+            gpu_id2goal_rank[self.target_gpu_id],
             self.size,
             cpu,
             nic,
@@ -836,20 +839,20 @@ class NCCLRecvReduceSend(NCCLPrimitive):
 
 class NCCLRecvReduceCopySend(NCCLPrimitive):
     def __repr__(self):
-        return f"NCCLRecvReduceCopySend(source_gpu={self.source_gpu.id}, target_gpu={self.target_gpu.id}, size={self.size})"
+        return f"NCCLRecvReduceCopySend(source_gpu_id={self.source_gpu_id}, target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
-        gpu2goal_rank: Dict[GPUDevice, int],
+        gpu_id2goal_rank: Dict[GpuId, int],
         cpu: int,
         nic: int,
         intra_node_send: bool,
         intra_node_recv: bool,
     ) -> GoalOp:
-        self_goal_rank = gpu2goal_rank[self.gpu]
+        self_goal_rank = gpu_id2goal_rank[self.gpu_id]
         recv = self.recv_goal(
             self_goal_rank,
-            gpu2goal_rank[self.source_gpu],
+            gpu_id2goal_rank[self.source_gpu_id],
             self.size,
             cpu,
             nic,
@@ -857,7 +860,7 @@ class NCCLRecvReduceCopySend(NCCLPrimitive):
         )
         send = self.send_goal(
             self_goal_rank,
-            gpu2goal_rank[self.target_gpu],
+            gpu_id2goal_rank[self.target_gpu_id],
             self.size,
             cpu,
             nic,
