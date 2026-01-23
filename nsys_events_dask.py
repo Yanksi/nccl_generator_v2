@@ -12,7 +12,7 @@ import numba
 import dask
 import dask.dataframe as dd
 from dask import delayed
-dask.config.set(scheduler='processes')
+# dask.config.set(scheduler='processes')
 from dask.diagnostics import ProgressBar
 
 # import modin.pandas as pd
@@ -64,8 +64,126 @@ def get_kernel_events(traces: List[os.PathLike]) -> dd.DataFrame:
         "nodeId": "object",
         "collective": "string"
     }
-    kernel_df = dd.from_delayed(dfs, meta=meta)
+    kernel_df = dd.from_delayed(dfs, meta=meta).persist(scheduler="processes")
     return kernel_df
+
+# All NVTX regex patterns - defined once globally
+NVTX_PATTERNS = {
+    "comm_info": r"commHash (0x[0-9a-f]+) commId (0x[0-9a-f]+) rank (\d+) nranks (\d+) pid (\d+)",
+    "comm_ring": r"commHash (0x[0-9a-f]+) Rings \[(\d+)\] (\d+)->(\d+)->(\d+) pid (\d+)",
+    "comm_tree": r"commHash (0x[0-9a-f]+) Trees \[(\d+)\] (-?\d+)/(-?\d+)/(-?\d+)->(-?\d+)->(-?\d+) pid (\d+)",
+    "profile_start": r"nsys profiling start, pid: (\d+)",
+    "profile_end": r"nsys profiling stopped, pid: (\d+)",
+    "group_start": r"ncclGroupStart\(\): pid (\d+)",
+    "group_end": r"ncclGroupEnd\(\): pid (\d+)",
+    "coll_kernel": r"nWarps \d+ count (\d+) chunkCount (\d+) workCount (\d+) lastChunkCount (\d+) workOffset (\d+) sendbuff (\d+) recvbuff (\d+) pid (\d+)",
+    "p2p_kernel": r"Bytes (\d+) nWarps \d+ p2pType (\d+) peer (\d+) proto (\d+) countHi32 (\d+) countLo32 (\d+) chunkSize (\d+) pid (\d+)",
+    "comm": r"nccl([a-zA-Z]+)\(\): commHash (0x[0-9a-f]+), stream (0x[0-9a-f]+), data_size \d+, type_size \d+,.* pid (\d+)",
+    "coll_info": r"collType (\d+) root (\d+) redOp (\d+) algo (\d+) proto (\d+) commHash (\S+) stream (\S+) data_size (\d+) type_size (\d+) chunkSize \d+ chunkCount \d+ chunkSteps (\d+) sliceSteps (\d+) stepSize (\d+) pid (\d+)",
+}
+
+def categorize_nvtx_text(text) -> str:
+    """Categorize a single NVTX text string. Returns category name or 'other'."""
+    if text is None or pd.isna(text):
+        return "other"
+    for category, pattern in NVTX_PATTERNS.items():
+        if re.match(pattern, text):
+            return category
+    return "other"
+
+def process_nvtx_by_category(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Process NVTX events by category, extracting fields and converting types."""
+    result = {}
+    
+    # comm_info
+    comm_info = df[df["category"] == "comm_info"].copy()
+    if len(comm_info) > 0:
+        comm_info[["commHash", "commId", "rank", "nRanks", "pid"]] = comm_info["text"].str.extract(NVTX_PATTERNS["comm_info"])
+        comm_info[["rank", "nRanks", "pid"]] = comm_info[["rank", "nRanks", "pid"]].astype("UInt64")
+        comm_info = comm_info.drop(columns=["text", "category"])
+    result["comm_info"] = comm_info
+    
+    # comm_ring
+    comm_ring = df[df["category"] == "comm_ring"].copy()
+    if len(comm_ring) > 0:
+        comm_ring[["commHash", "channelId", "prevRank", "myRank", "nextRank", "pid"]] = comm_ring["text"].str.extract(NVTX_PATTERNS["comm_ring"])
+        comm_ring[["channelId", "prevRank", "myRank", "nextRank", "pid"]] = comm_ring[["channelId", "prevRank", "myRank", "nextRank", "pid"]].astype("UInt64")
+        comm_ring = comm_ring.drop(columns=["text", "category"])
+    result["comm_ring"] = comm_ring
+    
+    # comm_tree
+    comm_tree = df[df["category"] == "comm_tree"].copy()
+    if len(comm_tree) > 0:
+        comm_tree[["commHash", "channelId", "child1Rank", "child2Rank", "child3Rank", "myRank", "parentRank", "pid"]] = comm_tree["text"].str.extract(NVTX_PATTERNS["comm_tree"])
+        comm_tree[["child1Rank", "child2Rank", "child3Rank", "parentRank"]] = comm_tree[["child1Rank", "child2Rank", "child3Rank", "parentRank"]].astype("Int64")
+        comm_tree[["channelId", "myRank", "pid"]] = comm_tree[["channelId", "myRank", "pid"]].astype("UInt64")
+        comm_tree = comm_tree.drop(columns=["text", "category"])
+    result["comm_tree"] = comm_tree
+    
+    # profile_start
+    profile_start = df[df["category"] == "profile_start"].copy()
+    if len(profile_start) > 0:
+        profile_start["pid"] = profile_start["text"].str.extract(NVTX_PATTERNS["profile_start"])[0].astype("Int64")
+        profile_start = profile_start.drop(columns=["text", "category", "end"])
+    result["profile_start"] = profile_start
+    
+    # profile_end
+    profile_end = df[df["category"] == "profile_end"].copy()
+    if len(profile_end) > 0:
+        profile_end["pid"] = profile_end["text"].str.extract(NVTX_PATTERNS["profile_end"])[0].astype("Int64")
+        # Drop original 'end' column first to avoid duplicate column names after rename
+        profile_end = profile_end.drop(columns=["text", "category", "end"]).rename(columns={"start": "end"})
+    result["profile_end"] = profile_end
+    
+    # group_start
+    group_start = df[df["category"] == "group_start"].copy()
+    if len(group_start) > 0:
+        group_start["pid"] = group_start["text"].str.extract(NVTX_PATTERNS["group_start"])[0].astype("Int64")
+        group_start = group_start.drop(columns=["text", "category"])
+        group_start["isStart"] = True
+    result["group_start"] = group_start
+    
+    # group_end
+    group_end = df[df["category"] == "group_end"].copy()
+    if len(group_end) > 0:
+        group_end["pid"] = group_end["text"].str.extract(NVTX_PATTERNS["group_end"])[0].astype("Int64")
+        group_end = group_end.drop(columns=["text", "category"])
+        group_end["isStart"] = False
+    result["group_end"] = group_end
+    
+    # coll_kernel
+    coll_kernel = df[df["category"] == "coll_kernel"].copy()
+    if len(coll_kernel) > 0:
+        coll_kernel[["count", "chunkCount", "workCount", "lastChunkCount", "workOffset", "sendbuff", "recvbuff", "pid"]] = coll_kernel["text"].str.extract(NVTX_PATTERNS["coll_kernel"])
+        coll_kernel[["count", "chunkCount", "workCount", "workOffset", "sendbuff", "recvbuff", "pid"]] = coll_kernel[["count", "chunkCount", "workCount", "workOffset", "sendbuff", "recvbuff", "pid"]].astype("UInt64")
+        coll_kernel = coll_kernel.drop(columns=["text", "category"])
+    result["coll_kernel"] = coll_kernel
+    
+    # p2p_kernel
+    p2p_kernel = df[df["category"] == "p2p_kernel"].copy()
+    if len(p2p_kernel) > 0:
+        p2p_kernel[["Bytes", "p2pType", "peer", "proto", "countHi32", "countLo32", "chunkSize", "pid"]] = p2p_kernel["text"].str.extract(NVTX_PATTERNS["p2p_kernel"])
+        p2p_kernel[["Bytes", "peer", "proto", "countHi32", "countLo32", "chunkSize", "pid"]] = p2p_kernel[["Bytes", "peer", "proto", "countHi32", "countLo32", "chunkSize", "pid"]].astype("UInt64")
+        p2p_kernel = p2p_kernel.drop(columns=["text", "category"])
+    result["p2p_kernel"] = p2p_kernel
+    
+    # comm
+    comm = df[df["category"] == "comm"].copy()
+    if len(comm) > 0:
+        comm[["collective", "commHash", "stream", "pid"]] = comm["text"].str.extract(NVTX_PATTERNS["comm"])
+        comm["pid"] = comm["pid"].astype("Int64")
+        comm = comm.drop(columns=["text", "category"])
+    result["comm"] = comm
+    
+    # coll_info
+    coll_info = df[df["category"] == "coll_info"].copy()
+    if len(coll_info) > 0:
+        coll_info[["collType", "root", "redOp", "algo", "proto", "commHash", "stream", "data_size", "type_size", "chunkSteps", "sliceSteps", "stepSize", "pid"]] = coll_info["text"].str.extract(NVTX_PATTERNS["coll_info"])
+        coll_info[["collType", "root", "redOp", "algo", "proto", "data_size", "type_size", "chunkSteps", "sliceSteps", "stepSize", "pid"]] = coll_info[["collType", "root", "redOp", "algo", "proto", "data_size", "type_size", "chunkSteps", "sliceSteps", "stepSize", "pid"]].astype("UInt64")
+        coll_info = coll_info.drop(columns=["text", "category"])
+    result["coll_info"] = coll_info
+    
+    return result
 
 def read_nvtx_event_file(trace_file):
     node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
@@ -79,24 +197,34 @@ def read_nvtx_event_file(trace_file):
         conn.close()
     except Exception as e:
         logger.warning(f"Failed to read {trace_file}: {e}")
-        return pd.DataFrame(columns=["start", "end", "text", "nodeId"])
+        return {cat: pd.DataFrame() for cat in ["comm_info", "comm_ring", "comm_tree", "profile_start", "profile_end", "group_start", "group_end", "coll_kernel", "p2p_kernel", "comm", "coll_info"]}
     df_tmp["nodeId"] = node_id
-    return df_tmp
+    # Categorize during read - this is parallelized across files
+    df_tmp["category"] = df_tmp["text"].apply(categorize_nvtx_text)
+    # Extract fields and convert types during read - also parallelized
+    return process_nvtx_by_category(df_tmp)
 
-def get_nvtx_events(traces: List[os.PathLike]) -> dd.DataFrame:
+def get_nvtx_events(traces: List[os.PathLike]) -> Dict[str, pd.DataFrame]:
     logger.info("querying for nvtx events")
     dfs = []
     for trace_file in traces:
         dfs.append(delayed(read_nvtx_event_file)(trace_file))
-
-    meta = {
-        "start": "Int64",
-        "end": "Int64",
-        "text": "string",
-        "nodeId": "object"
-    }
-    nvtx_df = dd.from_delayed(dfs, meta=meta)
-    return nvtx_df
+    
+    logger.info("computing nvtx events in parallel")
+    with ProgressBar():
+        results = dask.compute(*dfs, scheduler="processes")
+    
+    # Combine results from all files
+    combined = {}
+    categories = ["comm_info", "comm_ring", "comm_tree", "profile_start", "profile_end", "group_start", "group_end", "coll_kernel", "p2p_kernel", "comm", "coll_info"]
+    for cat in categories:
+        cat_dfs = [r[cat] for r in results if len(r[cat]) > 0]
+        if cat_dfs:
+            combined[cat] = pd.concat(cat_dfs, ignore_index=True)
+        else:
+            combined[cat] = pd.DataFrame()
+    
+    return combined
 
 
 def convert_numeric(data_frame: pd.DataFrame, signed_columns: List[str], unsigned_columns: List[str]) -> pd.DataFrame:
@@ -107,115 +235,42 @@ def convert_numeric(data_frame: pd.DataFrame, signed_columns: List[str], unsigne
     return data_frame
 
 
-def get_communicator_info(data: dd.DataFrame):
+def get_communicator_info(data: Dict[str, pd.DataFrame]):
     logger.info("extracting communicator info")
-    # extract available informations from the table
-    comm_info_pattern = (
-        r"commHash (0x[0-9a-f]+) commId (0x[0-9a-f]+) rank (\d+) nranks (\d+) pid (\d+)"
-    )
-    comm_info_pattern_matching_indexs = data["text"].str.match(comm_info_pattern)
-    comm_info_dask = data[comm_info_pattern_matching_indexs].copy()
-    data = data[~comm_info_pattern_matching_indexs]
     
-    logger.info("extracting communicator rings")
-    comm_ring_pattern = (
-        r"commHash (0x[0-9a-f]+) Rings \[(\d+)\] (\d+)->(\d+)->(\d+) pid (\d+)"
-    )
-    comm_ring_pattern_matching_indexs = data["text"].str.match(comm_ring_pattern)
-    comm_ring_info_dask = data[comm_ring_pattern_matching_indexs].copy()
-    data = data[~comm_ring_pattern_matching_indexs]
+    # Data is already extracted and typed
+    comm_info = data["comm_info"].copy()
+    comm_ring_info = data["comm_ring"].copy()
+    comm_tree_info = data["comm_tree"].copy()
     
-    logger.info("extracting communicator trees")
-    comm_tree_pattern = r"commHash (0x[0-9a-f]+) Trees \[(\d+)\] (-?\d+)/(-?\d+)/(-?\d+)->(-?\d+)->(-?\d+) pid (\d+)"
-    comm_tree_pattern_matching_indexs = data["text"].str.match(comm_tree_pattern)
-    comm_tree_info_dask = data[comm_tree_pattern_matching_indexs].copy()
-    data = data[~comm_tree_pattern_matching_indexs]
-    
-    logger.info("computing communicator info")
-    with ProgressBar():
-        comm_info, comm_ring_info, comm_tree_info = dask.compute(comm_info_dask, comm_ring_info_dask, comm_tree_info_dask)
-
-    comm_info[["commHash", "commId", "rank", "nRanks", "pid"]] = comm_info[
-        "text"
-    ].str.extract(comm_info_pattern)
-    comm_info = convert_numeric(comm_info, [], ["rank", "nRanks", "pid"])
-    # comm_info[["nRanks", "rank", "pid"]] = comm_info[["nRanks", "rank", "pid"]].astype(
-    #     "Int64"
-    # )
-    comm_info = comm_info.drop(
-        columns=["text", "start", "end"]
-    ).drop_duplicates()
-
+    comm_info = comm_info.drop(columns=["start", "end"]).drop_duplicates()
     comm_hash2id = comm_info[["nodeId", "commHash", "commId"]].drop_duplicates()
 
-    comm_ring_info[
-        ["commHash", "channelId", "prevRank", "myRank", "nextRank", "pid"]
-    ] = comm_ring_info["text"].str.extract(comm_ring_pattern)
-    comm_ring_info = convert_numeric(comm_ring_info, [], ["channelId", "prevRank", "myRank", "nextRank", "pid"]
-                                     )
     comm_ring_info = (
         comm_ring_info.merge(comm_hash2id, on=["nodeId", "commHash"], how="left")
-        .drop(columns=["commHash", "text", "start", "end"])
+        .drop(columns=["commHash", "start", "end"])
         .drop_duplicates()
     )
 
-    comm_tree_info[
-        [
-            "commHash",
-            "channelId",
-            "child1Rank",
-            "child2Rank",
-            "child3Rank",
-            "myRank",
-            "parentRank",
-            "pid",
-        ]
-    ] = comm_tree_info["text"].str.extract(comm_tree_pattern)
-    comm_tree_info = convert_numeric(comm_tree_info,
-        [
-            "child1Rank",
-            "child2Rank",
-            "child3Rank",
-            "parentRank"
-        ],["channelId","myRank","pid"]
-    )
     comm_tree_info = (
         comm_tree_info.merge(comm_hash2id, on=["nodeId", "commHash"], how="left")
-        .drop(columns=["commHash", "text", "start", "end"])
+        .drop(columns=["commHash", "start", "end"])
         .drop_duplicates()
     )
     return comm_info, comm_ring_info, comm_tree_info, data
 
 
-def get_profiling_interval(_data: dd.DataFrame):
+def get_profiling_interval(data: Dict[str, pd.DataFrame]):
     logger.info("extracting profiling intervals")
-    data = _data[["nodeId", "start", "text"]].copy()
-    profile_start_pattern = r"nsys profiling start, pid: (\d+)"
-    profile_end_pattern = r"nsys profiling stopped, pid: (\d+)"
-    profile_start_pattern_matching_indexs = data["text"].str.match(profile_start_pattern)
-    profile_end_pattern_matching_indexs = data["text"].str.match(profile_end_pattern)
-    profile_start_info_dask = data[profile_start_pattern_matching_indexs].copy()
-    profile_end_info_dask = data[profile_end_pattern_matching_indexs].copy()
-    _data = _data[~(profile_start_pattern_matching_indexs | profile_end_pattern_matching_indexs)]
     
-    logger.info("computing profiling intervals")
-    with ProgressBar():
-        profile_start_info, profile_end_info = dask.compute(profile_start_info_dask, profile_end_info_dask)
+    # Data is already extracted and typed
+    profile_start_info = data["profile_start"].copy()
+    profile_end_info = data["profile_end"].copy()
     
-    profile_start_info["pid"] = (
-        profile_start_info["text"].str.extract(profile_start_pattern).astype("Int64")
-    )
-    profile_start_info = profile_start_info.drop(columns=["text"])
-    profile_end_info["pid"] = (
-        profile_end_info["text"].str.extract(profile_end_pattern).astype("Int64")
-    )
-    profile_end_info = profile_end_info.rename(columns={"start": "end"}).drop(
-        columns=["text"]
-    )
     result_df = profile_start_info.merge(profile_end_info, on=["nodeId", "pid"])[
         ["nodeId", "pid", "start", "end"]
     ]
-    return {(row["nodeId"], row["pid"]): (row["start"], row["end"]) for _, row in result_df.iterrows()} ,_data
+    return {(row["nodeId"], row["pid"]): (row["start"], row["end"]) for _, row in result_df.iterrows()}, data
 
 
 @numba.njit
@@ -266,79 +321,40 @@ def _associate_start_ends(sequence, internal_groups=True):
     return group_ids
 
 
-def get_event_info(data: dd.DataFrame, comm_info: pd.DataFrame = None):
+def get_event_info(data: Dict[str, pd.DataFrame], comm_info: pd.DataFrame = None):
+    """
+    Process pre-extracted NVTX data and associate events.
+    
+    Args:
+        data: Dict of category -> DataFrame with pre-extracted fields from get_nvtx_events()
+        comm_info: Optional communicator info DataFrame
+    """
     logger.info("extracting event infos")
-    logger.info("extracting kernel group events")
-    kernel_group_start_pattern = r"ncclGroupStart\(\): pid (\d+)"
-    kernel_group_end_pattern = r"ncclGroupEnd\(\): pid (\d+)"
-    kernel_group_start_pattern_matching_indexs = data["text"].str.match(kernel_group_start_pattern)
-    kernel_group_end_pattern_matching_indexs = data["text"].str.match(kernel_group_end_pattern)
-    kernel_group_start_info_dask = data[
-        kernel_group_start_pattern_matching_indexs
-    ].copy()
-    kernel_group_end_info_dask = data[
-        kernel_group_end_pattern_matching_indexs
-    ].copy()
-    data = data[~(kernel_group_start_pattern_matching_indexs | kernel_group_end_pattern_matching_indexs)]
-
-    logger.info("extracting collective kernel events")
-    coll_kernel_pattern = r"nWarps \d+ count (\d+) chunkCount (\d+) workCount (\d+) lastChunkCount (\d+) workOffset (\d+) sendbuff (\d+) recvbuff (\d+) pid (\d+)"
-    coll_kernel_pattern_matching_indexs = data["text"].str.match(coll_kernel_pattern)
-    coll_kernel_data_dask = data[coll_kernel_pattern_matching_indexs].copy()
-    data = data[~coll_kernel_pattern_matching_indexs]
     
-    logger.info("extracting P2P kernel events")
-    p2p_kernel_pattern = r"Bytes (\d+) nWarps \d+ p2pType (\d+) peer (\d+) proto (\d+) countHi32 (\d+) countLo32 (\d+) chunkSize (\d+) pid (\d+)"
-    p2p_kernel_pattern_matching_indexs = data["text"].str.match(p2p_kernel_pattern)
-    p2p_kernel_data_dask = data[p2p_kernel_pattern_matching_indexs].copy()
-    data = data[~p2p_kernel_pattern_matching_indexs]
+    # Get pre-processed DataFrames (already have fields extracted and types converted)
+    kernel_group_start_info = data.get("group_start", pd.DataFrame()).copy()
+    kernel_group_end_info = data.get("group_end", pd.DataFrame()).copy()
+    coll_kernel_data = data.get("coll_kernel", pd.DataFrame()).copy()
+    p2p_kernel_data = data.get("p2p_kernel", pd.DataFrame()).copy()
+    comm_data = data.get("comm", pd.DataFrame()).copy()
+    coll_info_data = data.get("coll_info", pd.DataFrame()).copy()
     
-    logger.info("extracting communication events")
-    comm_pattern = r"nccl([a-zA-Z]+)\(\): commHash (0x[0-9a-f]+), stream (0x[0-9a-f]+), data_size \d+, type_size \d+,.* pid (\d+)"
-    comm_pattern_matching_indexs = data["text"].str.match(comm_pattern)
-    comm_data_dask = data[comm_pattern_matching_indexs].copy()
-    data = data[~comm_pattern_matching_indexs]
+    # concat start and end info (isStart already set in process_nvtx_by_category)
+    kernel_group_start_end = pd.concat(
+        [kernel_group_start_info, kernel_group_end_info]
+    )
     
-    logger.info("extracting collective info events")
-    coll_info_pattern = r"collType (\d+) root (\d+) redOp (\d+) algo (\d+) proto (\d+) commHash (\S+) stream (\S+) data_size (\d+) type_size (\d+) chunkSize \d+ chunkCount \d+ chunkSteps (\d+) sliceSteps (\d+) stepSize (\d+) pid (\d+)"
-    coll_info_pattern_matching_indexs = data["text"].str.match(coll_info_pattern)
-    coll_info_data_dask = data[coll_info_pattern_matching_indexs].copy()
-    data = data[~coll_info_pattern_matching_indexs]
-
-    logger.info("computing event infos")
-    with ProgressBar():
-        (kernel_group_start_info, 
-         kernel_group_end_info, 
-         coll_kernel_data, 
-         p2p_kernel_data, 
-         comm_data, 
-         coll_info_data) = dask.compute(
-            kernel_group_start_info_dask,
-            kernel_group_end_info_dask,
-            coll_kernel_data_dask,
-            p2p_kernel_data_dask,
-            comm_data_dask,
-            coll_info_data_dask
+    # Add comm_info mapping if provided
+    if comm_info is not None and len(comm_data) > 0:
+        comm_id_map = comm_info[["nodeId", "commHash", "commId"]].drop_duplicates()
+        comm_data = comm_data.merge(
+            comm_id_map, 
+            on=["nodeId", "commHash"], 
+            how="left"
         )
 
-    kernel_group_start_info["pid"] = (
-        kernel_group_start_info["text"]
-        .str.extract(kernel_group_start_pattern)
-        .astype("Int64")
-    )
-    kernel_group_end_info["pid"] = (
-        kernel_group_end_info["text"]
-        .str.extract(kernel_group_end_pattern)
-        .astype("Int64")
-    )
-
-    kernel_group_start_info.drop(columns=["text"], inplace=True)
-    kernel_group_end_info.drop(columns=["text"], inplace=True)
-    kernel_group_start_info["isStart"] = True
-    kernel_group_end_info["isStart"] = False
-    # concat start and end info
     kernel_group_start_end = (
-        pd.concat([kernel_group_start_info, kernel_group_end_info], ignore_index=True)
+        kernel_group_start_end
         .sort_values(by=["nodeId", "pid", "start"])
         .reset_index(drop=True)
     )
@@ -359,108 +375,6 @@ def get_event_info(data: dd.DataFrame, comm_info: pd.DataFrame = None):
         group = group[group["groupId"] != -1]
         group_start_end_grouped[gpu] = group
     
-    coll_kernel_data[
-        [
-            # "nWarps",
-            "count",
-            "chunkCount",
-            "workCount",
-            "lastChunkCount",
-            "workOffset",
-            "sendbuff",
-            "recvbuff",
-            "pid",
-        ]
-    ] = coll_kernel_data["text"].str.extract(coll_kernel_pattern)
-    coll_kernel_data.drop(columns=["text"], inplace=True)
-    coll_kernel_data = convert_numeric(coll_kernel_data,
-        [],[
-            # "nWarps",
-            "count",
-            "chunkCount",
-            "workCount",
-            "workOffset",
-            "sendbuff",
-            "recvbuff",
-            "pid",
-        ]
-    )
-    
-    p2p_kernel_data[
-        [
-            "Bytes",
-            # "nWarps",
-            "p2pType",
-            "peer",
-            "proto",
-            "countHi32",
-            "countLo32",
-            "chunkSize",
-            "pid",
-        ]
-    ] = p2p_kernel_data["text"].str.extract(p2p_kernel_pattern)
-    p2p_kernel_data.drop(columns=["text"], inplace=True)
-    p2p_kernel_data = convert_numeric(p2p_kernel_data,
-        [],[
-            "Bytes",
-            # "nWarps",
-            "peer",
-            "proto",
-            "countHi32",
-            "countLo32",
-            "chunkSize",
-            "pid",
-        ]
-    )
-    
-    comm_data[["collective", "commHash", "stream", "pid"]] = (
-        comm_data["text"].str.extract(comm_pattern)
-    )
-    comm_data.drop(columns=["text"], inplace=True)
-    comm_data["pid"] = comm_data["pid"].astype("Int64")
-    if comm_info is not None:
-        comm_data = comm_data.merge(
-            comm_info[["nodeId", "commHash", "commId"]].drop_duplicates(), on=["nodeId", "commHash"], how="left"
-        )
-        
-    coll_info_data[
-        [
-            "collType",
-            "root",
-            "redOp",
-            "algo",
-            "proto",
-            "commHash",
-            "stream",
-            "data_size",
-            "type_size",
-            # "chunkSize",
-            # "chunkCount",
-            "chunkSteps",
-            "sliceSteps",
-            "stepSize",
-            "pid",
-        ]
-    ] = coll_info_data["text"].str.extract(coll_info_pattern)
-    coll_info_data.drop(columns=["text"], inplace=True)
-    coll_info_data = convert_numeric(coll_info_data,
-        [],[
-            "collType",
-            "root",
-            "redOp",
-            "algo",
-            "proto",
-            "data_size",
-            "type_size",
-            # "chunkSize",
-            # "chunkCount",
-            "chunkSteps",
-            "sliceSteps",
-            "stepSize",
-            "pid",
-        ]
-    )
-
     logger.info("grouping events by GPU")
     comm_grouped = {name: group for name, group in comm_data.groupby(["nodeId", "pid"])}
     coll_info_grouped = {
@@ -595,7 +509,7 @@ def associate_kernel_to_nvtx(
         }
     else:
         kernel_df_grouped = kernel_events
-    for gpu in tqdm(kernel_df_grouped.keys()):
+    def process_one_gpu(gpu, kernels, nvtxs):
         collective_labels = {
             "AllGather": "A",
             "AllReduce": "B",
@@ -605,8 +519,8 @@ def associate_kernel_to_nvtx(
             "Send": "E",
             "SendRecv": "E",
         }
-        kernels = kernel_df_grouped[gpu].sort_values(by="start").reset_index(drop=True)
-        nvtxs = comm_grouped[gpu].sort_values(by="start").reset_index(drop=True)
+        kernels = kernels.sort_values(by="start").reset_index(drop=True)
+        nvtxs = nvtxs.sort_values(by="start").reset_index(drop=True)
         non_grouped_nvtxs = nvtxs[nvtxs["groupId"] == -1]
         grouped_nvtxs = nvtxs[nvtxs["groupId"] != -1]
 
@@ -669,7 +583,7 @@ def associate_kernel_to_nvtx(
         if len(stream_correspondence) != max(
             len(kernel_stream_collectives), len(nvtx_stream_collectives)
         ):
-            raise ValueError("Mismatch in number of unique stream fingerprints")
+            raise ValueError(f"Mismatch in number of unique stream fingerprints {gpu}")
         # check for unmatched streams
         unmatched_kernel_streams = stream_correspondence[
             stream_correspondence["stream"].isna()
@@ -701,7 +615,6 @@ def associate_kernel_to_nvtx(
             .rename(columns={"eventId": "association"})
         )
 
-        kernel_df_grouped[gpu] = kernels
         nvtxs = (
             nvtxs.drop(columns=["label", "inStreamEventId", "start", "end"])
             .merge(
@@ -724,10 +637,13 @@ def associate_kernel_to_nvtx(
             .sort_values(by=["start"])
             .reset_index(drop=True)
         )
+        return gpu, kernels, nvtxs
 
+    for gpu in tqdm(kernel_df_grouped.keys()):
+        gpu, kernels, nvtxs = process_one_gpu(gpu, kernel_df_grouped[gpu], comm_grouped[gpu])
+        kernel_df_grouped[gpu] = kernels
         comm_grouped[gpu] = nvtxs
 
-    # comm_data = pd.concat(list(comm_grouped.values()), ignore_index=True)
     return comm_grouped
     
 def add_context_parallelism(comm_datas: Dict[Tuple[int, int], pd.DataFrame]):
@@ -807,7 +723,7 @@ def add_context_parallelism(comm_datas: Dict[Tuple[int, int], pd.DataFrame]):
                     expecting_first = True
         return True
     
-    for gpu, comm_data in tqdm(comm_datas.items(), total=len(comm_datas)):
+    def process_one_context(gpu, comm_data):
         comm_data = comm_data.sort_values("start").reset_index(drop=True)
         comm_data["label"] = comm_data["collective"].map(collective_labels)
         comm_grouped = (
@@ -816,11 +732,16 @@ def add_context_parallelism(comm_datas: Dict[Tuple[int, int], pd.DataFrame]):
             .reset_index()
         )
         comm_grouped["parallelism"] = comm_grouped["label_seq"].map(get_rule)
-        comm_datas[gpu] = comm_data.merge(
+        comm_data = comm_data.merge(
             comm_grouped[["stream", "parallelism"]],
             on=["stream"],
             how="left",
         ).drop(columns=["label"])
+        return gpu, comm_data
+
+    for gpu, comm_data in tqdm(comm_datas.items()):
+        gpu, comm_data = process_one_context(gpu, comm_data)
+        comm_datas[gpu] = comm_data
     return comm_datas
 
 

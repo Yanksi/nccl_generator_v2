@@ -11,6 +11,7 @@ from tqdm import tqdm
 from nccl_comm import *
 from nccl_primitives import *
 import argparse
+import time
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -79,6 +80,7 @@ context_labels = {"Other": 0, "PP": 1, "DP": 2}
 if __name__ == "__main__":
     # %%
     # get the path of the current script
+    script_start_time = time.time()
     parser = argparse.ArgumentParser(description="Process some paths.")
     parser.add_argument("--trace_dir", type=str, required=True, help="Directory containing trace files")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save output files")
@@ -94,11 +96,15 @@ if __name__ == "__main__":
     use_dask = args.dask
     if use_dask:
         from nsys_events_dask import *
+        from dask.diagnostics import ProgressBar
     else:
         from nsys_events import *
 
     traces = find_all_traces(trace_dir)
     nvtx_events = get_nvtx_events(traces)
+    
+    # nvtx_events is now Dict[str, pd.DataFrame] with pre-processed data
+    # (parallel I/O, regex categorization, field extraction, and type conversion already done)
 
     comm_info, comm_ring_info, comm_tree_info, nvtx_events = get_communicator_info(nvtx_events)
     communicator_ids_numeric = [[i, comm_id] for i, comm_id in enumerate(comm_info["commId"].unique())]
@@ -212,4 +218,5 @@ if __name__ == "__main__":
             for line in gpu.generate_goal_lines(gpu2goal_rank, nic=0):
                 f.write(f"{line}\n")
             f.write("}\n")
+    logger.info(f"Total script time: {time.time() - script_start_time:.2f} seconds")
 # %%
