@@ -3,6 +3,7 @@ import os
 import pathlib
 import re
 import sqlite3
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -13,12 +14,16 @@ import dask
 import dask.dataframe as dd
 from dask import delayed
 # dask.config.set(scheduler='processes')
-from dask.diagnostics import ProgressBar
+from tqdm import tqdm
+from tqdm.dask import TqdmCallback
+from functools import partial
+
+# Configure tqdm for batch job compatibility (explicit stderr, no buffering)
+_tqdm_for_dask = partial(tqdm, file=sys.stderr, mininterval=0, dynamic_ncols=True)
 
 # import modin.pandas as pd
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 logger = logging.getLogger("nsys_events")
 logging.basicConfig(level=logging.INFO)
@@ -50,7 +55,7 @@ def read_kernel_event_file(trace_file):
     return df_tmp
 
 def get_kernel_events(traces: List[os.PathLike]) -> dd.DataFrame:
-    logger.info("querying for kernel events")
+    logger.info(f"querying for kernel events from {len(traces)} traces")
     dfs = []
     for trace_file in traces:
         dfs.append(delayed(read_kernel_event_file)(trace_file))
@@ -205,13 +210,13 @@ def read_nvtx_event_file(trace_file):
     return process_nvtx_by_category(df_tmp)
 
 def get_nvtx_events(traces: List[os.PathLike]) -> Dict[str, pd.DataFrame]:
-    logger.info("querying for nvtx events")
+    logger.info(f"querying for nvtx events from {len(traces)} traces")
     dfs = []
     for trace_file in traces:
         dfs.append(delayed(read_nvtx_event_file)(trace_file))
     
     logger.info("computing nvtx events in parallel")
-    with ProgressBar():
+    with TqdmCallback(desc="nvtx events", tqdm_class=_tqdm_for_dask):
         results = dask.compute(*dfs, scheduler="processes")
     
     # Combine results from all files
@@ -493,7 +498,7 @@ def associate_kernel_to_nvtx(
 ):
     if hasattr(kernel_events, "dask"):
         logger.info("computing kernel events")
-        with ProgressBar():
+        with TqdmCallback(desc="kernel events", tqdm_class=_tqdm_for_dask):
             kernel_events = kernel_events.compute(scheduler="processes")
 
     if profiling_interval is not None:

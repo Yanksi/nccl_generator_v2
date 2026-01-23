@@ -92,7 +92,7 @@ def init_and_generate_goal_for_gpu(args_tuple):
     Runs in a separate process to avoid GIL.
     
     Args:
-        args_tuple: (gpu_id, rank, gpu_init_data, gpu_id2goal_rank, output_dir, merged_streams, nic, init_counter, gen_counter)
+        args_tuple: (gpu_id, rank, gpu_init_data, gpu_id2goal_rank, output_dir, merged_streams, nic, init_counter, gen_counter, counter_lock)
     
     gpu_init_data contains:
         - coll_info_gpu: DataFrame
@@ -103,8 +103,9 @@ def init_and_generate_goal_for_gpu(args_tuple):
         - pid: int
     
     init_counter, gen_counter: multiprocessing.Value counters for progress tracking
+    counter_lock: multiprocessing.Lock to protect counter updates
     """
-    gpu_id, rank, gpu_init_data, gpu_id2goal_rank, output_dir, merged_streams, nic, init_counter, gen_counter = args_tuple
+    gpu_id, rank, gpu_init_data, gpu_id2goal_rank, output_dir, merged_streams, nic, init_counter, gen_counter, counter_lock = args_tuple
     
     # Reconstruct GPUDevice in this process
     gpu = GPUDevice(rank=rank, node_id=gpu_init_data["node_id"], pid=gpu_init_data["pid"])
@@ -121,8 +122,9 @@ def init_and_generate_goal_for_gpu(args_tuple):
     if merged_streams:
         gpu.merge_streams()
     
-    # Update init counter (Manager Values are process-safe, no lock needed)
-    init_counter.value += 1
+    # Update init counter with lock to prevent race conditions
+    with counter_lock:
+        init_counter.value += 1
     
     # Generate and write goal file
     output_file = output_dir / f"rank_{rank}.goal"
@@ -132,8 +134,9 @@ def init_and_generate_goal_for_gpu(args_tuple):
             f.write(f"{line}\n")
         f.write("}\n")
     
-    # Update generation counter
-    gen_counter.value += 1
+    # Update generation counter with lock
+    with counter_lock:
+        gen_counter.value += 1
     
     return rank
 
@@ -208,7 +211,10 @@ if __name__ == "__main__":
     use_dask = args.dask
     if use_dask:
         from nsys_events_dask import *
-        from dask.diagnostics import ProgressBar
+        from tqdm.dask import TqdmCallback
+        from functools import partial
+        # Configure tqdm for batch job compatibility
+        _tqdm_for_dask = partial(tqdm, file=sys.stderr, mininterval=0, dynamic_ncols=True)
     else:
         from nsys_events import *
 
@@ -326,20 +332,21 @@ if __name__ == "__main__":
         manager = multiprocessing.Manager()
         init_counter = manager.Value('i', 0)
         gen_counter = manager.Value('i', 0)
+        counter_lock = manager.Lock()
         
         # Prepare all GPU data in main process (this is fast, mostly DataFrame operations)
         gpu_data_list = []
         for gpu_id, gpu in tqdm(gpu_devices.items(), desc="Preparing GPU data"):
             gpu_data = prepare_gpu_data(gpu_id, gpu)
             rank = gpu_id2goal_rank[gpu.gpu_id]
-            gpu_data_list.append((gpu_id, rank, gpu_data, gpu_id2goal_rank, output_dir, merged_streams, 0, init_counter, gen_counter))
+            gpu_data_list.append((gpu_id, rank, gpu_data, gpu_id2goal_rank, output_dir, merged_streams, 0, init_counter, gen_counter, counter_lock))
         
         time_finish_prep = time.time()
         logger.info(f"Data preparation time: {time_finish_prep - script_start_time:.2f} seconds")
         
         # Now run init + goal generation in parallel processes
-        logger.info("initializing GPUs and generating goal files in parallel")
         num_workers = min(os.cpu_count() or 1, len(gpu_devices))
+        logger.info(f"initializing GPUs and generating goal files in parallel with {num_workers} workers")
         total_gpus = len(gpu_data_list)
         
         with multiprocessing.Pool(processes=num_workers) as pool:
@@ -368,9 +375,9 @@ if __name__ == "__main__":
                 
                 time.sleep(0.1)
             
-            # Final update to ensure bars show 100%
-            init_bar.n = total_gpus
-            gen_bar.n = total_gpus
+            # Final update to capture any last increments missed by the loop
+            init_bar.n = init_counter.value
+            gen_bar.n = gen_counter.value
             init_bar.refresh()
             gen_bar.refresh()
             init_bar.close()
@@ -405,7 +412,7 @@ if __name__ == "__main__":
             from dask import delayed
             import dask
             tasks = [delayed(init_one_gpu)(gpu_id, gpu) for gpu_id, gpu in gpu_devices.items()]
-            with ProgressBar():
+            with TqdmCallback(desc="init GPUs", tqdm_class=_tqdm_for_dask):
                 dask.compute(*tasks, scheduler="threads")
         else:
             for gpu_id, gpu in tqdm(gpu_devices.items()):
