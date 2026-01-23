@@ -7,6 +7,7 @@ import os
 import pathlib
 from typing import Dict, Tuple, List
 
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -85,6 +86,58 @@ proto_mapping = {
 context_labels = {"Other": 0, "PP": 1, "DP": 2}
 
 
+def init_and_generate_goal_for_gpu(args_tuple):
+    """
+    Worker function for parallel GPU initialization and goal generation.
+    Runs in a separate process to avoid GIL.
+    
+    Args:
+        args_tuple: (gpu_id, rank, gpu_init_data, gpu_id2goal_rank, output_dir, merged_streams, nic, init_counter, gen_counter)
+    
+    gpu_init_data contains:
+        - coll_info_gpu: DataFrame
+        - coll_kernel_gpu: DataFrame  
+        - p2p_kernel_gpu: DataFrame
+        - comm_data_gpu: DataFrame
+        - node_id: str
+        - pid: int
+    
+    init_counter, gen_counter: multiprocessing.Value counters for progress tracking
+    """
+    gpu_id, rank, gpu_init_data, gpu_id2goal_rank, output_dir, merged_streams, nic, init_counter, gen_counter = args_tuple
+    
+    # Reconstruct GPUDevice in this process
+    gpu = GPUDevice(rank=rank, node_id=gpu_init_data["node_id"], pid=gpu_init_data["pid"])
+    
+    # Initialize GPU from dataframes
+    gpu.init_from_dfs(
+        gpu_init_data["coll_info"],
+        gpu_init_data["coll_kernels"],
+        gpu_init_data["p2p_kernels"],
+        gpu_init_data["comm_data"]
+    )
+    
+    # Merge streams if requested
+    if merged_streams:
+        gpu.merge_streams()
+    
+    # Update init counter (Manager Values are process-safe, no lock needed)
+    init_counter.value += 1
+    
+    # Generate and write goal file
+    output_file = output_dir / f"rank_{rank}.goal"
+    with open(output_file, "w") as f:
+        f.write(f"rank {rank} {{\n")
+        for line in gpu.generate_goal_lines(gpu_id2goal_rank, nic=nic):
+            f.write(f"{line}\n")
+        f.write("}\n")
+    
+    # Update generation counter
+    gen_counter.value += 1
+    
+    return rank
+
+
 def write_goal_for_gpu(args_tuple):
     """
     Worker function for parallel goal file writing.
@@ -139,7 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("--merged", action='store_true', help="Whether the streams are merged")
     parser.add_argument("--intermediate_results", action='store_true', help="Whether to save intermediate results")
     parser.add_argument("--dask", action='store_true', help="Whether to use dask for processing")
-    parser.add_argument("--parallel_write", action='store_true', help="Whether to use parallel write for output files")
+    parser.add_argument("--parallel_generation", action='store_true', help="Whether to generate goal files in parallel")
     parser.add_argument("--concatenate", action='store_true', help="Whether to concatenate all traces into one")
     parser.add_argument("--delete_parts", action='store_true', help="Whether to delete part files after concatenation")
     args = parser.parse_args()
@@ -148,7 +201,7 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
     merged_streams = args.merged
     intermediate_results = args.intermediate_results
-    parallel_write = args.parallel_write
+    parallel_generation = args.parallel_generation
     concatenate = args.concatenate
     delete_parts = args.delete_parts
 
@@ -159,6 +212,8 @@ if __name__ == "__main__":
     else:
         from nsys_events import *
 
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
     traces = find_all_traces(trace_dir)
     nvtx_events = get_nvtx_events(traces)
     
@@ -196,6 +251,9 @@ if __name__ == "__main__":
     
     del kernel_events
 
+    comm_data = filter_time(profiling_interval, comm_data)
+    comm_data = add_context_parallelism(comm_data)
+
     communicators, gpu_devices = construct_communicators(
         comm_info, comm_ring_info, comm_tree_info
     )
@@ -206,11 +264,6 @@ if __name__ == "__main__":
         for k, v in comm_data.items():
             v.to_csv(curr_dir / f"{k[0]}_{k[1]}.csv", index=False)
 
-    comm_data = filter_time(profiling_interval, comm_data)
-    comm_data = add_context_parallelism(comm_data)
-
-
-    logger.info("initilizing GPU devices from dataframes")
     comm_ops = {
         "AllReduce": AllReduce,
         "AllGather": AllGather,
@@ -221,75 +274,112 @@ if __name__ == "__main__":
         "Recv": Recv,
     }
     
-    def init_one_gpu(gpu_id, gpu):
-        coll_info_gpu = coll_info[gpu_id]
-        coll_info_gpu["algo"] = coll_info_gpu["algo"].map(algo_mapping)
-        coll_info_gpu["proto"] = coll_info_gpu["proto"].map(proto_mapping)
-        
-        coll_kernel_gpu = coll_kernels[gpu_id]
-        
-        p2p_kernel_gpu = p2p_kernels[gpu_id]
-        p2p_kernel_gpu["proto"] = p2p_kernel_gpu["proto"].map(proto_mapping)
-        p2p_kernel_gpu["count"] = p2p_kernel_gpu[["countHi32", "countLo32"]].apply(
-            lambda row: row["countHi32"] << 32 | row["countLo32"], axis=1
-        )
-        p2p_kernel_gpu.drop(columns=["countHi32", "countLo32"], inplace=True)
-        
-        comm_data_gpu = comm_data[gpu_id]
-        comm_data_gpu = comm_data_gpu.merge(communicator_ids_numeric_df, on="commId", how="left")
-        comm_data_gpu["collective"] = comm_data_gpu["collective"].map(comm_ops)
-        comm_data_gpu["communicator"] = comm_data_gpu["commId"].map(communicators)
-        comm_data_gpu["context_label"] = comm_data_gpu.apply(
-            lambda row: context_labels.get(row["parallelism"], 0) + row["comm_num_id"] * 100, axis=1
-        )
-        comm_data_gpu.drop(columns=["commId", "parallelism", "comm_num_id"], inplace=True)
-        
-        gpu.init_from_dfs(coll_info_gpu, coll_kernel_gpu, p2p_kernel_gpu, comm_data_gpu)
-        return gpu_id
-    
-    if use_dask:
-        from dask import delayed
-        import dask
-        tasks = [delayed(init_one_gpu)(gpu_id, gpu) for gpu_id, gpu in gpu_devices.items()]
-        with ProgressBar():
-            dask.compute(*tasks, scheduler="threads")
-    else:
-        for gpu_id, gpu in tqdm(gpu_devices.items()):
-            init_one_gpu(gpu_id, gpu)
-
+    # Build gpu_id2goal_rank mapping
     gpu_id2goal_rank = {gpu.gpu_id: i for i, gpu in enumerate(gpu_devices.values())}
-
+    
+    # Initialize npkit data
     init_data(
         "npkit_benchmark_results/clariden/npkit_data_summary_Simple.json",
         "npkit_benchmark_results/clariden/npkit_data_summary_LL.json",
     )
 
-    time_finish_init = time.time()
-    
-    if parallel_write:
-        # Parallel write: each process writes to a separate file
-        logger.info("writing goal files in parallel")
-        num_workers = min(os.cpu_count() or 1, len(gpu_devices))
+    def prepare_gpu_data(gpu_id, gpu):
+        """Prepare dataframes for a single GPU, applying all transformations."""
+        coll_info_gpu = coll_info[gpu_id].copy()
+        coll_info_gpu["algo"] = coll_info_gpu["algo"].map(algo_mapping)
+        coll_info_gpu["proto"] = coll_info_gpu["proto"].map(proto_mapping)
         
-        # Prepare arguments for worker function
-        worker_args = [
-            (gpu, gpu_id2goal_rank[gpu.gpu_id], gpu_id2goal_rank, output_dir, merged_streams, 0)
-            for gpu in gpu_devices.values()
-        ]
-
-        with open(output_dir / "num_ranks.goal", "w") as f:
-            f.write(f"num_ranks {len(gpu_devices)}\n")
+        coll_kernel_gpu = coll_kernels[gpu_id].copy()
+        
+        p2p_kernel_gpu = p2p_kernels[gpu_id].copy()
+        p2p_kernel_gpu["proto"] = p2p_kernel_gpu["proto"].map(proto_mapping)
+        # Vectorized bitwise operation
+        hi32 = p2p_kernel_gpu["countHi32"].to_numpy(dtype=np.int64)
+        lo32 = p2p_kernel_gpu["countLo32"].to_numpy(dtype=np.int64)
+        p2p_kernel_gpu["count"] = (hi32 << 32) | lo32
+        p2p_kernel_gpu.drop(columns=["countHi32", "countLo32"], inplace=True)
+        
+        comm_data_gpu = comm_data[gpu_id].copy()
+        comm_data_gpu = comm_data_gpu.merge(communicator_ids_numeric_df, on="commId", how="left")
+        comm_data_gpu["collective"] = comm_data_gpu["collective"].map(comm_ops)
+        comm_data_gpu["communicator"] = comm_data_gpu["commId"].map(communicators)
+        # Vectorized context_label calculation
+        parallelism_vals = comm_data_gpu["parallelism"].map(context_labels).fillna(0).astype(np.int64)
+        comm_num_ids = comm_data_gpu["comm_num_id"].to_numpy(dtype=np.int64)
+        comm_data_gpu["context_label"] = parallelism_vals.to_numpy() + comm_num_ids * 100
+        comm_data_gpu.drop(columns=["commId", "parallelism", "comm_num_id"], inplace=True)
+        
+        return {
+            "coll_info": coll_info_gpu,
+            "coll_kernels": coll_kernel_gpu,
+            "p2p_kernels": p2p_kernel_gpu,
+            "comm_data": comm_data_gpu,
+            "node_id": gpu.node_id,
+            "pid": gpu.pid,
+        }
+    
+    if parallel_generation:
+        # Parallel generation: prepare data, then use multiprocessing for init + goal generation
+        logger.info("preparing GPU data for parallel generation")
+        
+        # Create shared counters for progress tracking
+        manager = multiprocessing.Manager()
+        init_counter = manager.Value('i', 0)
+        gen_counter = manager.Value('i', 0)
+        
+        # Prepare all GPU data in main process (this is fast, mostly DataFrame operations)
+        gpu_data_list = []
+        for gpu_id, gpu in tqdm(gpu_devices.items(), desc="Preparing GPU data"):
+            gpu_data = prepare_gpu_data(gpu_id, gpu)
+            rank = gpu_id2goal_rank[gpu.gpu_id]
+            gpu_data_list.append((gpu_id, rank, gpu_data, gpu_id2goal_rank, output_dir, merged_streams, 0, init_counter, gen_counter))
+        
+        time_finish_prep = time.time()
+        logger.info(f"Data preparation time: {time_finish_prep - script_start_time:.2f} seconds")
+        
+        # Now run init + goal generation in parallel processes
+        logger.info("initializing GPUs and generating goal files in parallel")
+        num_workers = min(os.cpu_count() or 1, len(gpu_devices))
+        total_gpus = len(gpu_data_list)
         
         with multiprocessing.Pool(processes=num_workers) as pool:
-            # Use imap_unordered for better performance, wrap with tqdm for progress
-            # position=0 and leave=True ensure clean progress bar display
-            results = list(tqdm(
-                pool.imap_unordered(write_goal_for_gpu, worker_args), 
-                total=len(worker_args), 
-                desc="Writing goal files",
-                position=0,
-                leave=True
-            ))
+            # Start async map
+            async_result = pool.map_async(init_and_generate_goal_for_gpu, gpu_data_list)
+            
+            # Create dual progress bars
+            # Init bar uses lighter/dimmer style, Gen bar uses solid style
+            init_bar = tqdm(total=total_gpus, desc="Initializing ", position=0, 
+                           bar_format='{desc}: {bar}| {n_fmt}/{total_fmt}',
+                           colour='cyan', leave=True)
+            gen_bar = tqdm(total=total_gpus, desc="Generating   ", position=1,
+                          bar_format='{desc}: {bar}| {n_fmt}/{total_fmt}',
+                          colour='green', leave=True)
+            
+            # Monitor progress until all tasks complete
+            while not async_result.ready():
+                # Update bars based on shared counters
+                current_init = init_counter.value
+                current_gen = gen_counter.value
+                
+                init_bar.n = current_init
+                gen_bar.n = current_gen
+                init_bar.refresh()
+                gen_bar.refresh()
+                
+                time.sleep(0.1)
+            
+            # Final update to ensure bars show 100%
+            init_bar.n = total_gpus
+            gen_bar.n = total_gpus
+            init_bar.refresh()
+            gen_bar.refresh()
+            init_bar.close()
+            gen_bar.close()
+            
+            # Get results (will raise if any worker failed)
+            results = async_result.get()
+        
+        time_finish_init = time.time()
         
         if concatenate:
             logger.info("concatenating goal files")
@@ -298,6 +388,31 @@ if __name__ == "__main__":
             goal_path = output_dir
             logger.info(f"Goal files written to: {output_dir}/rank_*.goal")
     else:
+        # Sequential mode: init GPUs then generate goals
+        logger.info("initilizing GPU devices from dataframes")
+        
+        def init_one_gpu(gpu_id, gpu):
+            gpu_data = prepare_gpu_data(gpu_id, gpu)
+            gpu.init_from_dfs(
+                gpu_data["coll_info"],
+                gpu_data["coll_kernels"],
+                gpu_data["p2p_kernels"],
+                gpu_data["comm_data"]
+            )
+            return gpu_id
+        
+        if use_dask:
+            from dask import delayed
+            import dask
+            tasks = [delayed(init_one_gpu)(gpu_id, gpu) for gpu_id, gpu in gpu_devices.items()]
+            with ProgressBar():
+                dask.compute(*tasks, scheduler="threads")
+        else:
+            for gpu_id, gpu in tqdm(gpu_devices.items()):
+                init_one_gpu(gpu_id, gpu)
+
+        time_finish_init = time.time()
+
         # Sequential write: single output file
         goal_path = output_dir / "output.goal"
         with open(goal_path, "w") as f:

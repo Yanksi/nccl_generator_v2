@@ -165,13 +165,14 @@ class GPUDevice:
             "p2p_kernels": {k:v for k,v in p2p_kernels.groupby("association")},
             "comm_data": comm_data.set_index("eventId")
         }
-        for event_id, rows in self.dfs["comm_data"].iterrows():
+        # Use itertuples() instead of iterrows() for ~10-100x speedup
+        for row in self.dfs["comm_data"].itertuples():
             self.add_collective(
-                stream=rows["stream"],
-                coll=event_id,
-                start=rows["start"],
-                end=rows["end"],
-                context=rows["context_label"]
+                stream=row.stream,
+                coll=row.Index,  # event_id is the index
+                start=row.start,
+                end=row.end,
+                context=row.context_label
             )
     
     def streams_sorted(self):
