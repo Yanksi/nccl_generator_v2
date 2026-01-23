@@ -64,7 +64,7 @@ def get_kernel_events(traces: List[os.PathLike]) -> dd.DataFrame:
         "nodeId": "object",
         "collective": "string"
     }
-    kernel_df = dd.from_delayed(dfs, meta=meta).persist(scheduler="processes")
+    kernel_df = dd.from_delayed(dfs, meta=meta)
     return kernel_df
 
 # All NVTX regex patterns - defined once globally
@@ -494,7 +494,7 @@ def associate_kernel_to_nvtx(
     if hasattr(kernel_events, "dask"):
         logger.info("computing kernel events")
         with ProgressBar():
-            kernel_events = kernel_events.compute()
+            kernel_events = kernel_events.compute(scheduler="processes")
 
     if profiling_interval is not None:
         if isinstance(kernel_events, pd.DataFrame):
