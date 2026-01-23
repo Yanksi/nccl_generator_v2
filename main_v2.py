@@ -217,7 +217,6 @@ if __name__ == "__main__":
     #         await asyncio.gather(*write_tasks)
     # asyncio.run(write_goals_buffered())
     time_finish_init = time.time()
-    logger.info(f"Time to initialize GPU devices: {time_finish_init - script_start_time:.2f} seconds")
     goal_path = output_dir / "output.goal"
     with open(goal_path, "w") as f:
         logger.info("writing goal file")
@@ -232,6 +231,8 @@ if __name__ == "__main__":
                 f.write(f"{line}\n")
             f.write("}\n")
     script_finish_time = time.time()
+    logger.info(f"Time to initialize GPU devices: {time_finish_init - script_start_time:.2f} seconds")
     logger.info(f"Time to generate goal file: {script_finish_time - time_finish_init:.2f} seconds")
     logger.info(f"Total script time: {time.time() - script_start_time:.2f} seconds")
+    logger.info(f"Goal file written to: {goal_path}")
 # %%
