@@ -161,17 +161,21 @@ if __name__ == "__main__":
         "Send": Send,
         "Recv": Recv,
     }
-    for gpu_id, gpu in tqdm(gpu_devices.items()):
+    
+    def init_one_gpu(gpu_id, gpu):
         coll_info_gpu = coll_info[gpu_id]
         coll_info_gpu["algo"] = coll_info_gpu["algo"].map(algo_mapping)
         coll_info_gpu["proto"] = coll_info_gpu["proto"].map(proto_mapping)
+        
         coll_kernel_gpu = coll_kernels[gpu_id]
+        
         p2p_kernel_gpu = p2p_kernels[gpu_id]
         p2p_kernel_gpu["proto"] = p2p_kernel_gpu["proto"].map(proto_mapping)
         p2p_kernel_gpu["count"] = p2p_kernel_gpu[["countHi32", "countLo32"]].apply(
             lambda row: row["countHi32"] << 32 | row["countLo32"], axis=1
         )
         p2p_kernel_gpu.drop(columns=["countHi32", "countLo32"], inplace=True)
+        
         comm_data_gpu = comm_data[gpu_id]
         comm_data_gpu = comm_data_gpu.merge(communicator_ids_numeric_df, on="commId", how="left")
         comm_data_gpu["collective"] = comm_data_gpu["collective"].map(comm_ops)
@@ -180,12 +184,19 @@ if __name__ == "__main__":
             lambda row: context_labels.get(row["parallelism"], 0) + row["comm_num_id"] * 100, axis=1
         )
         comm_data_gpu.drop(columns=["commId", "parallelism", "comm_num_id"], inplace=True)
-        gpu.init_from_dfs(
-            coll_info_gpu,
-            coll_kernel_gpu,
-            p2p_kernel_gpu,
-            comm_data_gpu
-        )
+        
+        gpu.init_from_dfs(coll_info_gpu, coll_kernel_gpu, p2p_kernel_gpu, comm_data_gpu)
+        return gpu_id
+    
+    if use_dask:
+        from dask import delayed
+        import dask
+        tasks = [delayed(init_one_gpu)(gpu_id, gpu) for gpu_id, gpu in gpu_devices.items()]
+        with ProgressBar():
+            dask.compute(*tasks, scheduler="threads")
+    else:
+        for gpu_id, gpu in tqdm(gpu_devices.items()):
+            init_one_gpu(gpu_id, gpu)
 
     gpu2goal_rank = {gpu: i for i, gpu in enumerate(gpu_devices.values())}
     gpu2node = {gpu: gpu_id[0] for gpu_id, gpu in gpu_devices.items()}
@@ -205,6 +216,8 @@ if __name__ == "__main__":
     #             write_tasks.append(f.write(result))
     #         await asyncio.gather(*write_tasks)
     # asyncio.run(write_goals_buffered())
+    time_finish_init = time.time()
+    logger.info(f"Time to initialize GPU devices: {time_finish_init - script_start_time:.2f} seconds")
     goal_path = output_dir / "output.goal"
     with open(goal_path, "w") as f:
         logger.info("writing goal file")
@@ -218,5 +231,7 @@ if __name__ == "__main__":
             for line in gpu.generate_goal_lines(gpu2goal_rank, nic=0):
                 f.write(f"{line}\n")
             f.write("}\n")
+    script_finish_time = time.time()
+    logger.info(f"Time to generate goal file: {script_finish_time - time_finish_init:.2f} seconds")
     logger.info(f"Total script time: {time.time() - script_start_time:.2f} seconds")
 # %%

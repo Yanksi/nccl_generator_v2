@@ -312,6 +312,7 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None):
             "count",
             "chunkCount",
             "workCount",
+            "lastChunkCount",
             "workOffset",
             "sendbuff",
             "recvbuff",

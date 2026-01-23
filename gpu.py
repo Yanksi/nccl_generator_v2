@@ -31,27 +31,27 @@ class GPUStream:
             if event_id not in self.self_gpu.dfs["coll_info"].index:
                 print(f"Event ID {event_id} not found in coll_info for GPU {self.self_gpu.id}.")
                 return None
-            coll_info = self.self_gpu.dfs["coll_info"].loc[event_id]
+            coll_info_row = self.self_gpu.dfs["coll_info"].loc[event_id]
             coll_info = CollInfo(
-                root_rank=coll_info["root"],
-                red_op=coll_info["redOp"],
-                algo=coll_info["algo"],
-                proto=coll_info["proto"],
-                data_size=coll_info["data_size"],
-                type_size=coll_info["type_size"],
-                chunk_steps=coll_info["chunkSteps"],
-                slice_steps=coll_info["sliceSteps"],
-                step_size=coll_info["stepSize"],
+                root_rank=int(coll_info_row["root"]),
+                red_op=int(coll_info_row["redOp"]),
+                algo=coll_info_row["algo"],
+                proto=coll_info_row["proto"],
+                data_size=int(coll_info_row["data_size"]),
+                type_size=int(coll_info_row["type_size"]),
+                chunk_steps=int(coll_info_row["chunkSteps"]),
+                slice_steps=int(coll_info_row["sliceSteps"]),
+                step_size=int(coll_info_row["stepSize"]),
             )
             coll_chnl_infos = self.self_gpu.dfs["coll_kernels"][event_id].apply(
                 lambda row: CollChnlInfo(
-                    count=row["count"],
-                    chunk_count=row["chunkCount"],
-                    work_count=row["workCount"],
-                    last_chunk_count=row["lastChunkCount"],
-                    work_offset=row["workOffset"],
-                    send_buff=row["sendbuff"],
-                    recv_buff=row["recvbuff"],
+                    count=int(row["count"]),
+                    chunk_count=int(row["chunkCount"]),
+                    work_count=int(row["workCount"]),
+                    last_chunk_count=int(row["lastChunkCount"]),
+                    work_offset=int(row["workOffset"]),
+                    send_buff=int(row["sendbuff"]),
+                    recv_buff=int(row["recvbuff"]),
                 ),
                 axis=1
             )
@@ -61,11 +61,11 @@ class GPUStream:
             from nccl_comm import P2PChnlInfo
             p2p_chnl_infos = self.self_gpu.dfs["p2p_kernels"][event_id].apply(
                 lambda row: P2PChnlInfo(
-                    Bytes=row["Bytes"],
+                    Bytes=int(row["Bytes"]),
                     proto=row["proto"],
-                    count=row["count"],
-                    chunk_size=row["chunkSize"],
-                    peer_rank=row["peer"],
+                    count=int(row["count"]),
+                    chunk_size=int(row["chunkSize"]),
+                    peer_rank=int(row["peer"]),
                 ),
                 axis=1
             )
