@@ -12,6 +12,7 @@ import numba
 import dask
 import dask.dataframe as dd
 from dask import delayed
+dask.config.set(scheduler='processes')
 from dask.diagnostics import ProgressBar
 
 # import modin.pandas as pd
@@ -61,7 +62,7 @@ def get_kernel_events(traces: List[os.PathLike]) -> dd.DataFrame:
         "streamId": "Int64",
         "pid": "Int64",
         "nodeId": "object",
-        "collective": "object"
+        "collective": "string"
     }
     kernel_df = dd.from_delayed(dfs, meta=meta)
     return kernel_df
@@ -565,9 +566,9 @@ def get_event_info(data: dd.DataFrame, comm_info: pd.DataFrame = None):
             p2p_kernel_grouped[gpu] = p2p_kernels
     
     comm_grouped = {k: v.drop(columns=["commHash", "nodeId", "pid"]) for k, v in comm_grouped.items()}
-    coll_info_grouped = {k: v.drop(columns=["eventId", "start", "end", "commHash", "stream", "nodeId", "pid"]) for k, v in coll_info_grouped.items()}
-    coll_kernel_grouped = {k: v.drop(columns=["eventId", "start", "end", "nodeId", "pid"]) for k, v in coll_kernel_grouped.items()}
-    p2p_kernel_grouped = {k: v.drop(columns=["eventId", "start", "end", "nodeId", "pid"]) for k, v in p2p_kernel_grouped.items()}
+    coll_info_grouped = {k: v.drop(columns=["start", "end", "commHash", "stream", "nodeId", "pid"]) for k, v in coll_info_grouped.items()}
+    coll_kernel_grouped = {k: v.drop(columns=["start", "end", "nodeId", "pid"]) for k, v in coll_kernel_grouped.items()}
+    p2p_kernel_grouped = {k: v.drop(columns=["start", "end", "nodeId", "pid"]) for k, v in p2p_kernel_grouped.items()}
     return comm_grouped, coll_info_grouped, coll_kernel_grouped, p2p_kernel_grouped, data
 
 

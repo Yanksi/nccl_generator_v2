@@ -10,7 +10,6 @@ from tqdm import tqdm
 
 from nccl_comm import *
 from nccl_primitives import *
-from nsys_events import *
 import argparse
 
 logger = logging.getLogger(__name__)
@@ -85,17 +84,23 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save output files")
     parser.add_argument("--merged", action='store_true', help="Whether the streams are merged")
     parser.add_argument("--intermediate_results", action='store_true', help="Whether to save intermediate results")
+    parser.add_argument("--dask", action='store_true', help="Whether to use dask for processing")
     args = parser.parse_args()
     trace_dir = pathlib.Path(args.trace_dir).resolve()
     output_dir = pathlib.Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     merged_streams = args.merged
     intermediate_results = args.intermediate_results
+    use_dask = args.dask
+    if use_dask:
+        from nsys_events_dask import *
+    else:
+        from nsys_events import *
+
     traces = find_all_traces(trace_dir)
     _nvtx_events = get_nvtx_events(traces)
-    nvtx_events = _nvtx_events
 
-    comm_info, comm_ring_info, comm_tree_info, nvtx_events = get_communicator_info(nvtx_events)
+    comm_info, comm_ring_info, comm_tree_info, nvtx_events = get_communicator_info(_nvtx_events)
     communicator_ids_numeric = [[i, comm_id] for i, comm_id in enumerate(comm_info["commId"].unique())]
     communicator_ids_numeric_df = pd.DataFrame(communicator_ids_numeric, columns=["comm_num_id", "commId"])
 
@@ -132,7 +137,11 @@ if __name__ == "__main__":
     )
 
     if intermediate_results:
-        comm_data.to_csv(output_dir / "comm_data_after.csv", index=False)
+        curr_dir = output_dir / "comm_data_after"
+        curr_dir.mkdir(parents=True, exist_ok=True)
+        for k, v in comm_data.items():
+            v.to_csv(curr_dir / f"{k[0]}_{k[1]}.csv", index=False)
+
     comm_data = filter_time(profiling_interval, comm_data)
     comm_data = add_context_parallelism(comm_data)
 
