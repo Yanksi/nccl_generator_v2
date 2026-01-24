@@ -86,23 +86,53 @@ proto_mapping = {
 context_labels = {"Other": 0, "PP": 1, "DP": 2}
 
 
+def parse_buffer_size(size_str: str) -> int:
+    """
+    Parse a buffer size string into bytes.
+    Supports formats like: '1MB', '512KB', '8192', '1M', '512K'
+    """
+    if size_str is None:
+        return None
+    
+    size_str = size_str.strip().upper()
+    
+    # Check for unit suffixes
+    if size_str.endswith('MB'):
+        return int(float(size_str[:-2]) * 1024 * 1024)
+    elif size_str.endswith('KB'):
+        return int(float(size_str[:-2]) * 1024)
+    elif size_str.endswith('GB'):
+        return int(float(size_str[:-2]) * 1024 * 1024 * 1024)
+    elif size_str.endswith('M'):
+        return int(float(size_str[:-1]) * 1024 * 1024)
+    elif size_str.endswith('K'):
+        return int(float(size_str[:-1]) * 1024)
+    elif size_str.endswith('B'):
+        return int(size_str[:-1])
+    else:
+        # Assume plain number in bytes
+        return int(size_str)
+
+
 # Global variables for worker processes (set via Pool initializer for copy-on-write efficiency)
 _WORKER_GPU_DATA = None
 _WORKER_GPU_ID2GOAL_RANK = None
 _WORKER_OUTPUT_DIR = None
 _WORKER_MERGED_STREAMS = None
+_WORKER_WRITE_BUFFER_SIZE = None
 
 
-def _init_worker(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams):
+def _init_worker(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams, write_buffer_size):
     """
     Initialize worker process with shared data.
     This is called once per worker at fork time, enabling copy-on-write memory sharing.
     """
-    global _WORKER_GPU_DATA, _WORKER_GPU_ID2GOAL_RANK, _WORKER_OUTPUT_DIR, _WORKER_MERGED_STREAMS
+    global _WORKER_GPU_DATA, _WORKER_GPU_ID2GOAL_RANK, _WORKER_OUTPUT_DIR, _WORKER_MERGED_STREAMS, _WORKER_WRITE_BUFFER_SIZE
     _WORKER_GPU_DATA = gpu_data_dict
     _WORKER_GPU_ID2GOAL_RANK = gpu_id2goal_rank
     _WORKER_OUTPUT_DIR = output_dir
     _WORKER_MERGED_STREAMS = merged_streams
+    _WORKER_WRITE_BUFFER_SIZE = write_buffer_size
 
 
 def init_and_generate_goal_for_gpu(args_tuple):
@@ -144,9 +174,11 @@ def init_and_generate_goal_for_gpu(args_tuple):
     with counter_lock:
         init_counter.value += 1
     
-    # Generate and write goal file
+    # Generate and write goal file with optional buffering for network storage performance
     output_file = output_dir / f"rank_{rank}.goal"
-    with open(output_file, "w") as f:
+    # buffering: -1 = system default, 0 = unbuffered, >0 = buffer size in bytes
+    buffering = _WORKER_WRITE_BUFFER_SIZE if _WORKER_WRITE_BUFFER_SIZE and _WORKER_WRITE_BUFFER_SIZE > 0 else -1
+    with open(output_file, "w", buffering=buffering) as f:
         f.write(f"rank {rank} {{\n")
         for line in gpu.generate_goal_lines(gpu_id2goal_rank, nic=nic):
             f.write(f"{line}\n")
@@ -165,15 +197,16 @@ def write_goal_for_gpu(args_tuple):
     Writes goal for a single GPU to a separate file.
     
     Args:
-        args_tuple: (gpu, rank, gpu_id2goal_rank, output_dir, merged_streams, nic)
+        args_tuple: (gpu, rank, gpu_id2goal_rank, output_dir, merged_streams, nic, write_buffer_size)
     """
-    gpu, rank, gpu_id2goal_rank, output_dir, merged_streams, nic = args_tuple
+    gpu, rank, gpu_id2goal_rank, output_dir, merged_streams, nic, write_buffer_size = args_tuple
     
     if merged_streams:
         gpu.merge_streams()
     
     output_file = output_dir / f"rank_{rank}.goal"
-    with open(output_file, "w") as f:
+    buffering = write_buffer_size if write_buffer_size and write_buffer_size > 0 else -1
+    with open(output_file, "w", buffering=buffering) as f:
         f.write(f"rank {rank} {{\n")
         for line in gpu.generate_goal_lines(gpu_id2goal_rank, nic=nic):
             f.write(f"{line}\n")
@@ -182,7 +215,8 @@ def write_goal_for_gpu(args_tuple):
     return rank
 
 
-def concatenate_goal_files(output_dir: pathlib.Path, num_ranks: int, delete_parts: bool = True):
+def concatenate_goal_files(output_dir: pathlib.Path, num_ranks: int, delete_parts: bool = True, 
+                           write_buffer_size: int = None):
     """
     Concatenate individual rank goal files into a single output.goal file.
     
@@ -190,9 +224,11 @@ def concatenate_goal_files(output_dir: pathlib.Path, num_ranks: int, delete_part
         output_dir: Directory containing the rank_*.goal files
         num_ranks: Total number of ranks
         delete_parts: Whether to delete individual rank files after concatenation
+        write_buffer_size: Buffer size for file writes (None = system default)
     """
     output_file = output_dir / "output.goal"
-    with open(output_file, "w") as out_f:
+    buffering = write_buffer_size if write_buffer_size and write_buffer_size > 0 else -1
+    with open(output_file, "w", buffering=buffering) as out_f:
         out_f.write(f"num_ranks {num_ranks}\n")
         for rank in range(num_ranks):
             rank_file = output_dir / f"rank_{rank}.goal"
@@ -216,6 +252,9 @@ if __name__ == "__main__":
     parser.add_argument("--parallel_generation", action='store_true', help="Whether to generate goal files in parallel")
     parser.add_argument("--concatenate", action='store_true', help="Whether to concatenate all traces into one")
     parser.add_argument("--delete_parts", action='store_true', help="Whether to delete part files after concatenation")
+    parser.add_argument("--write_buffer_size", type=str, default=None, 
+                        help="Write buffer size for goal file output (e.g., '1MB', '512KB', '8192'). "
+                             "Larger buffers reduce I/O operations, useful for network storage.")
     args = parser.parse_args()
     trace_dir = pathlib.Path(args.trace_dir).resolve()
     output_dir = pathlib.Path(args.output_dir).resolve()
@@ -225,6 +264,9 @@ if __name__ == "__main__":
     parallel_generation = args.parallel_generation
     concatenate = args.concatenate
     delete_parts = args.delete_parts
+    write_buffer_size = parse_buffer_size(args.write_buffer_size)
+    if write_buffer_size:
+        logger.info(f"Using write buffer size: {write_buffer_size} bytes ({write_buffer_size / 1024:.1f} KB)")
 
     use_dask = args.dask
     if use_dask:
@@ -372,7 +414,7 @@ if __name__ == "__main__":
         with multiprocessing.Pool(
             processes=num_workers,
             initializer=_init_worker,
-            initargs=(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams)
+            initargs=(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams, write_buffer_size)
         ) as pool:
             # Start async map - only small args are pickled now!
             async_result = pool.map_async(init_and_generate_goal_for_gpu, task_list)
@@ -414,7 +456,8 @@ if __name__ == "__main__":
         
         if concatenate:
             logger.info("concatenating goal files")
-            goal_path = concatenate_goal_files(output_dir, len(gpu_devices), delete_parts=delete_parts)
+            goal_path = concatenate_goal_files(output_dir, len(gpu_devices), delete_parts=delete_parts,
+                                               write_buffer_size=write_buffer_size)
         else:
             goal_path = output_dir
             logger.info(f"Goal files written to: {output_dir}/rank_*.goal")
@@ -446,7 +489,8 @@ if __name__ == "__main__":
 
         # Sequential write: single output file
         goal_path = output_dir / "output.goal"
-        with open(goal_path, "w") as f:
+        buffering = write_buffer_size if write_buffer_size and write_buffer_size > 0 else -1
+        with open(goal_path, "w", buffering=buffering) as f:
             logger.info("writing goal file")
             gpus = gpu_devices.values()
             f.write(f"num_ranks {len(gpus)}\n")
