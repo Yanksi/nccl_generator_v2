@@ -635,31 +635,33 @@ def _process_one_gpu_kernels(gpu, kernels, nvtxs):
     return gpu, kernel_times[["eventId", "start", "end"]]
 
 
-def _read_and_associate_kernel_events(
-    trace_file: os.PathLike,
-    comm_data_for_node: Dict[Tuple[str, int], pd.DataFrame],
-) -> Dict[Tuple[str, int], pd.DataFrame]:
+# Global variables for Pool initializer pattern in associate_kernel_to_nvtx
+_KERNEL_ASSOC_COMM_DATA: Dict[Tuple[str, int], pd.DataFrame] = None
+
+
+def _init_kernel_assoc_worker(comm_grouped):
+    """Initialize worker with comm_grouped data via copy-on-write."""
+    global _KERNEL_ASSOC_COMM_DATA
+    _KERNEL_ASSOC_COMM_DATA = comm_grouped
+
+
+def _process_trace_file(trace_file: os.PathLike) -> Dict[Tuple[str, int], pd.DataFrame]:
     """
-    Read kernel events from ONE sqlite file and immediately associate with NVTX events.
+    Read kernel events from ONE sqlite file and associate with NVTX events.
     
-    This function is designed to be called in parallel via dask.delayed - one task per trace file.
-    Each trace file contains data for all GPUs within a single node.
-    
-    Returns a lightweight result: Dict of (nodeId, pid) -> DataFrame with (eventId, start, end).
-    This minimal data is merged into comm_grouped in the main process.
-    
-    Args:
-        trace_file: Path to the sqlite trace file
-        comm_data_for_node: Dict of (nodeId, pid) -> NVTX DataFrame for GPUs in this node
-    
-    Returns:
-        Dict of (nodeId, pid) -> DataFrame with columns (eventId, start, end)
+    Accesses comm_grouped via global _KERNEL_ASSOC_COMM_DATA (copy-on-write after fork).
+    Returns lightweight Dict of (nodeId, pid) -> DataFrame with (eventId, start, end).
     """
+    global _KERNEL_ASSOC_COMM_DATA
+    
     # Read kernel events from this trace file
     kernel_df = read_kernel_event_file(trace_file)
     
     if len(kernel_df) == 0:
         return {}
+    
+    # Extract node ID from trace filename
+    node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
     
     results = {}
     
@@ -668,7 +670,7 @@ def _read_and_associate_kernel_events(
         gpu_key = (str(nodeId), int(pid))
         
         # Skip if no NVTX events for this GPU
-        if gpu_key not in comm_data_for_node:
+        if gpu_key not in _KERNEL_ASSOC_COMM_DATA:
             continue
         
         if len(gpu_kernels) == 0:
@@ -677,7 +679,7 @@ def _read_and_associate_kernel_events(
         # Associate kernels with NVTX events - returns only (eventId, start, end)
         try:
             _, kernel_times = _process_one_gpu_kernels(
-                gpu_key, gpu_kernels, comm_data_for_node[gpu_key]
+                gpu_key, gpu_kernels, _KERNEL_ASSOC_COMM_DATA[gpu_key]
             )
             results[gpu_key] = kernel_times
         except Exception as e:
@@ -693,11 +695,11 @@ def associate_kernel_to_nvtx(
     profiling_interval: Dict = None,  # Kept for API compatibility, but not used here
 ):
     """
-    Associate kernel events to NVTX events using Dask parallelization.
+    Associate kernel events to NVTX events using multiprocessing Pool.
     
-    Each task reads kernel events from ONE sqlite file (one node) and returns
-    a lightweight mapping of eventId -> (start, end) for each GPU.
-    The main process then merges these times into comm_grouped.
+    Uses Pool initializer pattern to share comm_grouped via copy-on-write after fork.
+    Each worker reads kernel events from ONE sqlite file and returns lightweight
+    (eventId, start, end) mappings. Main process merges these into comm_grouped.
     
     Args:
         comm_grouped: Dict of (nodeId, pid) -> NVTX DataFrame
@@ -707,40 +709,35 @@ def associate_kernel_to_nvtx(
     Returns:
         Updated comm_grouped with kernel start/end times
     """
+    import multiprocessing as mp
+    
     logger.info(f"associating kernel events to nvtx events from {len(traces)} traces (parallelized)")
     
-    # Group comm_grouped by node for efficient lookup
-    # nodeId is the first element of the tuple key
-    node_to_comm_data: Dict[str, Dict[Tuple[str, int], pd.DataFrame]] = defaultdict(dict)
-    for gpu_key, df in comm_grouped.items():
-        node_id = gpu_key[0]
-        node_to_comm_data[node_id][gpu_key] = df
-    
-    # Create delayed tasks - one per trace file
-    tasks = []
+    # Filter traces to only those with matching nodes
+    node_ids = {gpu_key[0] for gpu_key in comm_grouped.keys()}
+    filtered_traces = []
     for trace_file in traces:
-        # Extract node ID from trace filename (e.g., "nid12345" -> "12345")
         node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
-        
-        # Get comm data for this node
-        comm_data_for_node = node_to_comm_data.get(node_id, {})
-        
-        # Skip if no NVTX events for this node
-        if not comm_data_for_node:
-            continue
-        
-        tasks.append(delayed(_read_and_associate_kernel_events)(
-            trace_file, comm_data_for_node
-        ))
+        if node_id in node_ids:
+            filtered_traces.append(trace_file)
     
-    if not tasks:
-        logger.warning("No tasks to process - no matching nodes found")
+    if not filtered_traces:
+        logger.warning("No traces to process - no matching nodes found")
         return comm_grouped
     
-    # Compute in parallel
-    logger.info(f"running {len(tasks)} kernel association tasks in parallel")
-    with TqdmCallback(desc="kernel association", tqdm_class=_tqdm_for_dask):
-        results = dask.compute(*tasks, scheduler="processes")
+    logger.info(f"running {len(filtered_traces)} kernel association tasks in parallel")
+    
+    # Use Pool with initializer for copy-on-write sharing
+    with mp.Pool(
+        processes=min(len(filtered_traces), mp.cpu_count()),
+        initializer=_init_kernel_assoc_worker,
+        initargs=(comm_grouped,)
+    ) as pool:
+        results = list(tqdm(
+            pool.imap_unordered(_process_trace_file, filtered_traces),
+            total=len(filtered_traces),
+            desc="kernel association"
+        ))
     
     # Merge kernel times into comm_grouped
     # Each result is Dict[gpu_key, DataFrame with (eventId, start, end)]
