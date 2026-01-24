@@ -86,36 +86,54 @@ proto_mapping = {
 context_labels = {"Other": 0, "PP": 1, "DP": 2}
 
 
+# Global variables for worker processes (set via Pool initializer for copy-on-write efficiency)
+_WORKER_GPU_DATA = None
+_WORKER_GPU_ID2GOAL_RANK = None
+_WORKER_OUTPUT_DIR = None
+_WORKER_MERGED_STREAMS = None
+
+
+def _init_worker(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams):
+    """
+    Initialize worker process with shared data.
+    This is called once per worker at fork time, enabling copy-on-write memory sharing.
+    """
+    global _WORKER_GPU_DATA, _WORKER_GPU_ID2GOAL_RANK, _WORKER_OUTPUT_DIR, _WORKER_MERGED_STREAMS
+    _WORKER_GPU_DATA = gpu_data_dict
+    _WORKER_GPU_ID2GOAL_RANK = gpu_id2goal_rank
+    _WORKER_OUTPUT_DIR = output_dir
+    _WORKER_MERGED_STREAMS = merged_streams
+
+
 def init_and_generate_goal_for_gpu(args_tuple):
     """
     Worker function for parallel GPU initialization and goal generation.
-    Runs in a separate process to avoid GIL.
+    Uses global data set via initializer (copy-on-write friendly).
+    Only receives small arguments via pickle.
     
     Args:
-        args_tuple: (gpu_id, rank, gpu_init_data, gpu_id2goal_rank, output_dir, merged_streams, nic, init_counter, gen_counter, counter_lock)
-    
-    gpu_init_data contains:
-        - coll_info_gpu: DataFrame
-        - coll_kernel_gpu: DataFrame  
-        - p2p_kernel_gpu: DataFrame
-        - comm_data_gpu: DataFrame
-        - node_id: str
-        - pid: int
+        args_tuple: (gpu_id, rank, nic, init_counter, gen_counter, counter_lock)
     
     init_counter, gen_counter: multiprocessing.Value counters for progress tracking
     counter_lock: multiprocessing.Lock to protect counter updates
     """
-    gpu_id, rank, gpu_init_data, gpu_id2goal_rank, output_dir, merged_streams, nic, init_counter, gen_counter, counter_lock = args_tuple
+    gpu_id, rank, nic, init_counter, gen_counter, counter_lock = args_tuple
+    
+    # Access data from globals (copy-on-write, no pickle overhead)
+    gpu_data = _WORKER_GPU_DATA[gpu_id]
+    gpu_id2goal_rank = _WORKER_GPU_ID2GOAL_RANK
+    output_dir = _WORKER_OUTPUT_DIR
+    merged_streams = _WORKER_MERGED_STREAMS
     
     # Reconstruct GPUDevice in this process
-    gpu = GPUDevice(rank=rank, node_id=gpu_init_data["node_id"], pid=gpu_init_data["pid"])
+    gpu = GPUDevice(rank=rank, node_id=gpu_data["node_id"], pid=gpu_data["pid"])
     
     # Initialize GPU from dataframes
     gpu.init_from_dfs(
-        gpu_init_data["coll_info"],
-        gpu_init_data["coll_kernels"],
-        gpu_init_data["p2p_kernels"],
-        gpu_init_data["comm_data"]
+        gpu_data["coll_info"],
+        gpu_data["coll_kernels"],
+        gpu_data["p2p_kernels"],
+        gpu_data["comm_data"]
     )
     
     # Merge streams if requested
@@ -334,12 +352,14 @@ if __name__ == "__main__":
         gen_counter = manager.Value('i', 0)
         counter_lock = manager.Lock()
         
-        # Prepare all GPU data in main process (this is fast, mostly DataFrame operations)
-        gpu_data_list = []
+        # Prepare all GPU data in main process - stored in dict for initializer
+        gpu_data_dict = {}
+        task_list = []
         for gpu_id, gpu in tqdm(gpu_devices.items(), desc="Preparing GPU data"):
-            gpu_data = prepare_gpu_data(gpu_id, gpu)
+            gpu_data_dict[gpu_id] = prepare_gpu_data(gpu_id, gpu)
             rank = gpu_id2goal_rank[gpu.gpu_id]
-            gpu_data_list.append((gpu_id, rank, gpu_data, gpu_id2goal_rank, output_dir, merged_streams, 0, init_counter, gen_counter, counter_lock))
+            # Only pass small args per task - large data accessed via globals
+            task_list.append((gpu_id, rank, 0, init_counter, gen_counter, counter_lock))
         
         time_finish_prep = time.time()
         logger.info(f"Data preparation time: {time_finish_prep - script_start_time:.2f} seconds")
@@ -347,11 +367,16 @@ if __name__ == "__main__":
         # Now run init + goal generation in parallel processes
         num_workers = min(os.cpu_count() or 1, len(gpu_devices))
         logger.info(f"initializing GPUs and generating goal files in parallel with {num_workers} workers")
-        total_gpus = len(gpu_data_list)
+        total_gpus = len(task_list)
         
-        with multiprocessing.Pool(processes=num_workers) as pool:
-            # Start async map
-            async_result = pool.map_async(init_and_generate_goal_for_gpu, gpu_data_list)
+        # Use initializer to set up shared data once per worker (copy-on-write friendly)
+        with multiprocessing.Pool(
+            processes=num_workers,
+            initializer=_init_worker,
+            initargs=(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams)
+        ) as pool:
+            # Start async map - only small args are pickled now!
+            async_result = pool.map_async(init_and_generate_goal_for_gpu, task_list)
             
             # Create dual progress bars
             # Init bar uses lighter/dimmer style, Gen bar uses solid style

@@ -44,7 +44,7 @@ class GPUStream:
                 slice_steps=int(coll_info_row["sliceSteps"]),
                 step_size=int(coll_info_row["stepSize"]),
             )
-            coll_chnl_infos = self.self_gpu.dfs["coll_kernels"][event_id].apply(
+            coll_chnl_infos = self.self_gpu.dfs["coll_kernels"].get_group(event_id).apply(
                 lambda row: CollChnlInfo(
                     count=int(row["count"]),
                     chunk_count=int(row["chunkCount"]),
@@ -60,7 +60,7 @@ class GPUStream:
             
         elif issubclass(coll_class, P2POp):
             from nccl_comm import P2PChnlInfo
-            p2p_chnl_infos = self.self_gpu.dfs["p2p_kernels"][event_id].apply(
+            p2p_chnl_infos = self.self_gpu.dfs["p2p_kernels"].get_group(event_id).apply(
                 lambda row: P2PChnlInfo(
                     Bytes=int(row["Bytes"]),
                     proto=row["proto"],
@@ -161,8 +161,8 @@ class GPUDevice:
     def init_from_dfs(self, coll_info, coll_kernels, p2p_kernels, comm_data):
         self.dfs = {
             "coll_info": coll_info.set_index("association"),
-            "coll_kernels": {k:v.sort_values("workOffset") for k,v in coll_kernels.groupby("association")},
-            "p2p_kernels": {k:v for k,v in p2p_kernels.groupby("association")},
+            "coll_kernels": coll_kernels.groupby("association"),
+            "p2p_kernels": p2p_kernels.groupby("association"),
             "comm_data": comm_data.set_index("eventId")
         }
         # Use itertuples() instead of iterrows() for ~10-100x speedup
