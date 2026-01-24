@@ -270,10 +270,9 @@ if __name__ == "__main__":
     
     del nvtx_events
     
-    kernel_events = get_kernel_events(traces)
-    comm_data = associate_kernel_to_nvtx(comm_data, kernel_events)
-    
-    del kernel_events
+    # Pass traces directly - kernel events are read and processed in parallel tasks
+    # Note: filter_time is called after association (not during)
+    comm_data = associate_kernel_to_nvtx(comm_data, traces)
 
     comm_data = filter_time(profiling_interval, comm_data)
     comm_data = add_context_parallelism(comm_data)

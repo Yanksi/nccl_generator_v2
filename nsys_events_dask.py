@@ -494,7 +494,10 @@ def get_event_info(data: Dict[str, pd.DataFrame], comm_info: pd.DataFrame = None
 def _process_one_gpu_kernels(gpu, kernels, nvtxs):
     """
     Process kernel events for a single GPU - matches kernels to NVTX events.
-    Extracted as a module-level function for reuse and potential parallelization.
+    
+    Returns:
+        gpu: The GPU key
+        kernel_times: DataFrame with (eventId, start, end) - the kernel times to merge into NVTX
     """
     collective_labels = {
         "AllGather": "A",
@@ -601,104 +604,163 @@ def _process_one_gpu_kernels(gpu, kernels, nvtxs):
         .rename(columns={"eventId": "association"})
     )
 
-    nvtxs = (
-        nvtxs.drop(columns=["label", "inStreamEventId", "start", "end"])
-        .merge(
-            kernels[["start", "end", "association"]],
-            left_on=["eventId"],
-            right_on=["association"],
+    # Build the kernel times mapping: eventId -> (start, end)
+    # For grouped events, the first event in group gets the kernel time,
+    # dropped events get the end time of the first event as both start and end
+    
+    # Get kernel times for first events (non-grouped + first in each group)
+    kernel_times = kernels[["start", "end", "association"]].rename(
+        columns={"association": "eventId"}
+    ).dropna(subset=["eventId"])
+    kernel_times["eventId"] = kernel_times["eventId"].astype("Int64")
+    
+    # For dropped events in groups, they get the end time of the first event in their group
+    # We need to get the groupId -> end time mapping
+    if len(dropped_nvtxs) > 0:
+        # Get the end time for each group from kernel_times
+        first_event_times = nvtxs[nvtxs["groupId"] != -1][["eventId", "groupId"]].merge(
+            kernel_times[["eventId", "end"]], on="eventId", how="left"
         )
-        .drop(columns=["association"])
-    )
+        group_end_times = first_event_times.groupby("groupId")["end"].first().reset_index()
+        
+        # For dropped events, start = end = group's end time
+        dropped_times = dropped_nvtxs[["eventId", "groupId"]].merge(
+            group_end_times, on="groupId", how="left"
+        )
+        dropped_times["start"] = dropped_times["end"]
+        dropped_times = dropped_times[["eventId", "start", "end"]]
+        
+        kernel_times = pd.concat([kernel_times, dropped_times], ignore_index=True)
+    
+    return gpu, kernel_times[["eventId", "start", "end"]]
 
-    dropped_nvtxs = dropped_nvtxs.drop(columns=["start", "end"]).merge(
-        nvtxs[["end", "groupId"]], on=["groupId"], how="left"
-    )
 
-    dropped_nvtxs["start"] = dropped_nvtxs[
-        "end"
-    ]  # assign the end time of the previous nvtx as the start time of the dropped nvtx
-    nvtxs = (
-        pd.concat([nvtxs, dropped_nvtxs], ignore_index=True)
-        .sort_values(by=["start"])
-        .reset_index(drop=True)
-    )
-    return gpu, kernels, nvtxs
+def _read_and_associate_kernel_events(
+    trace_file: os.PathLike,
+    comm_data_for_node: Dict[Tuple[str, int], pd.DataFrame],
+) -> Dict[Tuple[str, int], pd.DataFrame]:
+    """
+    Read kernel events from ONE sqlite file and immediately associate with NVTX events.
+    
+    This function is designed to be called in parallel via dask.delayed - one task per trace file.
+    Each trace file contains data for all GPUs within a single node.
+    
+    Returns a lightweight result: Dict of (nodeId, pid) -> DataFrame with (eventId, start, end).
+    This minimal data is merged into comm_grouped in the main process.
+    
+    Args:
+        trace_file: Path to the sqlite trace file
+        comm_data_for_node: Dict of (nodeId, pid) -> NVTX DataFrame for GPUs in this node
+    
+    Returns:
+        Dict of (nodeId, pid) -> DataFrame with columns (eventId, start, end)
+    """
+    # Read kernel events from this trace file
+    kernel_df = read_kernel_event_file(trace_file)
+    
+    if len(kernel_df) == 0:
+        return {}
+    
+    results = {}
+    
+    # Process each GPU in this node
+    for (nodeId, pid), gpu_kernels in kernel_df.groupby(["nodeId", "pid"]):
+        gpu_key = (str(nodeId), int(pid))
+        
+        # Skip if no NVTX events for this GPU
+        if gpu_key not in comm_data_for_node:
+            continue
+        
+        if len(gpu_kernels) == 0:
+            continue
+        
+        # Associate kernels with NVTX events - returns only (eventId, start, end)
+        try:
+            _, kernel_times = _process_one_gpu_kernels(
+                gpu_key, gpu_kernels, comm_data_for_node[gpu_key]
+            )
+            results[gpu_key] = kernel_times
+        except Exception as e:
+            logger.error(f"Failed to process GPU {gpu_key} in {trace_file}: {e}")
+            raise
+    
+    return results
 
 
 def associate_kernel_to_nvtx(
     comm_grouped: Dict[Tuple[str, int], pd.DataFrame],
-    kernel_events: dd.DataFrame,
-    profiling_interval: Dict = None,
+    traces: List[os.PathLike],
+    profiling_interval: Dict = None,  # Kept for API compatibility, but not used here
 ):
     """
-    Associate kernel events to NVTX events.
+    Associate kernel events to NVTX events using Dask parallelization.
     
-    Processes kernel events in a memory-efficient streaming manner
-    by reading partition by partition instead of materializing all data at once.
+    Each task reads kernel events from ONE sqlite file (one node) and returns
+    a lightweight mapping of eventId -> (start, end) for each GPU.
+    The main process then merges these times into comm_grouped.
+    
+    Args:
+        comm_grouped: Dict of (nodeId, pid) -> NVTX DataFrame
+        traces: List of paths to sqlite trace files
+        profiling_interval: Unused - kept for API compatibility
+    
+    Returns:
+        Updated comm_grouped with kernel start/end times
     """
-    import gc
+    logger.info(f"associating kernel events to nvtx events from {len(traces)} traces (parallelized)")
     
-    # Memory-efficient streaming approach: process partitions one at a time
-    logger.info("computing kernel events (streaming by partition)")
+    # Group comm_grouped by node for efficient lookup
+    # nodeId is the first element of the tuple key
+    node_to_comm_data: Dict[str, Dict[Tuple[str, int], pd.DataFrame]] = defaultdict(dict)
+    for gpu_key, df in comm_grouped.items():
+        node_id = gpu_key[0]
+        node_to_comm_data[node_id][gpu_key] = df
     
-    n_partitions = kernel_events.npartitions
-    
-    # Accumulator for kernel events per GPU
-    kernel_events_by_gpu = defaultdict(list)
-    
-    # Process partitions in small batches to limit memory
-    batch_size = min(4, n_partitions)  # Process 4 partitions at a time
-    
-    for i in tqdm(range(0, n_partitions, batch_size), desc="kernel event partitions"):
-        # Get partitions for this batch
-        partitions = []
-        for j in range(i, min(i + batch_size, n_partitions)):
-            partitions.append(kernel_events.get_partition(j))
+    # Create delayed tasks - one per trace file
+    tasks = []
+    for trace_file in traces:
+        # Extract node ID from trace filename (e.g., "nid12345" -> "12345")
+        node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
         
-        # Compute this batch (using threads to avoid serialization overhead)
-        results = dask.compute(*partitions, scheduler="threads")
+        # Get comm data for this node
+        comm_data_for_node = node_to_comm_data.get(node_id, {})
         
-        # Group by GPU and accumulate
-        for df in results:
-            if len(df) == 0:
-                continue
-            for (nodeId, pid), gpu_df in df.groupby(["nodeId", "pid"]):
-                # Normalize key types
-                gpu_key = (str(nodeId), int(pid))
-                kernel_events_by_gpu[gpu_key].append(gpu_df)
-        
-        # Free memory from this batch
-        del results
-        gc.collect()
-    
-    # Concatenate per-GPU and convert to dict format
-    logger.info("concatenating kernel events per GPU")
-    kernel_df_grouped = {}
-    for gpu_key, dfs in kernel_events_by_gpu.items():
-        if dfs:
-            kernel_df_grouped[gpu_key] = pd.concat(dfs, ignore_index=True)
-    
-    # Free the accumulator
-    del kernel_events_by_gpu
-    gc.collect()
-    
-    # Apply profiling interval filter if provided
-    if profiling_interval is not None:
-        logger.info("filtering kernel events by profiling intervals")
-        kernel_df_grouped = filter_time(profiling_interval, kernel_df_grouped)
-    
-    # Process each GPU
-    logger.info("associating kernels to nvtx events")
-    for gpu in tqdm(comm_grouped.keys()):
-        if gpu not in kernel_df_grouped:
+        # Skip if no NVTX events for this node
+        if not comm_data_for_node:
             continue
         
-        gpu, kernels, nvtxs = _process_one_gpu_kernels(
-            gpu, kernel_df_grouped[gpu], comm_grouped[gpu]
-        )
-        kernel_df_grouped[gpu] = kernels
-        comm_grouped[gpu] = nvtxs
+        tasks.append(delayed(_read_and_associate_kernel_events)(
+            trace_file, comm_data_for_node
+        ))
+    
+    if not tasks:
+        logger.warning("No tasks to process - no matching nodes found")
+        return comm_grouped
+    
+    # Compute in parallel
+    logger.info(f"running {len(tasks)} kernel association tasks in parallel")
+    with TqdmCallback(desc="kernel association", tqdm_class=_tqdm_for_dask):
+        results = dask.compute(*tasks, scheduler="processes")
+    
+    # Merge kernel times into comm_grouped
+    # Each result is Dict[gpu_key, DataFrame with (eventId, start, end)]
+    processed_gpus = set()
+    for result in results:
+        for gpu_key, kernel_times in result.items():
+            # Get original NVTX data and merge with kernel times
+            nvtx_df = comm_grouped[gpu_key]
+            
+            # Drop old start/end columns and merge new ones from kernel times
+            nvtx_df = nvtx_df.drop(columns=["start", "end"], errors="ignore")
+            nvtx_df = nvtx_df.merge(kernel_times, on="eventId", how="left")
+            
+            comm_grouped[gpu_key] = nvtx_df
+            processed_gpus.add(gpu_key)
+    
+    # Log any GPUs that weren't processed (no kernel events found)
+    unprocessed = set(comm_grouped.keys()) - processed_gpus
+    if unprocessed:
+        logger.warning(f"{len(unprocessed)} GPUs had no kernel events: {list(unprocessed)[:5]}...")
 
     return comm_grouped
     
@@ -804,14 +866,14 @@ def add_context_parallelism(comm_datas: Dict[Tuple[int, int], pd.DataFrame]):
 
 if __name__ == "__main__":
     traces = find_all_traces("traces/Llama70B_N64_GPU256_TP1_PP8_DP32_70B_BS32/sqlite")
-    kernel_events = get_kernel_events(traces)
     nvtx_events = get_nvtx_events(traces)
-    comm_info, comm_ring_info, comm_tree_info = get_communicator_info(nvtx_events)
-    profiling_interval = get_profiling_interval(nvtx_events)
-    comm_data, coll_info, coll_kernels, p2p_kernels = get_event_info(
-        nvtx_events, profiling_interval
+    comm_info, comm_ring_info, comm_tree_info, nvtx_events = get_communicator_info(nvtx_events)
+    profiling_interval, nvtx_events = get_profiling_interval(nvtx_events)
+    comm_data, coll_info, coll_kernels, p2p_kernels, nvtx_events = get_event_info(
+        nvtx_events, comm_info
     )
-    kernel_events = associate_kernel_to_nvtx(
-        comm_data, kernel_events, profiling_interval
-    )
+    # Pass traces directly - kernel events are read and processed in parallel tasks
+    # Note: filter_time should be called after association (not during)
+    comm_data = associate_kernel_to_nvtx(comm_data, traces)
+    comm_data = filter_time(profiling_interval, comm_data)
     comm_data = add_context_parallelism(comm_data)
