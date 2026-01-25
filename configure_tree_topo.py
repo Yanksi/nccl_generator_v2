@@ -1,4 +1,5 @@
 #%%
+import numpy as np
 import pandas as pd
 import logging
 from typing import Dict, Tuple
@@ -327,7 +328,7 @@ def update_tree_ingress_egress_df(tree_ingress_egress_df: pd.DataFrame, comm_nod
         node_id_in_comm_switch_group = comm_nodes_groups_1.loc[(comm_id, node_id)]["nodeId_in_comm_switch_group"]
         num_nodes_in_comm_switch_group = comm_nodes_groups_1.loc[(comm_id, node_id)]["num_nodes_in_comm_switch_group"]
         comm_switch_group_id = comm_nodes_groups_1.loc[(comm_id, node_id)]["comm_switch_groupId"]
-        root_node_id_in_comm_switch_group = tree_0_id % num_nodes_in_comm_switch_group
+        root_node_id_in_comm_switch_group = np.int64(tree_0_id % num_nodes_in_comm_switch_group) ## may yield numpy.float64, need to convert to int for later calculations
         node_id_in_comm_switch_group_shifted = commSwitchGroupNodeId_to_shiftedNodeId(node_id_in_comm_switch_group, root_node_id_in_comm_switch_group, num_nodes_in_comm_switch_group)
 
         parent_0_node_id_shifted, child_0_0_node_id_shifted, child_0_1_node_id_shifted, parentChildType0, parent_1_node_id_shifted, child_1_0_node_id_shifted, child_1_1_node_id_shifted, parentChildType1 = getDtree(num_nodes_in_comm_switch_group, node_id_in_comm_switch_group_shifted)
