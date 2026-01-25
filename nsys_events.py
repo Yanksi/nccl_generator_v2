@@ -186,7 +186,16 @@ def get_profiling_interval(_data: pd.DataFrame) -> pd.DataFrame:
     ]
     return {(row["nodeId"], row["pid"]): (row["start"], row["end"]) for _, row in result_df.iterrows()} ,_data
 
+def safe_numba(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            # logger.error(f"Numba JIT compilation failed: {e}. Falling back to pure Python implementation.")
+            return func.py_func(*args, **kwargs)
+    return wrapper
 
+@safe_numba
 @numba.njit
 def _associate_events(interval_starts, interval_ends, interval_id, events_time):
     associated_ids = -1 * np.ones(len(events_time), dtype=np.int64)
@@ -215,7 +224,7 @@ def filter_time(profiling_interval: Dict[Tuple[int, int], Tuple[int, int]], data
         ].reset_index(drop=True)
     return result_dfs
 
-
+@safe_numba
 @numba.njit
 def _associate_start_ends(sequence, internal_groups=True):
     group_id = -1
@@ -443,7 +452,7 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None):
         coll_comm = comm[
             (comm["collective"] != "Send") & (comm["collective"] != "Recv")
         ]
-        if len(coll_comm) > 0:
+        # if len(coll_comm) > 0:
             # # From https://github.com/NVIDIA/nccl/blob/81c7da31f98f4aa4a70317169ba8ca130839b447/src/include/nccl_common.h#L59
             # coll_types = {
             #     "Broadcast": "0",
@@ -456,56 +465,56 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None):
             #     "Gather": "10",
             #     "AllGatherV": "11",
             # }
-            coll_infos = coll_info_grouped[gpu]
-            coll_kernels = coll_kernel_grouped[gpu]
+        coll_infos = coll_info_grouped[gpu]
+        coll_kernels = coll_kernel_grouped[gpu]
 
-            coll_infos = coll_infos.sort_values(by="start").reset_index(drop=True)
-            coll_kernels = coll_kernels.sort_values(by="start").reset_index(drop=True)
+        coll_infos = coll_infos.sort_values(by="start").reset_index(drop=True)
+        coll_kernels = coll_kernels.sort_values(by="start").reset_index(drop=True)
 
-            comm_starts = coll_comm["start"].to_numpy()
-            comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
+        comm_starts = coll_comm["start"].to_numpy()
+        comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
 
-            coll_info_starts = coll_infos["start"].to_numpy()
-            coll_infos["association"] = _associate_events(
-                comm_starts,
-                comm_ends,
-                coll_comm["eventId"].to_numpy(),
-                coll_info_starts,
-            )
+        coll_info_starts = coll_infos["start"].to_numpy()
+        coll_infos["association"] = _associate_events(
+            comm_starts,
+            comm_ends,
+            coll_comm["eventId"].to_numpy(),
+            coll_info_starts,
+        )
 
-            coll_kernel_starts = coll_kernels["start"].to_numpy()
-            coll_kernels["association"] = _associate_events(
-                comm_starts,
-                comm_ends,
-                coll_comm["eventId"].to_numpy(),
-                coll_kernel_starts,
-            )
-            coll_info_grouped[gpu] = coll_infos
-            coll_kernel_grouped[gpu] = coll_kernels
+        coll_kernel_starts = coll_kernels["start"].to_numpy()
+        coll_kernels["association"] = _associate_events(
+            comm_starts,
+            comm_ends,
+            coll_comm["eventId"].to_numpy(),
+            coll_kernel_starts,
+        )
+        coll_info_grouped[gpu] = coll_infos
+        coll_kernel_grouped[gpu] = coll_kernels
 
         p2p_comm = comm[(comm["collective"] == "Send") | (comm["collective"] == "Recv")]
-        if len(p2p_comm) > 0:
-            p2p_kernels = p2p_kernel_grouped[gpu]
-            p2p_types = {
-                "Send": "1",
-                "Recv": "2",
-            }
-            p2p_kernel_lists = []
-            for p2p_type, type_id in p2p_types.items():
-                curr_p2p_comm = p2p_comm[p2p_comm["collective"] == p2p_type].sort_values(by="start").reset_index(drop=True)
-                curr_p2p_kernels = p2p_kernels[p2p_kernels["p2pType"] == type_id].sort_values(by="start").reset_index(drop=True).copy()
-                comm_starts = curr_p2p_comm["start"].to_numpy()
-                comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
-                p2p_kernel_starts = curr_p2p_kernels["start"].to_numpy()
-                curr_p2p_kernels["association"] = _associate_events(
-                    comm_starts,
-                    comm_ends,
-                    curr_p2p_comm["eventId"].to_numpy(),
-                    p2p_kernel_starts,
-                )
-                p2p_kernel_lists.append(curr_p2p_kernels)
-            p2p_kernels = pd.concat(p2p_kernel_lists, ignore_index=True)
-            p2p_kernel_grouped[gpu] = p2p_kernels
+        # if len(p2p_comm) > 0:
+        p2p_kernels = p2p_kernel_grouped[gpu]
+        p2p_types = {
+            "Send": "1",
+            "Recv": "2",
+        }
+        p2p_kernel_lists = []
+        for p2p_type, type_id in p2p_types.items():
+            curr_p2p_comm = p2p_comm[p2p_comm["collective"] == p2p_type].sort_values(by="start").reset_index(drop=True)
+            curr_p2p_kernels = p2p_kernels[p2p_kernels["p2pType"] == type_id].sort_values(by="start").reset_index(drop=True).copy()
+            comm_starts = curr_p2p_comm["start"].to_numpy()
+            comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
+            p2p_kernel_starts = curr_p2p_kernels["start"].to_numpy()
+            curr_p2p_kernels["association"] = _associate_events(
+                comm_starts,
+                comm_ends,
+                curr_p2p_comm["eventId"].to_numpy(),
+                p2p_kernel_starts,
+            )
+            p2p_kernel_lists.append(curr_p2p_kernels)
+        p2p_kernels = pd.concat(p2p_kernel_lists, ignore_index=True)
+        p2p_kernel_grouped[gpu] = p2p_kernels
     
     comm_grouped = {k: v.drop(columns=["commHash", "nodeId", "pid"]) for k, v in comm_grouped.items()}
     coll_info_grouped = {k: v.drop(columns=["eventId", "start", "end", "commHash", "stream", "nodeId", "pid"]) for k, v in coll_info_grouped.items()}
