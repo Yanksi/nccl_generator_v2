@@ -411,16 +411,22 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None):
     )
 
     logger.info("grouping events by GPU")
-    comm_grouped = {name: group for name, group in comm_data.groupby(["nodeId", "pid"])}
-    coll_info_grouped = {
-        name: group for name, group in coll_info_data.groupby(["nodeId", "pid"])
-    }
-    coll_kernel_grouped = {
-        name: group for name, group in coll_kernel_data.groupby(["nodeId", "pid"])
-    }
-    p2p_kernel_grouped = {
-        name: group for name, group in p2p_kernel_data.groupby(["nodeId", "pid"])
-    }
+    comm_grouped = defaultdict(
+        lambda: pd.DataFrame(columns=comm_data.columns),
+        {name: group for name, group in comm_data.groupby(["nodeId", "pid"])}
+    )
+    coll_info_grouped = defaultdict(
+        lambda: pd.DataFrame(columns=list(coll_info_data.columns) + ["association"]),
+        {name: group for name, group in coll_info_data.groupby(["nodeId", "pid"])}
+    )
+    coll_kernel_grouped = defaultdict(
+        lambda: pd.DataFrame(columns=list(coll_kernel_data.columns) + ["association"]),
+        {name: group for name, group in coll_kernel_data.groupby(["nodeId", "pid"])}
+    )
+    p2p_kernel_grouped = defaultdict(
+        lambda: pd.DataFrame(columns=list(p2p_kernel_data.columns) + ["association"]),
+        {name: group for name, group in p2p_kernel_data.groupby(["nodeId", "pid"])}
+    )
 
     logger.info("associating events")
     for gpu in tqdm(comm_grouped.keys()):
@@ -478,8 +484,8 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None):
             coll_kernel_grouped[gpu] = coll_kernels
 
         p2p_comm = comm[(comm["collective"] == "Send") | (comm["collective"] == "Recv")]
-        p2p_kernels = p2p_kernel_grouped[gpu]
         if len(p2p_comm) > 0:
+            p2p_kernels = p2p_kernel_grouped[gpu]
             p2p_types = {
                 "Send": "1",
                 "Recv": "2",

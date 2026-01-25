@@ -246,12 +246,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process some paths.")
     parser.add_argument("--trace_dir", type=str, required=True, help="Directory containing trace files")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save output files")
-    parser.add_argument("--merged", action='store_true', help="Whether the streams are merged")
+    parser.add_argument("--merged", "-m", action='store_true', help="Whether the streams are merged")
     parser.add_argument("--intermediate_results", action='store_true', help="Whether to save intermediate results")
-    parser.add_argument("--dask", action='store_true', help="Whether to use dask for processing")
-    parser.add_argument("--parallel_generation", action='store_true', help="Whether to generate goal files in parallel")
-    parser.add_argument("--concatenate", action='store_true', help="Whether to concatenate all traces into one")
-    parser.add_argument("--delete_parts", action='store_true', help="Whether to delete part files after concatenation")
+    parser.add_argument("--dask", "-d", action='store_true', help="Whether to use dask for processing")
+    parser.add_argument("--parallel_generation", "-p", action='store_true', help="Whether to generate goal files in parallel")
+    parser.add_argument("--concatenate", "-c", action='store_true', help="Whether to concatenate all traces into one")
+    parser.add_argument("--delete_parts", "-r", action='store_true', help="Whether to delete part files after concatenation")
+    parser.add_argument("--opt", "-o", action='store_true', help="Whether to use all optimizations")
     parser.add_argument("--write_buffer_size", type=str, default=None, 
                         help="Write buffer size for goal file output (e.g., '1MB', '512KB', '8192'). "
                              "Larger buffers reduce I/O operations, useful for network storage.")
@@ -264,11 +265,15 @@ if __name__ == "__main__":
     parallel_generation = args.parallel_generation
     concatenate = args.concatenate
     delete_parts = args.delete_parts
+    use_dask = args.dask
+    if args.opt:
+        use_dask = True
+        parallel_generation = True
     write_buffer_size = parse_buffer_size(args.write_buffer_size)
     if write_buffer_size:
         logger.info(f"Using write buffer size: {write_buffer_size} bytes ({write_buffer_size / 1024:.1f} KB)")
 
-    use_dask = args.dask
+    
     if use_dask:
         from nsys_events_dask import *
         from tqdm.dask import TqdmCallback
@@ -312,9 +317,8 @@ if __name__ == "__main__":
     
     del nvtx_events
     
-    # Pass traces directly - kernel events are read and processed in parallel tasks
-    # Note: filter_time is called after association (not during)
-    comm_data = associate_kernel_to_nvtx(comm_data, traces)
+    kernel_events = get_kernel_events(traces)
+    comm_data = associate_kernel_to_nvtx(comm_data, kernel_events)
 
     comm_data = filter_time(profiling_interval, comm_data)
     comm_data = add_context_parallelism(comm_data)
