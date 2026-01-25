@@ -65,9 +65,13 @@ def get_nvtx_events(traces: List[os.PathLike]) -> Dict[str, pd.DataFrame]:
     for trace_file in traces:
         dfs.append(delayed(read_nvtx_event_file)(trace_file))
     
-    logger.info("computing nvtx events in parallel")
+    # Explicitly read config values since processes scheduler doesn't auto-apply them
+    scheduler = dask.config.get("scheduler", default="synchronous")
+    num_workers = dask.config.get("num_workers", default=None)
+    
+    logger.info(f"computing nvtx events in parallel (scheduler={scheduler}, num_workers={num_workers})")
     with TqdmCallback(desc="nvtx events", tqdm_class=_tqdm_for_dask):
-        results = dask.compute(*dfs, scheduler="processes")
+        results = dask.compute(*dfs, scheduler=scheduler, num_workers=num_workers)
     
     # Combine results from all files
     combined = {}
@@ -356,7 +360,7 @@ def associate_kernel_to_nvtx(
         logger.warning("No traces to process - no matching nodes found")
         return comm_grouped
     
-    logger.info(f"running {len(filtered_traces)} kernel association tasks in parallel")
+    logger.info(f"running {len(filtered_traces)} kernel association tasks in parallel with {dask.config.get('num_workers', default=mp.cpu_count())} workers")
     
     # Use Pool with initializer for copy-on-write sharing
     with mp.Pool(

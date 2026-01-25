@@ -256,6 +256,7 @@ if __name__ == "__main__":
     parser.add_argument("--write_buffer_size", type=str, default=None, 
                         help="Write buffer size for goal file output (e.g., '1MB', '512KB', '8192'). "
                              "Larger buffers reduce I/O operations, useful for network storage.")
+    parser.add_argument("--n_workers", "-w", type=int, default=os.cpu_count(), help="Number of worker processes for parallel generation")
     args = parser.parse_args()
     trace_dir = pathlib.Path(args.trace_dir).resolve()
     output_dir = pathlib.Path(args.output_dir).resolve()
@@ -263,6 +264,7 @@ if __name__ == "__main__":
     merged_streams = args.merged
     intermediate_results = args.intermediate_results
     parallel_generation = args.parallel_generation
+    n_workers = args.n_workers
     concatenate = args.concatenate
     delete_parts = args.delete_parts
     use_dask = args.dask
@@ -275,6 +277,8 @@ if __name__ == "__main__":
 
     
     if use_dask:
+        import dask
+        dask.config.set(scheduler="processes", num_workers=n_workers)
         from nsys_events_dask import *
         from tqdm.dask import TqdmCallback
         from functools import partial
@@ -410,13 +414,12 @@ if __name__ == "__main__":
         logger.info(f"Data preparation time: {time_finish_prep - script_start_time:.2f} seconds")
         
         # Now run init + goal generation in parallel processes
-        num_workers = min(os.cpu_count() or 1, len(gpu_devices))
-        logger.info(f"initializing GPUs and generating goal files in parallel with {num_workers} workers")
+        logger.info(f"initializing GPUs and generating goal files in parallel with {n_workers} workers")
         total_gpus = len(task_list)
         
         # Use initializer to set up shared data once per worker (copy-on-write friendly)
         with multiprocessing.Pool(
-            processes=num_workers,
+            processes=n_workers,
             initializer=_init_worker,
             initargs=(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams, write_buffer_size)
         ) as pool:
