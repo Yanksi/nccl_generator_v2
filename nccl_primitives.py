@@ -144,6 +144,9 @@ class NCCLPrimitiveComm(ABC):
     def proto_simple(self) -> NCCLPrimitiveComm:
         pass
 
+    def proto_ll128(self) -> NCCLPrimitiveComm:
+        return self.proto_ll()
+
     @abstractmethod
     def __repr__(self) -> str:
         pass
