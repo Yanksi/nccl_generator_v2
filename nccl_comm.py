@@ -142,8 +142,12 @@ class Send(P2POp):
         result = NCCLSend(self.context, self.gpu_id, target_gpu_id=self.comm.rank2gpu_id[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
         if chnl_info.proto == NCCLProto.LL:
             return result.proto_ll()
-        else:
+        elif chnl_info.proto == NCCLProto.LL128:
+            return result.proto_ll128()
+        elif chnl_info.proto == NCCLProto.SIMPLE:
             return result.proto_simple()
+        else:
+            raise ValueError(f"Unsupported proto: {chnl_info.proto}")
     # def to_primitives(self) -> NCCLPrimitiveComm:
     #     return NCCLSend(self.context, self.gpu_id, target_gpu_id=self.comm.rank2gpu_id[self.peer_rank], size=self.size, chunk_size=self.chunk_size).proto_simple()
 
@@ -153,8 +157,12 @@ class Recv(P2POp):
         result = NCCLRecv(self.context, self.gpu_id, source_gpu_id=self.comm.rank2gpu_id[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
         if chnl_info.proto == NCCLProto.LL:
             return result.proto_ll()
-        else:
+        elif chnl_info.proto == NCCLProto.LL128:
+            return result.proto_ll128()
+        elif chnl_info.proto == NCCLProto.SIMPLE:
             return result.proto_simple()
+        else:
+            raise ValueError(f"Unsupported proto: {chnl_info.proto}")
 
 @dataclass
 class CollInfo:
@@ -217,8 +225,10 @@ class CollectiveOp(CommOp):
             result = self._to_primitives_tree()
         else:
             raise ValueError(f"Unsupported algo: {self.coll_info.algo}")
-        if self.coll_info.proto == NCCLProto.LL or self.coll_info.proto == NCCLProto.LL128: # TODO: distinguish LL and LL128
+        if self.coll_info.proto == NCCLProto.LL: # TODO: distinguish LL and LL128
             result = result.proto_ll()
+        elif self.coll_info.proto == NCCLProto.LL128:
+            result = result.proto_ll128()
         elif self.coll_info.proto == NCCLProto.SIMPLE:
             result = result.proto_simple()
         else:
