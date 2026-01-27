@@ -168,7 +168,7 @@ def init_and_generate_goal_for_gpu(args_tuple):
     
     # Merge streams if requested
     if merged_streams:
-        gpu.merge_streams()
+        gpu.streams = {"merged_stream": gpu.merge_streams()}
     
     # Update init counter with lock to prevent race conditions
     with counter_lock:
@@ -346,6 +346,9 @@ if __name__ == "__main__":
         "Send": Send,
         "Recv": Recv,
     }
+
+    comm_op_ids = {name: i for i, name in enumerate(comm_ops.keys())}
+    comm_op_ids["Send"] = comm_op_ids["Recv"]
     
     # Build gpu_id2goal_rank mapping
     gpu_id2goal_rank = {gpu.gpu_id: i for i, gpu in enumerate(gpu_devices.values())}
@@ -355,6 +358,10 @@ if __name__ == "__main__":
         "npkit_benchmark_results/clariden/npkit_data_summary_Simple.json",
         "npkit_benchmark_results/clariden/npkit_data_summary_LL.json",
     )
+
+    _MASK = (1 << sys.hash_info.width) - 1
+    def hash_sequnces(*sequences):
+        return [hash(elems) & _MASK for elems in zip(*sequences)]
 
     def prepare_gpu_data(gpu_id, gpu):
         """Prepare dataframes for a single GPU, applying all transformations."""
@@ -374,13 +381,30 @@ if __name__ == "__main__":
         
         comm_data_gpu = comm_data[gpu_id].copy()
         comm_data_gpu = comm_data_gpu.merge(communicator_ids_numeric_df, on="commId", how="left")
-        comm_data_gpu["collective"] = comm_data_gpu["collective"].map(comm_ops)
-        comm_data_gpu["communicator"] = comm_data_gpu["commId"].map(communicators)
+        comm_data_gpu = comm_data_gpu.sort_values(["start"])
+        
         # Vectorized context_label calculation
         parallelism_vals = comm_data_gpu["parallelism"].map(context_labels).fillna(0).astype(np.int64)
+        # make sure one communicator is used by only one stream only
+        for commId, group in comm_data_gpu.groupby("commId"):
+            stream_ids = group["stream"].unique()
+            if len(stream_ids) > 1:
+                raise ValueError(f"Communicator {commId} used by multiple streams: {stream_ids}")
+        
+        # prepare identifier tag
         comm_num_ids = comm_data_gpu["comm_num_id"].to_numpy(dtype=np.int64)
-        comm_data_gpu["context_label"] = parallelism_vals.to_numpy() + comm_num_ids * 100
-        comm_data_gpu.drop(columns=["commId", "parallelism", "comm_num_id"], inplace=True)
+        comm_data_gpu["comm_op_id"] = comm_data_gpu["collective"].map(comm_op_ids)
+        comm_op_id = comm_data_gpu["comm_op_id"].to_numpy(dtype=np.int64)
+        comm_seq_ids = comm_data_gpu.groupby(["commId", "comm_op_id"]).cumcount().to_numpy(dtype=np.int64)
+        comm_seq_ids[comm_data_gpu["collective"].isin(["Send", "Recv"])] = 0  # reset seq_id for point-to-point ops
+        comm_identifier = (np.array(hash_sequnces(comm_num_ids, comm_op_id, comm_seq_ids)) % 10000).astype(np.int64)
+        # comm_identifier = comm_num_ids
+        comm_data_gpu["context_label"] = parallelism_vals.to_numpy() + comm_identifier * 100
+
+        comm_data_gpu["collective"] = comm_data_gpu["collective"].map(comm_ops)
+        comm_data_gpu["communicator"] = comm_data_gpu["commId"].map(communicators)
+
+        comm_data_gpu.drop(columns=["commId", "parallelism", "comm_num_id", "comm_op_id"], inplace=True)
         
         return {
             "coll_info": coll_info_gpu,
