@@ -61,6 +61,14 @@ class CommOp(ABC):
     def to_primitives(self) -> NCCLPrimitiveComm:
         pass
 
+class CommGrouped(CommOp):
+    def __init__(self, gpu_id: GpuId, comm_ops: Union[List[CommOp], Generator[CommOp]], context: int):
+        super().__init__(gpu_id, context)
+        self.comm_ops = comm_ops
+    
+    def to_primitives(self) -> NCCLPrimitiveComm:
+        result = NCCLPrimitiveParallel(self.gpu_id, False, (comm_op.to_primitives() for comm_op in self.comm_ops))
+        return result
 
 class AllToAll(CommOp):
     def __init__(self, gpu_id: GpuId, size_per_peer: int, comm: Communicator, chunk_size: int, context: int):
