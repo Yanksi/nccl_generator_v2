@@ -14,6 +14,8 @@ from tqdm import tqdm
 from nccl_comm import *
 from nccl_primitives import *
 from gpu import *
+from configure_topo import *
+from topo_viz import *
 import argparse
 import time
 
@@ -286,6 +288,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process some paths.")
     parser.add_argument("--trace_dir", type=str, required=True, help="Directory containing trace files")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save output files")
+    parser.add_argument("--node_topo_file", type=str, required=False, help="Path to save HTSIM topology file")
+    parser.add_argument("--viz_virtual_topo", action='store_true', help="Whether to visualize virtual topology")
     parser.add_argument("--merged", "-m", action='store_true', help="Whether the streams are merged")
     parser.add_argument("--intermediate_results", action='store_true', help="Whether to save intermediate results")
     parser.add_argument("--dask", "-d", action='store_true', help="Whether to use dask for processing")
@@ -301,6 +305,8 @@ if __name__ == "__main__":
     trace_dir = pathlib.Path(args.trace_dir).resolve()
     output_dir = pathlib.Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    node_topo_file_path = pathlib.Path(args.node_topo_file).resolve() if args.node_topo_file is not None else None
+    viz_virtual_topo = args.viz_virtual_topo
     merged_streams = args.merged
     intermediate_results = args.intermediate_results
     parallel_generation = args.parallel_generation
@@ -344,6 +350,25 @@ if __name__ == "__main__":
         comm_info.to_csv(output_dir / "comm_info.csv", index=False)
         comm_ring_info.to_csv(output_dir / "comm_ring_info.csv", index=False)
         comm_tree_info.to_csv(output_dir / "comm_tree_info.csv", index=False)
+
+    if viz_virtual_topo:
+        ring_viz = NCCLRingVisualizer(comm_info=comm_info, comm_ring_info=comm_ring_info, out_dir=trace_dir / "topo_figs", tag="original")
+        ring_viz.render_all()
+        tree_viz = NCCLTreeVisualizer(comm_info=comm_info, comm_tree_info=comm_tree_info, out_dir=trace_dir / "topo_figs", tag="original")
+        tree_viz.render_all()
+
+    if node_topo_file_path is not None:
+        node_groups = get_node_groups(node_topo_file_path)
+        comm_info, comm_ring_info, comm_tree_info = update_topo_info(comm_info, comm_ring_info, comm_tree_info, node_groups)
+        if viz_virtual_topo:
+            ring_viz = NCCLRingVisualizer(comm_info=comm_info, comm_ring_info=comm_ring_info, out_dir=trace_dir / "topo_figs", tag="updated")
+            ring_viz.render_all()
+            tree_viz = NCCLTreeVisualizer(comm_info=comm_info, comm_tree_info=comm_tree_info, out_dir=trace_dir / "topo_figs", tag="updated")
+            tree_viz.render_all()
+
+    communicators, gpu_devices = construct_communicators(
+        comm_info, comm_ring_info, comm_tree_info
+    )
     
     comm_data, coll_info, coll_kernels, p2p_kernels, nvtx_events = get_event_info(nvtx_events, comm_info)
 
