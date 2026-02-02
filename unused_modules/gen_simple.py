@@ -1,5 +1,5 @@
 from __future__ import annotations
-from goal_v2 import GoalCalc, GoalSequential, GoalParallel, GoalSend, GoalRecv, GoalOp, GoalRank, GoalCPU, _current_self_rank, _current_cpu
+from unused_modules.goal_v2 import GoalCalc, GoalSequential, GoalParallel, GoalSend, GoalRecv, GoalOp, GoalRank, GoalCPU, _current_self_rank, _current_cpu
 from typing import List, Tuple, Dict, Optional
 import contextvars
 from contextlib import ContextDecorator

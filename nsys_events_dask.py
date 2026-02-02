@@ -360,7 +360,7 @@ def associate_kernel_to_nvtx(
         logger.warning("No traces to process - no matching nodes found")
         return comm_grouped
     
-    logger.info(f"running {len(filtered_traces)} kernel association tasks in parallel with {dask.config.get('num_workers', default=mp.cpu_count())} workers")
+    logger.info(f"running {len(filtered_traces)} kernel association tasks in parallel with {min(len(filtered_traces), mp.cpu_count())} workers")
     
     # Use Pool with initializer for copy-on-write sharing
     with mp.Pool(
