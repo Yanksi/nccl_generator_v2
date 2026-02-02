@@ -8,8 +8,8 @@ from contextlib import ContextDecorator
 DEFAULT_SELF_RANK: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("DEFAULT_SELF_RANK", default=None)
 DEFAULT_CPU: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("DEFAULT_CPU", default=None)
 
-MESSAGE_ID_WIDTH = 6
-MESSAGE_TAG_WIDTH = 4
+MESSAGE_ID_WIDTH = 4
+MESSAGE_TAG_WIDTH = 5
 
 class GoalRank(ContextDecorator):
     def __init__(self, self_rank):

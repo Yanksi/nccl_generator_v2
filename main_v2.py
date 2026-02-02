@@ -120,75 +120,115 @@ _WORKER_GPU_ID2GOAL_RANK = None
 _WORKER_OUTPUT_DIR = None
 _WORKER_MERGED_STREAMS = None
 _WORKER_WRITE_BUFFER_SIZE = None
+_WORKER_MERGE_SUCCESS = None  # Shared array for tracking merge success per GPU
+_WORKER_MERGE_BARRIER = None  # Barrier for synchronizing merge phase
 
 
-def _init_worker(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams, write_buffer_size):
+def _init_worker(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams, write_buffer_size,
+                 merge_success_array=None, merge_barrier=None):
     """
     Initialize worker process with shared data.
     This is called once per worker at fork time, enabling copy-on-write memory sharing.
     """
-    global _WORKER_GPU_DATA, _WORKER_GPU_ID2GOAL_RANK, _WORKER_OUTPUT_DIR, _WORKER_MERGED_STREAMS, _WORKER_WRITE_BUFFER_SIZE
+    global _WORKER_GPU_DATA, _WORKER_GPU_ID2GOAL_RANK, _WORKER_OUTPUT_DIR, _WORKER_MERGED_STREAMS
+    global _WORKER_WRITE_BUFFER_SIZE, _WORKER_MERGE_SUCCESS, _WORKER_MERGE_BARRIER
     _WORKER_GPU_DATA = gpu_data_dict
     _WORKER_GPU_ID2GOAL_RANK = gpu_id2goal_rank
     _WORKER_OUTPUT_DIR = output_dir
     _WORKER_MERGED_STREAMS = merged_streams
     _WORKER_WRITE_BUFFER_SIZE = write_buffer_size
+    _WORKER_MERGE_SUCCESS = merge_success_array
+    _WORKER_MERGE_BARRIER = merge_barrier
 
 
-def init_and_generate_goal_for_gpu(args_tuple):
+def process_gpu_chunk(args_tuple):
     """
     Worker function for parallel GPU initialization and goal generation.
+    Processes a chunk of GPUs (not just one) for better load balancing.
     Uses global data set via initializer (copy-on-write friendly).
-    Only receives small arguments via pickle.
+    
+    Two-phase stream merging:
+    - Phase 1: Try merge_streams() for all GPUs in chunk, record success/failure
+    - Barrier: Wait for all workers to complete phase 1
+    - Phase 2: If ALL GPUs across all workers succeeded, apply merged streams; otherwise skip
     
     Args:
-        args_tuple: (gpu_id, rank, nic, init_counter, gen_counter, counter_lock)
-    
-    init_counter, gen_counter: multiprocessing.Value counters for progress tracking
-    counter_lock: multiprocessing.Lock to protect counter updates
+        args_tuple: (gpu_chunk, nic, init_counter, gen_counter, counter_lock)
+        gpu_chunk: List of (gpu_id, rank) tuples for this worker to process
     """
-    gpu_id, rank, nic, init_counter, gen_counter, counter_lock = args_tuple
+    gpu_chunk, nic, init_counter, gen_counter, counter_lock = args_tuple
     
     # Access data from globals (copy-on-write, no pickle overhead)
-    gpu_data = _WORKER_GPU_DATA[gpu_id]
+    gpu_data_dict = _WORKER_GPU_DATA
     gpu_id2goal_rank = _WORKER_GPU_ID2GOAL_RANK
     output_dir = _WORKER_OUTPUT_DIR
     merged_streams = _WORKER_MERGED_STREAMS
+    merge_success_array = _WORKER_MERGE_SUCCESS
+    merge_barrier = _WORKER_MERGE_BARRIER
     
-    # Reconstruct GPUDevice in this process
-    gpu = GPUDevice(rank=rank, node_id=gpu_data["node_id"], pid=gpu_data["pid"])
+    # Phase 1: Initialize all GPUs in chunk and attempt stream merging
+    gpus = []  # List of (gpu, rank, merged_stream_or_none)
+    for gpu_id, rank in gpu_chunk:
+        gpu_data = gpu_data_dict[gpu_id]
+        
+        # Reconstruct GPUDevice in this process
+        gpu = GPUDevice(rank=rank, node_id=gpu_data["node_id"], pid=gpu_data["pid"])
+        
+        # Initialize GPU from dataframes
+        gpu.init_from_dfs(
+            gpu_data["coll_info"],
+            gpu_data["coll_kernels"],
+            gpu_data["p2p_kernels"],
+            gpu_data["comm_data"]
+        )
+        
+        # Try to merge streams if requested
+        merged_stream = None
+        if merged_streams:
+            merged_stream = gpu.merge_streams()
+            # Record success/failure in shared array (1 = success, 0 = failure)
+            merge_success_array[rank] = 1 if merged_stream is not None else 0
+        
+        gpus.append((gpu, rank, merged_stream))
+        
+        # Update init counter
+        with counter_lock:
+            init_counter.value += 1
     
-    # Initialize GPU from dataframes
-    gpu.init_from_dfs(
-        gpu_data["coll_info"],
-        gpu_data["coll_kernels"],
-        gpu_data["p2p_kernels"],
-        gpu_data["comm_data"]
-    )
+    # Barrier: Wait for all workers to complete Phase 1 (merge attempts)
+    if merged_streams and merge_barrier is not None:
+        merge_barrier.wait()
     
-    # Merge streams if requested
-    if merged_streams:
-        gpu.streams = {"merged_stream": gpu.merge_streams()}
+    # Phase 2: Check if ALL GPUs succeeded in merging
+    all_merge_success = True
+    if merged_streams and merge_success_array is not None:
+        # Check all entries in the shared array
+        all_merge_success = all(merge_success_array[i] == 1 for i in range(len(merge_success_array)))
     
-    # Update init counter with lock to prevent race conditions
-    with counter_lock:
-        init_counter.value += 1
+    # Phase 3: Generate goal files
+    results = []
+    for gpu, rank, merged_stream in gpus:
+        # Apply merged streams only if ALL GPUs succeeded
+        if merged_streams and all_merge_success and merged_stream is not None:
+            gpu.streams = {"merged_stream": merged_stream}
+        # else: keep original streams
+        
+        # Generate and write goal file
+        output_file = output_dir / f"rank_{rank}.goal"
+        buffering = _WORKER_WRITE_BUFFER_SIZE if _WORKER_WRITE_BUFFER_SIZE and _WORKER_WRITE_BUFFER_SIZE > 0 else -1
+        with open(output_file, "w", buffering=buffering) as f:
+            f.write(f"rank {rank} {{\n")
+            for line in gpu.generate_goal_lines(gpu_id2goal_rank, nic=nic):
+                f.write(f"{line}\n")
+            f.write("}\n")
+        
+        # Update generation counter
+        with counter_lock:
+            gen_counter.value += 1
+        
+        results.append(rank)
     
-    # Generate and write goal file with optional buffering for network storage performance
-    output_file = output_dir / f"rank_{rank}.goal"
-    # buffering: -1 = system default, 0 = unbuffered, >0 = buffer size in bytes
-    buffering = _WORKER_WRITE_BUFFER_SIZE if _WORKER_WRITE_BUFFER_SIZE and _WORKER_WRITE_BUFFER_SIZE > 0 else -1
-    with open(output_file, "w", buffering=buffering) as f:
-        f.write(f"rank {rank} {{\n")
-        for line in gpu.generate_goal_lines(gpu_id2goal_rank, nic=nic):
-            f.write(f"{line}\n")
-        f.write("}\n")
-    
-    # Update generation counter with lock
-    with counter_lock:
-        gen_counter.value += 1
-    
-    return rank
+    return results
 
 
 def write_goal_for_gpu(args_tuple):
@@ -202,8 +242,8 @@ def write_goal_for_gpu(args_tuple):
     gpu, rank, gpu_id2goal_rank, output_dir, merged_streams, nic, write_buffer_size = args_tuple
     
     if merged_streams:
-        gpu.merge_streams()
-    
+        gpu.streams = {"stream_merged": gpu.merge_streams()}
+
     output_file = output_dir / f"rank_{rank}.goal"
     buffering = write_buffer_size if write_buffer_size and write_buffer_size > 0 else -1
     with open(output_file, "w", buffering=buffering) as f:
@@ -397,7 +437,7 @@ if __name__ == "__main__":
         comm_op_id = comm_data_gpu["comm_op_id"].to_numpy(dtype=np.int64)
         comm_seq_ids = comm_data_gpu.groupby(["commId", "comm_op_id"]).cumcount().to_numpy(dtype=np.int64)
         comm_seq_ids[comm_data_gpu["collective"].isin(["Send", "Recv"])] = 0  # reset seq_id for point-to-point ops
-        comm_identifier = (np.array(hash_sequnces(comm_num_ids, comm_op_id, comm_seq_ids)) % 10000).astype(np.int64)
+        comm_identifier = (np.array(hash_sequnces(comm_num_ids, comm_op_id, comm_seq_ids)) % 1000).astype(np.int64)
         # comm_identifier = comm_num_ids
         comm_data_gpu["context_label"] = parallelism_vals.to_numpy() + comm_identifier * 100
 
@@ -417,6 +457,7 @@ if __name__ == "__main__":
     
     if parallel_generation:
         # Parallel generation: prepare data, then use multiprocessing for init + goal generation
+        # GPUs are chunked into n_workers chunks for coordinated stream merging
         logger.info("preparing GPU data for parallel generation")
         
         # Create shared counters for progress tracking
@@ -425,33 +466,67 @@ if __name__ == "__main__":
         gen_counter = manager.Value('i', 0)
         counter_lock = manager.Lock()
         
+        # Create shared array for tracking merge success per GPU (used for coordinated merging)
+        total_gpus = len(gpu_devices)
+        merge_success_array = None
+        merge_barrier = None
+        if merged_streams:
+            # Shared array: 1 = merge success, 0 = merge failure (indexed by rank)
+            merge_success_array = multiprocessing.Array('i', [0] * total_gpus)
+            # Barrier to synchronize all workers after merge phase
+            merge_barrier = multiprocessing.Barrier(n_workers)
+        
         # Prepare all GPU data in main process - stored in dict for initializer
         gpu_data_dict = {}
-        task_list = []
+        gpu_list = []  # List of (gpu_id, rank) tuples
         for gpu_id, gpu in tqdm(gpu_devices.items(), desc="Preparing GPU data"):
             gpu_data_dict[gpu_id] = prepare_gpu_data(gpu_id, gpu)
             rank = gpu_id2goal_rank[gpu.gpu_id]
-            # Only pass small args per task - large data accessed via globals
-            task_list.append((gpu_id, rank, 0, init_counter, gen_counter, counter_lock))
+            gpu_list.append((gpu_id, rank))
+        
+        # Chunk GPUs into n_workers chunks (one chunk per worker)
+        # This ensures coordinated stream merging across all GPUs
+        def chunk_list(lst, n_chunks):
+            """Split list into n roughly equal chunks."""
+            chunk_size = len(lst) // n_chunks
+            remainder = len(lst) % n_chunks
+            chunks = []
+            start = 0
+            for i in range(n_chunks):
+                # Distribute remainder across first 'remainder' chunks
+                end = start + chunk_size + (1 if i < remainder else 0)
+                chunks.append(lst[start:end])
+                start = end
+            # chunks = [chunk for chunk in chunks if chunk]  # remove empty chunks
+            return chunks
+        
+        gpu_chunks = chunk_list(gpu_list, n_workers)
+        # Build task list: each task is a chunk of GPUs
+        task_list = [
+            (chunk, 0, init_counter, gen_counter, counter_lock)  # nic=0
+            for chunk in gpu_chunks
+        ]
         
         time_finish_prep = time.time()
         logger.info(f"Data preparation time: {time_finish_prep - script_start_time:.2f} seconds")
         
         # Now run init + goal generation in parallel processes
         logger.info(f"initializing GPUs and generating goal files in parallel with {n_workers} workers")
-        total_gpus = len(task_list)
+        logger.info(f"Total GPUs: {total_gpus}, chunked into {len(gpu_chunks)} chunks")
+        if merged_streams:
+            logger.info("Stream merging enabled: coordinated across all GPUs (all-or-none)")
         
         # Use initializer to set up shared data once per worker (copy-on-write friendly)
         with multiprocessing.Pool(
             processes=n_workers,
             initializer=_init_worker,
-            initargs=(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams, write_buffer_size)
+            initargs=(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams, write_buffer_size,
+                      merge_success_array, merge_barrier)
         ) as pool:
-            # Start async map - only small args are pickled now!
-            async_result = pool.map_async(init_and_generate_goal_for_gpu, task_list)
+            # Start async map - each task processes a chunk of GPUs
+            async_result = pool.map_async(process_gpu_chunk, task_list)
             
             # Create dual progress bars
-            # Init bar uses lighter/dimmer style, Gen bar uses solid style
             init_bar = tqdm(total=total_gpus, desc="Initializing ", position=0, 
                            bar_format='{desc}: {bar}| {n_fmt}/{total_fmt}',
                            colour='cyan', leave=True)
@@ -482,6 +557,15 @@ if __name__ == "__main__":
             
             # Get results (will raise if any worker failed)
             results = async_result.get()
+        
+        # Log merge result
+        if merged_streams and merge_success_array is not None:
+            all_merged = all(merge_success_array[i] == 1 for i in range(total_gpus))
+            if all_merged:
+                logger.info("Stream merging: SUCCESS - all GPUs merged their streams")
+            else:
+                failed_ranks = [i for i in range(total_gpus) if merge_success_array[i] == 0]
+                logger.info(f"Stream merging: SKIPPED - {len(failed_ranks)} GPU(s) could not merge (ranks: {failed_ranks[:10]}{'...' if len(failed_ranks) > 10 else ''})")
         
         time_finish_init = time.time()
         
@@ -518,6 +602,25 @@ if __name__ == "__main__":
 
         time_finish_init = time.time()
 
+        # Coordinated stream merging: all GPUs merge only if all can merge
+        merged_streams_dict = {}
+        if merged_streams:
+            all_can_merge = True
+            for gpu in gpu_devices.values():
+                merged = gpu.merge_streams()
+                if merged is None:
+                    all_can_merge = False
+                    logger.info(f"Stream merging: GPU {gpu.id} cannot merge streams")
+                    break
+                merged_streams_dict[gpu.gpu_id] = merged
+            
+            if all_can_merge:
+                logger.info("Stream merging: SUCCESS - all GPUs merged their streams")
+                for gpu in gpu_devices.values():
+                    gpu.streams = {"stream_merged": merged_streams_dict[gpu.gpu_id]}
+            else:
+                logger.info("Stream merging: SKIPPED - not all GPUs could merge")
+
         # Sequential write: single output file
         goal_path = output_dir / "output.goal"
         buffering = write_buffer_size if write_buffer_size and write_buffer_size > 0 else -1
@@ -526,8 +629,6 @@ if __name__ == "__main__":
             gpus = gpu_devices.values()
             f.write(f"num_ranks {len(gpus)}\n")
             for gpu in tqdm(gpus):
-                if merged_streams:
-                    gpu.merge_streams()
                 f.write(f"rank {gpu_id2goal_rank[gpu.gpu_id]} {{\n")
                 for line in gpu.generate_goal_lines(gpu_id2goal_rank, nic=0):
                     f.write(f"{line}\n")
