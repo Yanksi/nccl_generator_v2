@@ -268,14 +268,11 @@ class GPUDevice:
         # logger.info(f"Merging streams for GPU {self.id} with {len(self.streams)} streams.")
         merged_stream = GPUStream(self)
         for _, stream in self.streams_sorted():
-            stream_merged = False
             if check_mergable(stream, merged_stream):
                 # merge
                 merged_stream.collectives.extend(stream.collectives)
                 merged_stream.coll_starts.extend(stream.coll_starts)
                 merged_stream.coll_ends.extend(stream.coll_ends)
-                stream_merged = True
-                break
-            if not stream_merged:
+            else:
                 return None
         return merged_stream
