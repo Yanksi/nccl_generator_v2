@@ -272,13 +272,14 @@ def get_event_info(data: Dict[str, pd.DataFrame], comm_info: pd.DataFrame = None
 
 # Global variables for Pool initializer pattern in associate_kernel_to_nvtx
 _KERNEL_ASSOC_COMM_DATA: Dict[Tuple[str, int], pd.DataFrame] = None
+_PROFILING_INTERVAL: Dict[Tuple[str, int], Tuple[int, int]] = None
 
 
-def _init_kernel_assoc_worker(comm_grouped):
+def _init_kernel_assoc_worker(comm_grouped, profiling_interval):
     """Initialize worker with comm_grouped data via copy-on-write."""
-    global _KERNEL_ASSOC_COMM_DATA
+    global _KERNEL_ASSOC_COMM_DATA, _PROFILING_INTERVAL
     _KERNEL_ASSOC_COMM_DATA = comm_grouped
-
+    _PROFILING_INTERVAL = profiling_interval
 
 def _process_trace_file(trace_file: os.PathLike) -> Dict[Tuple[str, int], pd.DataFrame]:
     """
@@ -287,7 +288,7 @@ def _process_trace_file(trace_file: os.PathLike) -> Dict[Tuple[str, int], pd.Dat
     Accesses comm_grouped via global _KERNEL_ASSOC_COMM_DATA (copy-on-write after fork).
     Returns lightweight Dict of (nodeId, pid) -> DataFrame with (eventId, start, end).
     """
-    global _KERNEL_ASSOC_COMM_DATA
+    global _KERNEL_ASSOC_COMM_DATA, _PROFILING_INTERVAL
     
     # Read kernel events from this trace file
     kernel_df = read_kernel_event_file(trace_file)
@@ -310,11 +311,13 @@ def _process_trace_file(trace_file: os.PathLike) -> Dict[Tuple[str, int], pd.Dat
         
         if len(gpu_kernels) == 0:
             continue
+
+        interval = _PROFILING_INTERVAL.get(gpu_key, None)
         
         # Associate kernels with NVTX events - returns only (eventId, start, end)
         try:
             _, kernel_times = process_one_gpu_kernels(
-                gpu_key, gpu_kernels, _KERNEL_ASSOC_COMM_DATA[gpu_key]
+                gpu_key, gpu_kernels, _KERNEL_ASSOC_COMM_DATA[gpu_key], interval
             )
             results[gpu_key] = kernel_times
         except Exception as e:
@@ -327,7 +330,7 @@ def _process_trace_file(trace_file: os.PathLike) -> Dict[Tuple[str, int], pd.Dat
 def associate_kernel_to_nvtx(
     comm_grouped: Dict[Tuple[str, int], pd.DataFrame],
     traces: List[os.PathLike],
-    profiling_interval: Dict = None,  # Kept for API compatibility, but not used here
+    profiling_interval: Dict = dict()
 ):
     """
     Associate kernel events to NVTX events using multiprocessing Pool.
@@ -339,7 +342,7 @@ def associate_kernel_to_nvtx(
     Args:
         comm_grouped: Dict of (nodeId, pid) -> NVTX DataFrame
         traces: List of paths to sqlite trace files
-        profiling_interval: Unused - kept for API compatibility
+        profiling_interval: Optional dict of (nodeId, pid) -> (start, end) for filtering events by profiling interval
     
     Returns:
         Updated comm_grouped with kernel start/end times
@@ -366,7 +369,7 @@ def associate_kernel_to_nvtx(
     with mp.Pool(
         processes=min(len(filtered_traces), mp.cpu_count()),
         initializer=_init_kernel_assoc_worker,
-        initargs=(comm_grouped,)
+        initargs=(comm_grouped, profiling_interval)
     ) as pool:
         results = list(tqdm(
             pool.imap_unordered(_process_trace_file, filtered_traces),
@@ -384,7 +387,7 @@ def associate_kernel_to_nvtx(
             
             # Drop old start/end columns and merge new ones from kernel times
             nvtx_df = nvtx_df.drop(columns=["start", "end"], errors="ignore")
-            nvtx_df = nvtx_df.merge(kernel_times, on="eventId", how="left")
+            nvtx_df = nvtx_df.merge(kernel_times, on="eventId", how="inner")
             
             comm_grouped[gpu_key] = nvtx_df
             processed_gpus.add(gpu_key)

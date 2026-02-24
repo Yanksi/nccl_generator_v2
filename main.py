@@ -344,9 +344,13 @@ if __name__ == "__main__":
     del nvtx_events
     
     kernel_events = get_kernel_events(traces)
-    comm_data = associate_kernel_to_nvtx(comm_data, kernel_events)
-
-    comm_data = filter_time(profiling_interval, comm_data)
+    try:
+        comm_data = associate_kernel_to_nvtx(comm_data, kernel_events, profiling_interval)
+    except Exception as e:
+        logger.info("Kernel association failed with pre-filtering, retrying with post filtering")
+        comm_data = associate_kernel_to_nvtx(comm_data, kernel_events)
+        comm_data = filter_time(profiling_interval, comm_data)
+    
     comm_data = add_context_parallelism(comm_data)
 
     communicators, gpu_devices = construct_communicators(
