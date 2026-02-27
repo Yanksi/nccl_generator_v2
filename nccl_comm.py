@@ -5,7 +5,7 @@ from enum import Enum
 from math import ceil
 from abc import ABC, abstractmethod
 from nccl_primitives import *
-
+from goal import GoalOp
 
 class CollAlgo(Enum):
     TREE = 0
@@ -60,6 +60,9 @@ class CommOp(ABC):
     @abstractmethod
     def to_primitives(self) -> NCCLPrimitiveComm:
         pass
+
+    def to_goal(self, gpu_id2goal_rank, starting_cpu_id, nic) -> GoalOp:
+        return self.to_primitives().to_goal(gpu_id2goal_rank, starting_cpu_id, nic)
 
 class CommGrouped(CommOp):
     def __init__(self, gpu_id: GpuId, comm_ops: Union[List[CommOp], Generator[CommOp]], context: int):

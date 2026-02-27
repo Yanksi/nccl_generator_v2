@@ -35,7 +35,7 @@ class GoalCPU(ContextDecorator):
         self._token_cpu = DEFAULT_CPU.set(self.cpu)
         return self
     
-    def __exit__(self):
+    def __exit__(self, exc_type, exc, tb):
         if self._token_cpu is not None:
             DEFAULT_CPU.reset(self._token_cpu)
         return False
@@ -232,3 +232,116 @@ class GoalSequential(GoalOp):
         #     f"l{self.ops[i+1].get_start_id()} requires l{self.ops[i].get_end_id()}" for i in range(len(self.ops)-1)
         # ])
         # return f"{results}\n{requirements}"
+
+
+class GoalGraphNode:
+    """A node in a :class:`GoalGraph`.
+
+    Wraps an arbitrary :class:`GoalOp` and records predecessor
+    ``GoalGraphNode`` references so that ``GoalGraph.generate_lines``
+    can emit the correct ``requires`` edges.
+
+    Parameters
+    ----------
+    op : GoalOp
+        The underlying goal operation (can be an atom, sequential,
+        parallel, or even a nested ``GoalGraph``).
+    predecessors : list[GoalGraphNode]
+        Nodes that must complete before *op* may start.
+    """
+
+    def __init__(
+        self,
+        op: GoalOp,
+        predecessors: Optional[List["GoalGraphNode"]] = None,
+    ):
+        self.op = op
+        self.predecessors: List["GoalGraphNode"] = predecessors if predecessors is not None else []
+
+    def add_predecessor(self, pred: "GoalGraphNode") -> None:
+        self.predecessors.append(pred)
+
+
+class GoalGraph(GoalOp):
+    """A general DAG of :class:`GoalGraphNode`\\ s.
+
+    Unlike :class:`GoalSequential` (linear chain) and
+    :class:`GoalParallel` (fork-join), ``GoalGraph`` can represent
+    arbitrary dependency structures.
+
+    The *nodes* argument must be topologically sorted: every node's
+    predecessors appear before it in the sequence.  This is required so
+    that ``generate_lines`` can stream output in a single pass — by
+    the time we emit ``requires`` edges for a node, all predecessors'
+    IDs have already been allocated.
+
+    Parameters
+    ----------
+    nodes : list[GoalGraphNode] | Generator[GoalGraphNode]
+        Topologically sorted graph nodes.
+    """
+
+    def __init__(
+        self,
+        nodes: Union[List[GoalGraphNode], Generator[GoalGraphNode, None, None]],
+        self_rank: Optional[int] = None,
+        cpu: Optional[int] = None,
+    ):
+        super().__init__(self_rank, cpu)
+        self.nodes: Union[List[GoalGraphNode], Generator[GoalGraphNode, None, None]] = nodes
+        self.single_use = not isinstance(nodes, list)
+        self.consumed = False
+        # Sentinel zero-cost calc ops for the graph's start / end IDs.
+        self.starting_op = GoalCalc(0, self.self_rank, self.cpu)
+        self.ending_op = GoalCalc(0, self.self_rank, self.cpu)
+
+    def get_start_id(self) -> int:
+        return self.starting_op.get_start_id()
+
+    def get_end_id(self) -> int:
+        return self.ending_op.get_end_id()
+
+    def generate_lines(self) -> Generator[str]:
+        if self.consumed:
+            raise ValueError(
+                "This GoalGraph has already been consumed and it is single-use."
+            )
+
+        yield from self.starting_op.generate_lines()
+
+        # Track source nodes (no predecessors) and sink nodes
+        # (no successors) so we can wire them to the sentinel ops.
+        source_nodes: List[GoalGraphNode] = []
+        all_nodes: List[GoalGraphNode] = []
+
+        for gnode in self.nodes:
+            # Emit the underlying op's lines.
+            yield from gnode.op.generate_lines()
+
+            # Emit dependency edges to predecessors.
+            for pred in gnode.predecessors:
+                yield f"l{gnode.op.get_start_id()} requires l{pred.op.get_end_id()}"
+
+            if not gnode.predecessors:
+                source_nodes.append(gnode)
+
+            all_nodes.append(gnode)
+
+        # Determine sink nodes (nodes that are never referenced as a
+        # predecessor by any other node).
+        predecessor_set = set()
+        for gnode in all_nodes:
+            for pred in gnode.predecessors:
+                predecessor_set.add(id(pred))
+        sink_nodes = [gn for gn in all_nodes if id(gn) not in predecessor_set]
+
+        # Wire source nodes to the graph's starting sentinel.
+        for gnode in source_nodes:
+            yield f"l{gnode.op.get_start_id()} requires l{self.starting_op.get_end_id()}"
+
+        # Wire the graph's ending sentinel to all sink nodes.
+        yield from self.ending_op.generate_lines()
+        for gnode in sink_nodes:
+            yield f"l{self.ending_op.get_start_id()} requires l{gnode.op.get_end_id()}"
+
+        self.consumed = True and self.single_use

@@ -107,8 +107,8 @@ class GPUStream:
                 coll = self.construct_collective(coll)
                 if coll is None:
                     continue
-            primitives = coll.to_primitives()
-            goal_op, _last_cpu = primitives.to_goal(gpu_id2goal_rank, starting_cpu_id, nic)
+            # primitives = coll.to_primitives()
+            goal_op, _last_cpu = coll.to_goal(gpu_id2goal_rank, starting_cpu_id, nic)
             last_cpu = max(last_cpu, _last_cpu)
             if prev_end > 0:
                 goal_ops.append(GoalCalc(start - prev_end, gpu_id2goal_rank[gpu_id], curr_cpu))
@@ -132,8 +132,8 @@ class GPUStream:
                     coll = self.construct_collective(coll)
                     if coll is None:
                         continue
-                primitives = coll.to_primitives()
-                goal_op, _last_cpu = primitives.to_goal(gpu_id2goal_rank, starting_cpu_id, nic)
+                # primitives = coll.to_primitives()
+                goal_op, _last_cpu = coll.to_goal(gpu_id2goal_rank, starting_cpu_id, nic)
                 last_cpu = max(last_cpu, _last_cpu)
                 if prev_end > 0:
                     yield GoalCalc(start - prev_end, gpu_id2goal_rank[gpu_id], curr_cpu)
