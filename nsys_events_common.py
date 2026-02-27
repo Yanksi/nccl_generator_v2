@@ -329,6 +329,11 @@ def _associate_start_ends(sequence, internal_groups=True):
 # Data processing functions
 # =============================================================================
 
+def filter_time_single(profiling_interval: Tuple[int, int], df: pd.DataFrame) -> pd.DataFrame:
+    """Filter events by a single profiling interval."""
+    profile_start, profile_end = profiling_interval
+    return df[(df["start"] < profile_end) & (df["end"] > profile_start)].reset_index(drop=True)
+
 def filter_time(
     profiling_interval: Dict[Tuple[str, int], Tuple[int, int]],
     data: Dict[Tuple[str, int], pd.DataFrame]
@@ -340,10 +345,7 @@ def filter_time(
         if gpu not in profiling_interval:
             logger.warning(f"GPU {gpu} has no profiling interval, skipping filtering")
             continue
-        profile_start, profile_end = profiling_interval[gpu]
-        result_dfs[gpu] = gpu_df[
-            (gpu_df["start"] < profile_end) & (gpu_df["end"] > profile_start)
-        ].reset_index(drop=True)
+        result_dfs[gpu] = filter_time_single(profiling_interval[gpu], gpu_df)
     return result_dfs
 
 
@@ -474,7 +476,7 @@ def add_context_parallelism(
 # Kernel-to-NVTX association helpers
 # =============================================================================
 
-def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame):
+def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame, profiling_interval: Tuple[int, int] = None) -> Tuple[Tuple[str, int], pd.DataFrame]:
     """
     Process kernel events for a single GPU - matches kernels to NVTX events.
     
@@ -482,10 +484,13 @@ def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame):
         gpu: The GPU key (nodeId, pid)
         kernels: DataFrame of kernel events for this GPU
         nvtxs: DataFrame of NVTX events for this GPU
-    
+        profiling_interval: Tuple of (start, end) timestamps for filtering
     Returns:
         Tuple of (gpu, kernel_times DataFrame with eventId, start, end)
     """
+    if profiling_interval is not None:
+        kernels = filter_time_single(profiling_interval, kernels)
+        nvtxs = filter_time_single(profiling_interval, nvtxs)
     kernels = kernels.sort_values(by="start").reset_index(drop=True)
     nvtxs = nvtxs.sort_values(by="start").reset_index(drop=True)
     non_grouped_nvtxs = nvtxs[nvtxs["groupId"] == -1]
@@ -549,6 +554,7 @@ def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame):
     if len(stream_correspondence) != max(
         len(kernel_stream_collectives), len(nvtx_stream_collectives)
     ):
+        logger.debug(f"nvtx_stream_collectives:\n{nvtx_stream_collectives}\nkernel_stream_collectives:\n{kernel_stream_collectives}")
         raise ValueError(f"Mismatch in number of unique stream fingerprints {gpu}")
     
     unmatched_kernel_streams = stream_correspondence[

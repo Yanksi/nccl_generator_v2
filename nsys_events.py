@@ -29,6 +29,7 @@ from nsys_events_common import (
     _associate_start_ends,
     # Data processing
     filter_time,
+    filter_time_single,
     add_context_parallelism,
     # Kernel association
     process_one_gpu_kernels,
@@ -441,22 +442,22 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None):
 def associate_kernel_to_nvtx(
     comm_grouped: pd.DataFrame,
     kernel_events: pd.DataFrame,
-    profiling_interval: pd.DataFrame = None,
+    profiling_interval: pd.DataFrame = dict(),
 ):
     """Associate kernel events to NVTX events (sequential implementation)."""
-    if profiling_interval is not None:
-        logger.info("filtering kernel events by profiling intervals")
-        kernel_events = filter_time(profiling_interval, kernel_events)
+
     logger.info("associating kernels to nvtx events")
     kernel_df_grouped = {
         name: group for name, group in kernel_events.groupby(["nodeId", "pid"])
     }
+    
     for gpu in tqdm(kernel_df_grouped.keys()):
         kernels = kernel_df_grouped[gpu]
         nvtxs = comm_grouped[gpu]
+        interval = profiling_interval.get(gpu, None)
         
         # Use shared function for kernel association
-        _, kernel_times = process_one_gpu_kernels(gpu, kernels, nvtxs)
+        _, kernel_times = process_one_gpu_kernels(gpu, kernels, nvtxs, interval)
         
         # Merge kernel times back - rebuild nvtxs with new times
         nvtxs = nvtxs.sort_values(by="start").reset_index(drop=True)
