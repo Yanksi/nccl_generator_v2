@@ -1,0 +1,499 @@
+import sys
+sys.path.insert(0, '.')
+
+from simple_sim import (
+    input_tensor,
+    input_factory,
+    parameter,
+    matmul,
+    add,
+    activation,
+    backward,
+    checkpoint,
+    adam_update,
+    completion,
+    clear_checkpoint_registry,
+    get_graph,
+    print_graph_summary,
+    detach,
+    Tensor,
+    Group,
+    ShardSpec,
+    MemoryCategory,
+    fill,
+    send,
+    sink,
+    wait_for,
+    megatron_mlp,
+    megatron_mlp_sp,
+    Zero1Plan,
+    zero1_optimizer_step,
+    zero1_gather_params,
+    param_factory,
+)
+from simple_sim.ir import tensor_replace
+from simple_sim.utils import bytes_of
+from simple_sim.visualize import visualize_graph
+
+
+def build_training_iteration(x, w1, w2, w3, iteration, use_checkpoint=True):
+    """Build one training iteration with 3-layer FFN."""
+    
+    if use_checkpoint:
+        # Wrap first two layers in checkpoint (layers 1 and 2)
+        # Layer 3 is outside the checkpoint
+        with checkpoint(name=f"iter{iteration}.ckpt12") as ckpt:
+            h = ckpt.enter(x)
+            h = matmul(h, w1, name=f"iter{iteration}.linear1")  # Layer 1
+            h = matmul(h, w2, name=f"iter{iteration}.linear2")  # Layer 2
+            h = ckpt.exit(h)
+    else:
+        # No checkpoint - all layers are saved
+        h = matmul(x, w1, name=f"iter{iteration}.linear1")
+        h = matmul(h, w2, name=f"iter{iteration}.linear2")
+    
+    out = matmul(h, w3, name=f"iter{iteration}.linear3")  # Layer 3 (outside checkpoint)
+    
+    return out
+
+
+def build_full_training(num_iterations=2, use_checkpoint=True):
+    """Build a complete training loop with multiple iterations."""
+    
+    # Clear registry
+    clear_checkpoint_registry()
+    
+    # Initial parameters (3 layers)
+    w1 = parameter((8, 16), name="w1")  # Layer 1
+    w2 = parameter((16, 16), name="w2")  # Layer 2
+    w3 = parameter((16, 4), name="w3")   # Layer 3
+    
+    params = [w1, w2, w3]
+    prev_x = None          # input tensor from previous iteration
+    prev_done = None        # completion token from previous iteration
+    
+    for iteration in range(num_iterations):
+        print(f"Building iteration {iteration}...")
+        
+        # Input for this iteration — reuse the same tensor, gated behind
+        # the previous iteration's completion.
+        x = input_factory(
+            prev_x,
+            after=prev_done,
+            create_fn=lambda: input_tensor((4, 8), name="x"),
+            iteration=iteration,
+        )
+        
+        # Forward pass with 3-layer FFN
+        loss = build_training_iteration(x, params[0], params[1], params[2], iteration, use_checkpoint)
+        
+        # Backward pass - compute gradients
+        grads = backward(loss, wrt=params)
+        
+        # Include gradients in graph for visualization
+        # graph_roots = [loss] + list(grads.values())
+        
+        # Apply Adam optimizer update to parameters
+        new_w1 = adam_update(params[0], grads[params[0]], name=f"iter{iteration}.adam_w1")
+        new_w2 = adam_update(params[1], grads[params[1]], name=f"iter{iteration}.adam_w2")
+        new_w3 = adam_update(params[2], grads[params[2]], name=f"iter{iteration}.adam_w3")
+        
+        # Detach for next iteration (stop gradient flow)
+        params = [detach(new_w1), detach(new_w2), detach(new_w3)]
+        
+        # Create a completion token marking the end of this iteration.
+        # The next iteration's input (and params) will depend on this.
+        prev_done = completion(new_w1, new_w2, new_w3,
+                               name=f"iter{iteration}.done")
+        prev_x = x  # remember the input tensor for reuse
+        
+        print(f"  Forward: x -> linear1 -> linear2 [checkpoint] -> linear3 -> loss")
+        print(f"  Gradients computed and parameters updated for iteration {iteration}")
+    
+    # Get final graph (include all grads for visualization)
+    g = get_graph(loss)
+    return g
+
+
+# ====================================================================
+# Distributed example: TP=4, DP=4, PP=8  — single GPU, one PP stage
+# ====================================================================
+
+def build_distributed_single_gpu(
+    pp_stage: int = 3,
+    tp_size: int = 4,
+    dp_size: int = 4,
+    pp_size: int = 8,
+    hidden: int = 1024,
+    inter: int = 4096,
+    seq: int = 2048,
+    batch: int = 8,
+):
+    """
+    Build the computation graph visible to **one GPU** in a distributed
+    training setup with TP=4, DP=4, PP=8.
+
+    The GPU sits at a middle pipeline stage.  Its graph contains:
+
+    Forward  (Sequence Parallelism — activations are sequence-sharded)
+      1. fill (recv) sequence-sharded activation from previous PP stage
+      2. Megatron-style MLP with SP:
+         AllGather → column-parallel matmul → activation → row-parallel matmul → ReduceScatter
+      3. send sequence-sharded activation to next PP stage
+
+    Backward (auto-generated by autograd via fill/send vjps)
+      - send.vjp: recv gradient from next stage (fill)
+      - fill.vjp: send input gradient to previous stage (send)
+      No manual backward PP comms needed!
+
+    Optimizer
+      ZeRO-1 (reduce-scatter grad → Adam shard update → allgather
+      param) over the DP group.
+    """
+    clear_checkpoint_registry()
+
+    # ---- group handles (this GPU's local view) ----
+    tp = Group("tp", id=0, size=tp_size)
+    dp = Group("dp", id=0, size=dp_size)
+
+    prev_pp_rank = pp_stage - 1          # source for fwd activation
+    next_pp_rank = pp_stage + 1          # dest   for fwd activation
+
+    # ---- hyperparams visible to this rank ----
+    # Parameters use full logical shapes with shard specs
+
+    # ---- parameters (TP-sharded, logical shapes) ----
+    w1_col = parameter(
+        (hidden, inter), name="w1_col",
+        tp_group=tp, shard=ShardSpec("sharded", axis=1, parts=tp_size),
+    )
+    w2_row = parameter(
+        (inter, hidden), name="w2_row",
+        tp_group=tp, shard=ShardSpec("sharded", axis=0, parts=tp_size),
+    )
+    params = [w1_col, w2_row]
+
+    # With SP the activation is sequence-sharded across TP ranks
+    # Logical shape is the full (unsharded) activation
+    tokens = seq * batch
+    act_shape = (tokens, hidden)               # full logical shape
+    act_shard = ShardSpec("sharded", axis=0, parts=tp_size)  # seq-sharded
+    act_bytes_sp = bytes_of((tokens // tp_size, hidden), "fp16")  # physical bytes
+
+    pp_label_fwd = f"iter0.mb0.stage{pp_stage}.fwd"
+
+    # ================================================================
+    # Forward pass  (Sequence Parallelism)
+    # ================================================================
+    # 1. Fill (recv) sequence-sharded activation from previous PP stage
+    placeholder = Tensor(
+        shape=act_shape, dtype="fp16",
+        memory_category=MemoryCategory.NOT_MATERIALIZED,
+        requires_grad=True,
+        name="pp.recv_act.placeholder",
+        shard=act_shard,
+        tp_group=tp,
+    )
+    x = fill(
+        placeholder, src=prev_pp_rank, bytes=act_bytes_sp, tag=0,
+        label=pp_label_fwd, name="pp.recv_act",
+    )
+
+    # 2. Megatron MLP with Sequence Parallelism
+    #    AllGather before column-parallel linear, ReduceScatter after row-parallel linear
+    y = megatron_mlp_sp(x, w1_col, w2_row, tp_group=tp, seq_axis=0, name="stage.mlp")
+
+    # 3. Send sequence-sharded activation to next PP stage
+    loss = send(
+        y, dst=next_pp_rank, bytes=act_bytes_sp, tag=0,
+        label=pp_label_fwd, name="pp.send_act",
+    )
+
+    # ================================================================
+    # Backward pass — fully auto-generated!
+    # ================================================================
+    # send.vjp: creates fill (recv grad from next stage)
+    # fill.vjp: creates send (send grad to prev stage)
+    grads = backward(loss, wrt=params + [placeholder])
+
+    # The gradient of `placeholder` is a send op (auto-generated by fill.vjp).
+    # We must include it in the graph roots so it's not pruned.
+    deps = []
+    if placeholder in grads:
+        deps.append(grads[placeholder])
+
+    # ================================================================
+    # ZeRO-1 optimizer step (DP collectives)
+    # ================================================================
+    new_params, opt_done_tok = zero1_optimizer_step(
+        params, grads, plan=Zero1Plan(dp_group=dp), name="zero1",
+    )
+
+    # ---- collect all graph roots ----
+    done = sink(*deps, opt_done_tok, name="stage.done")
+    g = get_graph(done)
+    return g
+
+
+# ====================================================================
+# PP-only example: microbatch scheduling + training + inference
+# ====================================================================
+
+def build_pp_microbatch(
+    pp_stage: int = 1,
+    pp_size: int = 3,
+    num_microbatches: int = 4,
+    hidden: int = 64,
+):
+    """
+    PP-only pipeline stage with microbatch scheduling.
+
+    Layout (PP=3, middle stage 1):
+
+      stage 0  ──►  **stage 1**  ──►  stage 2
+
+    Training (1 iteration, gradient accumulation over microbatches):
+      For each microbatch m:
+        fwd:  fill(placeholder_m) → matmul → act → matmul → send
+        bwd:  backward auto-generates recv-grad → grad-compute → send-grad
+      Accumulate per-microbatch gradients → adam_update
+
+    Inference:
+      After training, run one forward pass on the updated weights (no grad).
+    """
+    clear_checkpoint_registry()
+
+    prev_rank = pp_stage - 1
+    next_rank = pp_stage + 1
+    act_shape = (hidden, hidden)
+    act_bytes = bytes_of(act_shape, "fp16")
+
+    # ---- parameters ----
+    w1 = parameter((hidden, hidden), name="w1")
+    w2 = parameter((hidden, hidden), name="w2")
+    params = [w1, w2]
+
+    # ==============================================================
+    # Training: forward + backward per microbatch
+    # ==============================================================
+    placeholders = []
+    losses = []
+
+    for mb in range(num_microbatches):
+        label = f"mb{mb}.fwd"
+
+        # Forward
+        ph = Tensor(
+            shape=act_shape, dtype="fp16",
+            memory_category=MemoryCategory.NOT_MATERIALIZED,
+            requires_grad=True,
+            name=f"mb{mb}.ph",
+        )
+        x = fill(ph, src=prev_rank, bytes=act_bytes, tag=mb,
+                 label=label, name=f"mb{mb}.recv_act")
+        h = matmul(x, w1, name=f"mb{mb}.linear1")
+        h = activation(h, name=f"mb{mb}.act")
+        h = matmul(h, w2, name=f"mb{mb}.linear2")
+        loss_mb = send(h, dst=next_rank, bytes=act_bytes, tag=mb,
+                       label=label, name=f"mb{mb}.send_act")
+
+        placeholders.append(ph)
+        losses.append(loss_mb)
+
+    # Backward per microbatch
+    all_grads = []
+    bwd_deps = []
+    for mb in range(num_microbatches):
+        grads_mb = backward(losses[mb], wrt=params + [placeholders[mb]])
+        all_grads.append(grads_mb)
+        # The gradient of placeholder is a send (auto-generated), keep it
+        if placeholders[mb] in grads_mb:
+            bwd_deps.append(grads_mb[placeholders[mb]])
+
+    # Accumulate gradients across microbatches
+    accumulated = {}
+    for p in params:
+        g = all_grads[0][p]
+        for mb in range(1, num_microbatches):
+            g = add(g, all_grads[mb][p], name=f"acc_grad.{p.name}.mb{mb}")
+        accumulated[p] = g
+
+    # Adam update
+    new_w1 = adam_update(w1, accumulated[w1], name="adam.w1")
+    new_w2 = adam_update(w2, accumulated[w2], name="adam.w2")
+
+    # ==============================================================
+    # Inference: one forward pass on updated weights (no grad)
+    # ==============================================================
+    # Detach so backward doesn't flow into inference
+    inf_w1 = detach(new_w1, name="inf.w1")
+    inf_w2 = detach(new_w2, name="inf.w2")
+
+    inf_ph = Tensor(
+        shape=act_shape, dtype="fp16",
+        memory_category=MemoryCategory.NOT_MATERIALIZED,
+        requires_grad=False,
+        name="inf.ph",
+    )
+    inf_x = fill(inf_ph, src=prev_rank, bytes=act_bytes, tag=100,
+                 label="inf.fwd", name="inf.recv_act")
+    inf_h = matmul(inf_x, inf_w1, name="inf.linear1")
+    inf_h = activation(inf_h, name="inf.act")
+    inf_h = matmul(inf_h, inf_w2, name="inf.linear2")
+    inf_sent = send(inf_h, dst=next_rank, bytes=act_bytes, tag=100,
+                    label="inf.fwd", name="inf.send_act")
+
+    # ---- graph roots ----
+    done = sink(*bwd_deps, inf_sent, name="all.done")
+    g = get_graph(done)
+    return g
+
+
+# ====================================================================
+# DP-only example with gather_on_demand ZeRO-1
+# ====================================================================
+
+def build_dp_gather_on_demand(
+    dp_size: int = 4,
+    hidden: int = 256,
+    inter: int = 1024,
+    batch: int = 32,
+    num_iterations: int = 2,
+):
+    """
+    DP-only training with ZeRO-1 in gather_on_demand mode.
+
+    Each iteration:
+      1. allgather params (deferred from previous optimizer step)
+      2. forward:  matmul → activation → matmul
+      3. backward
+      4. zero1_optimizer_step (reduce-scatter grad → Adam shard)
+         — returns DP-sharded params, NO allgather yet
+
+    The allgather is deferred to step 1 of the *next* iteration,
+    giving the scheduler room to overlap it with other work.
+    """
+    clear_checkpoint_registry()
+
+    dp = Group("dp", id=0, size=dp_size)
+    plan = Zero1Plan(dp_group=dp, gather_policy="gather_on_demand")
+
+    # ---- initial parameters ----
+    w1 = parameter((hidden, inter), name="w1", dp_group=dp)
+    w2 = parameter((inter, hidden), name="w2", dp_group=dp)
+    orig_params = [w1, w2]          # keep for metadata restoration
+    params = list(orig_params)
+
+    prev_tok = None
+    all_tokens = []
+
+    for it in range(num_iterations):
+        # If we have sharded params from a previous optimizer step,
+        # allgather them now ("gather on demand").
+        if prev_tok is not None:
+            params, gather_tok = zero1_gather_params(
+                params, orig_params,
+                plan=plan,
+                name=f"iter{it}.zero1",
+            )
+            all_tokens.append(gather_tok)
+
+        # Detach params (stop gradient flow between iterations)
+        params = [
+            detach(p, name=f"iter{it}.{p.name}" if p.name else None)
+            for p in params
+        ]
+
+        # ---- forward ----
+        x = input_tensor((batch, hidden), name=f"iter{it}.x")
+        h = matmul(x, params[0], name=f"iter{it}.linear1")
+        h = activation(h, name=f"iter{it}.act")
+        loss = matmul(h, params[1], name=f"iter{it}.linear2")
+
+        # ---- backward ----
+        grads = backward(loss, wrt=params)
+
+        # ---- ZeRO-1 optimizer (gather_on_demand) ----
+        params, opt_tok = zero1_optimizer_step(
+            params, grads,
+            plan=plan,
+            name=f"iter{it}.zero1",
+        )
+        all_tokens.append(opt_tok)
+        prev_tok = opt_tok
+
+    done = sink(*all_tokens, name="training.done")
+    g = get_graph(done)
+    return g
+
+
+if __name__ == "__main__":
+    # Build training with checkpoints
+    print("=" * 60)
+    print("WITH GRADIENT CHECKPOINTING")
+    print("Checkpoint covers: linear1 + linear2")
+    print("Outside checkpoint: linear3")
+    print("=" * 60)
+    g_ckpt = build_full_training(num_iterations=2, use_checkpoint=True)
+    
+    print(f"\nGraph has {len(g_ckpt.nodes)} nodes")
+    print_graph_summary(g_ckpt)
+    
+    visualize_graph(g_ckpt, output='graph_3layer_checkpoint', format='svg', show_tensors=True)
+    print("\nSaved to graph_3layer_checkpoint.svg")
+    
+    # Build training without checkpoints
+    print("\n" + "=" * 60)
+    print("WITHOUT GRADIENT CHECKPOINTING")
+    print("All layers saved (no checkpoint)")
+    print("=" * 60)
+    g_no_ckpt = build_full_training(num_iterations=2, use_checkpoint=False)
+    
+    print(f"\nGraph has {len(g_no_ckpt.nodes)} nodes")
+    print_graph_summary(g_no_ckpt)
+    
+    visualize_graph(g_no_ckpt, output='graph_3layer_no_checkpoint', format='svg', show_tensors=True)
+    print("\nSaved to graph_3layer_no_checkpoint.svg")
+
+    # ================================================================
+    # Distributed example: TP=4, DP=4, PP=8  (single GPU, middle stage)
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("DISTRIBUTED: TP=4, DP=4, PP=8  (single GPU, PP stage 3)")
+    print("  Megatron MLP with TP + Sequence Parallelism")
+    print("  ZeRO-1 optimizer (DP reduce-scatter + allgather)")
+    print("  PP send/recv for activations & gradients")
+    print("=" * 60)
+    g_dist = build_distributed_single_gpu()
+    print(f"\nGraph has {len(g_dist.nodes)} nodes")
+    print_graph_summary(g_dist)
+    visualize_graph(g_dist, output='graph_distributed', format='svg', show_tensors=True)
+    print("\nSaved to graph_distributed.svg")
+
+    # ================================================================
+    # PP microbatch example: 4 microbatches, grad accum, then inference
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("PP MICROBATCH: PP=3, stage 1, 2 microbatches")
+    print("  Training: fill/send per mb, backward auto-comms, grad accum")
+    print("  Inference: 1 forward pass on adam-updated weights")
+    print("=" * 60)
+    g_pp = build_pp_microbatch(num_microbatches=2)
+    print(f"\nGraph has {len(g_pp.nodes)} nodes")
+    print_graph_summary(g_pp)
+    visualize_graph(g_pp, output='graph_pp_microbatch', format='svg', show_tensors=True)
+    print("\nSaved to graph_pp_microbatch.svg")
+
+    # ================================================================
+    # DP-only with gather_on_demand ZeRO-1
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("DP-ONLY: gather_on_demand ZeRO-1, 2 iterations")
+    print("  Optimizer returns DP-sharded params")
+    print("  Allgather deferred to start of next iteration")
+    print("=" * 60)
+    g_dp = build_dp_gather_on_demand(num_iterations=2)
+    print(f"\nGraph has {len(g_dp.nodes)} nodes")
+    print_graph_summary(g_dp)
+    visualize_graph(g_dp, output='graph_dp_gather_on_demand', format='svg', show_tensors=True)
+    print("\nSaved to graph_dp_gather_on_demand.svg")
