@@ -93,12 +93,16 @@ def _get_node_label(node: OpNode) -> str:
         pass
     
     # Add op-specific info
-    if hasattr(node, 'm') and hasattr(node, 'n') and hasattr(node, 'k'):
-        lines.append(f"[{node.m}×{node.k}]×[{node.k}×{node.n}]")
-    elif hasattr(node, 'batch_size') and hasattr(node, 'seq_len_q'):
-        lines.append(f"B={node.batch_size}, S={node.seq_len_q}")
-    elif hasattr(node, 'n') and hasattr(node, 'num_inputs'):
-        lines.append(f"n={node.n}, in={node.num_inputs}")
+    if hasattr(node, 'a_shape') and hasattr(node, 'b_shape'):
+        m, k = node.a_shape
+        _, n = node.b_shape
+        lines.append(f"[{m}×{k}]×[{k}×{n}]")
+    elif hasattr(node, 'q_shape') and hasattr(node, 'kv_shape'):
+        B, Sq, H, D = node.q_shape
+        lines.append(f"B={B}, S={Sq}")
+    elif hasattr(node, 'shape') and hasattr(node, 'num_inputs'):
+        from .utils import numel
+        lines.append(f"n={numel(node.shape)}, in={node.num_inputs}")
     elif hasattr(node, 'bytes'):
         lines.append(f"bytes={_format_num(node.bytes)}")
 

@@ -32,7 +32,6 @@ from simple_sim import (
     param_factory,
 )
 from simple_sim.ir import tensor_replace
-from simple_sim.utils import bytes_of
 from simple_sim.visualize import visualize_graph
 
 
@@ -178,7 +177,6 @@ def build_distributed_single_gpu(
     tokens = seq * batch
     act_shape = (tokens, hidden)               # full logical shape
     act_shard = ShardSpec("sharded", axis=0, parts=tp_size)  # seq-sharded
-    act_bytes_sp = bytes_of((tokens // tp_size, hidden), "fp16")  # physical bytes
 
     pp_label_fwd = f"iter0.mb0.stage{pp_stage}.fwd"
 
@@ -195,7 +193,7 @@ def build_distributed_single_gpu(
         tp_group=tp,
     )
     x = fill(
-        placeholder, src=prev_pp_rank, bytes=act_bytes_sp, tag=0,
+        placeholder, src=prev_pp_rank, tag=0,
         label=pp_label_fwd, name="pp.recv_act",
     )
 
@@ -205,7 +203,7 @@ def build_distributed_single_gpu(
 
     # 3. Send sequence-sharded activation to next PP stage
     loss = send(
-        y, dst=next_pp_rank, bytes=act_bytes_sp, tag=0,
+        y, dst=next_pp_rank, tag=0,
         label=pp_label_fwd, name="pp.send_act",
     )
 
@@ -266,7 +264,6 @@ def build_pp_microbatch(
     prev_rank = pp_stage - 1
     next_rank = pp_stage + 1
     act_shape = (hidden, hidden)
-    act_bytes = bytes_of(act_shape, "fp16")
 
     # ---- parameters ----
     w1 = parameter((hidden, hidden), name="w1")
@@ -289,12 +286,12 @@ def build_pp_microbatch(
             requires_grad=True,
             name=f"mb{mb}.ph",
         )
-        x = fill(ph, src=prev_rank, bytes=act_bytes, tag=mb,
+        x = fill(ph, src=prev_rank, tag=mb,
                  label=label, name=f"mb{mb}.recv_act")
         h = matmul(x, w1, name=f"mb{mb}.linear1")
         h = activation(h, name=f"mb{mb}.act")
         h = matmul(h, w2, name=f"mb{mb}.linear2")
-        loss_mb = send(h, dst=next_rank, bytes=act_bytes, tag=mb,
+        loss_mb = send(h, dst=next_rank, tag=mb,
                        label=label, name=f"mb{mb}.send_act")
 
         placeholders.append(ph)
@@ -335,12 +332,12 @@ def build_pp_microbatch(
         requires_grad=False,
         name="inf.ph",
     )
-    inf_x = fill(inf_ph, src=prev_rank, bytes=act_bytes, tag=100,
+    inf_x = fill(inf_ph, src=prev_rank, tag=100,
                  label="inf.fwd", name="inf.recv_act")
     inf_h = matmul(inf_x, inf_w1, name="inf.linear1")
     inf_h = activation(inf_h, name="inf.act")
     inf_h = matmul(inf_h, inf_w2, name="inf.linear2")
-    inf_sent = send(inf_h, dst=next_rank, bytes=act_bytes, tag=100,
+    inf_sent = send(inf_h, dst=next_rank, tag=100,
                     label="inf.fwd", name="inf.send_act")
 
     # ---- graph roots ----

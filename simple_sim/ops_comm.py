@@ -5,7 +5,7 @@ from typing import Dict, Sequence, Tuple
 
 from .ir import CommOp, Group, MemoryCategory, Tensor, Token, ShardSpec, tensor_replace
 from .ops_schedule import wait_for
-from .utils import bytes_of, numel
+from .utils import bytes_of
 
 
 # -------- helpers --------
@@ -30,11 +30,15 @@ class FillOp(CommOp):
     In *recv mode* (no source), data arrives from the network.
     In *local fill mode* (source given), data is copied locally.
     """
-    bytes: int = 0
     src: int = -1
     tag: int = 0
     label: str = ""
     kind: str = field(default="fill", init=False)
+
+    @property
+    def bytes(self) -> int:
+        t = next(v for v in self.inputs if isinstance(v, Tensor))
+        return bytes_of(t.physical_shape(), t.dtype)
 
     @property
     def display_kind(self) -> str:
@@ -58,7 +62,7 @@ class FillOp(CommOp):
             if not placeholder.requires_grad:
                 return {}
             sent = send(
-                grad_output, dst=self.src, bytes=self.bytes,
+                grad_output, dst=self.src,
                 tag=self.tag, label=_bwd_label(self.label),
                 name=f"bwd_send({placeholder.name})" if placeholder.name else None,
             )
@@ -70,7 +74,6 @@ def fill(
     source: Tensor | None = None,
     *,
     src: int = -1,
-    bytes: int = 0,
     tag: int = 0,
     label: str = "",
     name: str | None = None,
@@ -84,7 +87,7 @@ def fill(
     ``requires_grad`` is inherited from *placeholder*.
     """
     inputs = (placeholder,) if source is None else (placeholder, source)
-    node = FillOp(bytes=bytes, src=src, tag=tag, label=label, inputs=inputs)
+    node = FillOp(src=src, tag=tag, label=label, inputs=inputs)
     return Tensor(
         shape=placeholder.shape,
         dtype=placeholder.dtype,
@@ -104,39 +107,26 @@ class SendOp(CommOp):
     Returns a NOT_MATERIALIZED tensor that aliases the input, keeping
     the original data accessible after the send.
     """
-    bytes: int = 0
     dst: int = -1
     tag: int = 0
     label: str = ""
     kind: str = field(default="send", init=False)
+
+    @property
+    def bytes(self) -> int:
+        t = next(v for v in self.inputs if isinstance(v, Tensor))
+        return bytes_of(t.physical_shape(), t.dtype)
 
     def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
         (x,) = [v for v in self.inputs if isinstance(v, Tensor)]
         if not x.requires_grad:
             return {}
         # Recv gradient from the rank we sent to.
-        # Propagate shard / tp_group / dp_group so the backward placeholder
-        # carries the same logical-shape + shard metadata as the forward tensor.
-        bwd_placeholder = Tensor(
-            shape=grad_output.shape,
-            dtype=grad_output.dtype,
-            memory_category=MemoryCategory.NOT_MATERIALIZED,
-            requires_grad=False,
-            name=f"bwd_placeholder({x.name})" if x.name else None,
-            shard=grad_output.shard,
-            tp_group=grad_output.tp_group,
-            dp_group=grad_output.dp_group,
-        )
-        raw_grad = fill(
-            bwd_placeholder, src=self.dst, bytes=self.bytes,
+        # grad_output is already a NOT_MATERIALIZED tensor, so we can recv directly into it.
+        grad_x = fill(
+            grad_output, src=self.dst,
             tag=self.tag, label=_bwd_label(self.label),
-            name=f"bwd_recv({x.name})" if x.name else None,
-        )
-        # Gate behind grad_output to maintain causal ordering:
-        # the backward recv cannot complete before the forward send.
-        grad_x = wait_for(
-            raw_grad, grad_output,
-            name=f"bwd_recv_gated({x.name})" if x.name else None,
+            name=f"bwd_recv({x.name})" if x.name else None
         )
         return {x: grad_x}
 
@@ -145,7 +135,6 @@ def send(
     x: Tensor,
     *,
     dst: int,
-    bytes: int,
     tag: int = 0,
     label: str = "",
     name: str | None = None,
@@ -155,7 +144,7 @@ def send(
     Returns a NOT_MATERIALIZED tensor that aliases *x*, serving as
     a dependency token while keeping the data accessible.
     """
-    node = SendOp(bytes=bytes, dst=dst, tag=tag, label=label, inputs=(x,))
+    node = SendOp(dst=dst, tag=tag, label=label, inputs=(x,))
     return Tensor(
         shape=x.shape,
         dtype=x.dtype,
@@ -185,9 +174,13 @@ def sink(*deps: Token | Tensor, name: str | None = None) -> Token:
 
 @dataclass(frozen=True, eq=False)
 class AllReduceOp(CommOp):
-    bytes: int = 0
     group: Group = Group("tp", 0, 1)
     kind: str = field(default="allreduce", init=False)
+
+    @property
+    def bytes(self) -> int:
+        t = next(v for v in self.inputs if isinstance(v, Tensor))
+        return bytes_of(t.physical_shape(), t.dtype)
 
     def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
         # AllReduce is linear: gradient is also allreduce
@@ -197,9 +190,8 @@ class AllReduceOp(CommOp):
         dx, _tok = allreduce(grad_output, group=self.group, name=f"d_allreduce({x.name})")
         return {x: dx}
 
-def allreduce(x: Tensor, *, group: Group, bytes: int | None = None, name: str | None = None) -> Tuple[Tensor, Token]:
-    b = bytes if bytes is not None else bytes_of(x.physical_shape(), x.dtype)
-    node = AllReduceOp(bytes=b, group=group, inputs=(x,))
+def allreduce(x: Tensor, *, group: Group, name: str | None = None) -> Tuple[Tensor, Token]:
+    node = AllReduceOp(group=group, inputs=(x,))
     y = tensor_replace(x, producer=node, name=name, requires_grad=x.requires_grad, tp_group=group,
                         memory_category=MemoryCategory.MATERIALIZED, aliases=None)
     tok = Token(producer=node, name=(None if name is None else name + ".tok"))
@@ -208,9 +200,13 @@ def allreduce(x: Tensor, *, group: Group, bytes: int | None = None, name: str | 
 
 @dataclass(frozen=True, eq=False)
 class ReduceScatterOp(CommOp):
-    bytes: int = 0
     group: Group = Group("dp", 0, 1)
     kind: str = field(default="reduce_scatter", init=False)
+
+    @property
+    def bytes(self) -> int:
+        t = next(v for v in self.inputs if isinstance(v, Tensor))
+        return bytes_of(t.physical_shape(), t.dtype)
 
     def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
         # ReduceScatter is linear: gradient is allgather
@@ -220,7 +216,7 @@ class ReduceScatterOp(CommOp):
         dx, _tok = allgather(grad_output, group=self.group, name=f"d_reduce_scatter({x.name})")
         return {x: dx}
 
-def reduce_scatter(x: Tensor, *, group: Group, shard_axis: int = 0, bytes: int | None = None, name: str | None = None) -> Tuple[Tensor, Token]:
+def reduce_scatter(x: Tensor, *, group: Group, shard_axis: int = 0, name: str | None = None) -> Tuple[Tensor, Token]:
     """
     ReduceScatter: reduces across the group and scatters shards.
 
@@ -230,8 +226,7 @@ def reduce_scatter(x: Tensor, *, group: Group, shard_axis: int = 0, bytes: int |
     """
     assert x.shape[shard_axis] % group.size == 0, "shape not divisible for reduce_scatter"
 
-    b = bytes if bytes is not None else bytes_of(x.physical_shape(), x.dtype)
-    node = ReduceScatterOp(bytes=b, group=group, inputs=(x,))
+    node = ReduceScatterOp(group=group, inputs=(x,))
     y = tensor_replace(
         x,
         producer=node,
@@ -248,10 +243,15 @@ def reduce_scatter(x: Tensor, *, group: Group, shard_axis: int = 0, bytes: int |
 
 @dataclass(frozen=True, eq=False)
 class AllGatherOp(CommOp):
-    bytes: int = 0
     group: Group = Group("dp", 0, 1)
     shard_axis: int = 0
     kind: str = field(default="allgather", init=False)
+
+    @property
+    def bytes(self) -> int:
+        t = next(v for v in self.inputs if isinstance(v, Tensor))
+        # AllGather output is the full (unshard) tensor size
+        return bytes_of(t.shape, t.dtype)
 
     def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
         # AllGather is linear: gradient is reduce_scatter
@@ -261,7 +261,7 @@ class AllGatherOp(CommOp):
         dx, _tok = reduce_scatter(grad_output, group=self.group, shard_axis=self.shard_axis, name=f"d_allgather({x.name})")
         return {x: dx}
 
-def allgather(x_shard: Tensor, *, group: Group, bytes: int | None = None, name: str | None = None) -> Tuple[Tensor, Token]:
+def allgather(x_shard: Tensor, *, group: Group, name: str | None = None) -> Tuple[Tensor, Token]:
     """AllGather: gathers shards across the group.
 
     The output tensor keeps the same logical shape as the input.
@@ -269,8 +269,7 @@ def allgather(x_shard: Tensor, *, group: Group, bytes: int | None = None, name: 
     """
     # Derive shard_axis from the input tensor's shard spec
     shard_axis = x_shard.shard.axis if x_shard.shard.axis is not None else 0
-    b = bytes if bytes is not None else bytes_of(x_shard.shape, x_shard.dtype)
-    node = AllGatherOp(bytes=b, group=group, shard_axis=shard_axis, inputs=(x_shard,))
+    node = AllGatherOp(group=group, shard_axis=shard_axis, inputs=(x_shard,))
     y = tensor_replace(
         x_shard,
         producer=node,

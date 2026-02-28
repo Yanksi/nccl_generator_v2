@@ -58,16 +58,17 @@ class ElementwiseOp(ComputeOp):
     - Binary (add, mul, sub): num_inputs=2, num_outputs=1
     - Adam update: num_inputs=4, num_outputs=3 (reads p,g,m,v; writes p,m,v)
     """
-    n: int = 0  # elements per tensor
+    shape: tuple[int, ...] = ()  # physical shape of each tensor
     num_inputs: int = 1
     num_outputs: int = 1
     kind: str = "elementwise"
 
     def get_cost_meta(self) -> CostMeta:
+        n = numel(self.shape)
         return {
-            "flops": self.n,  # Approximate, doesn't matter for memory-bound
-            "mem_read": self.num_inputs * self.n,
-            "mem_write": self.num_outputs * self.n,
+            "flops": n,  # Approximate, doesn't matter for memory-bound
+            "mem_read": self.num_inputs * n,
+            "mem_write": self.num_outputs * n,
         }
 
     def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
@@ -93,8 +94,7 @@ def elementwise(*inputs: Tensor, num_outputs: int = 1, kind: str = "elementwise"
         assert t.shape == shape, f"shape mismatch: {shape} vs {t.shape}"
     
     # Use physical shape for cost model (actual per-rank computation)
-    phys_n = numel(inputs[0].physical_shape())
-    node = ElementwiseOp(n=phys_n, num_inputs=len(inputs), num_outputs=num_outputs, kind=kind, inputs=inputs)
+    node = ElementwiseOp(shape=inputs[0].physical_shape(), num_inputs=len(inputs), num_outputs=num_outputs, kind=kind, inputs=inputs)
     # Propagate shard spec from first input
     first_shard = inputs[0].shard
     return Tensor(
@@ -110,8 +110,17 @@ def elementwise(*inputs: Tensor, num_outputs: int = 1, kind: str = "elementwise"
 
 
 def ones_like(x: Tensor, *, name: str | None = None) -> Tensor:
-    """Create a tensor of ones with the same shape (no gradient needed)."""
-    node = ElementwiseOp(n=numel(x.physical_shape()), num_inputs=1, num_outputs=1, kind="ones_like", inputs=(x,))
+    """Create a tensor of ones with the same shape (no gradient needed).
+
+    Uses a zero-cost :class:`ShapeChangeOp` with ``is_view=False``
+    to express that this tensor is a new constant derived from *x*'s
+    metadata, not a view of *x*'s data.
+    """
+    node = ShapeChangeOp(
+        input_shape=(), output_shape=(), has_cost=False,
+        kind="ones_like", is_view=False,
+        inputs=(x,),
+    )
     return Tensor(shape=x.shape, dtype=x.dtype, producer=node, requires_grad=False,
                   name=name, tp_group=x.tp_group, dp_group=x.dp_group,
                   memory_category=MemoryCategory.NOT_MATERIALIZED,
@@ -137,40 +146,53 @@ def add(a: Tensor, b: Tensor, *, name: str | None = None) -> Tensor:
 @dataclass(frozen=True, eq=False)
 class ShapeChangeOp(ComputeOp):
     """
-    Operation that changes tensor shape with configurable cost model.
-    
-    Covers:
-    - View ops (reshape, transpose): has_cost=False, zero data movement
-    - Reduction (sum, mean): has_cost=True, reads input_n, writes output_n
-    - Broadcast: has_cost=True, reads input_n, writes output_n (opposite direction)
-    
-    The VJP is always a shape change in the opposite direction with the same cost model.
+    Operation that produces a tensor whose shape is derived from its input.
+
+    ``is_view`` controls whether the output shares the input's data:
+
+    * ``is_view=True`` (default) — the output is a *view* of the input,
+      sharing the same underlying data (reshape, transpose).  Zero cost;
+      VJP is the inverse shape change.
+
+    * ``is_view=False`` — the output contains *independent* data.
+      - If ``has_cost=True`` (reduction, broadcast): real data movement;
+        VJP is the inverse shape change with matching cost.
+      - If ``has_cost=False`` (ones_like, causal mask): a zero-cost
+        constant derived from the input's metadata; VJP returns no
+        gradients.
     """
-    input_n: int = 0
-    output_n: int = 0
-    has_cost: bool = False  # If True, actual data movement; if False, zero-cost view
-    kind: str = "reshape"   # Configurable: "reshape", "reduction", "broadcast"
+    input_shape: tuple[int, ...] = ()
+    output_shape: tuple[int, ...] = ()
+    has_cost: bool = False
+    kind: str = "reshape"
+    is_view: bool = True  # True → output aliases/views input data
 
     def get_cost_meta(self) -> CostMeta:
         if self.has_cost:
-            return {"flops": self.output_n, "mem_read": self.input_n, "mem_write": self.output_n}
+            in_n = numel(self.input_shape)
+            out_n = numel(self.output_shape)
+            return {"flops": out_n, "mem_read": in_n, "mem_write": out_n}
         return {"flops": 0, "mem_read": 0, "mem_write": 0}
 
     def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
+        if not self.is_view and not self.has_cost:
+            # Zero-cost constant (ones_like, causal mask) — no gradient.
+            return {}
         (x,) = [v for v in self.inputs if isinstance(v, Tensor)]
         if not x.requires_grad:
             return {}
         # Backward is shape change in opposite direction
         bwd_kind = "broadcast" if self.kind == "reduction" else ("reduction" if self.kind == "broadcast" else "reshape")
         bwd_node = ShapeChangeOp(
-            input_n=self.output_n,
-            output_n=self.input_n,
+            input_shape=self.output_shape,
+            output_shape=self.input_shape,
             has_cost=self.has_cost,
             kind=bwd_kind,
+            is_view=self.is_view,
             inputs=(grad_output,),
         )
-        mem_cat = MemoryCategory.NOT_MATERIALIZED if not self.has_cost else MemoryCategory.MATERIALIZED
-        alias = grad_output if not self.has_cost else None
+        mem_cat = MemoryCategory.NOT_MATERIALIZED if self.is_view else MemoryCategory.MATERIALIZED
+        alias = grad_output if self.is_view else None
         return {x: tensor_replace(x, producer=bwd_node, name=f"d({x.name})", memory_category=mem_cat, aliases=alias)}
 
 
@@ -190,16 +212,15 @@ def reshape(x: Tensor, *, shape: Sequence[int], shard: ShardSpec | None = None, 
         assert log_in == log_out, (
             f"reshape logical size mismatch: {x.shape} ({log_in}) -> {shape} ({log_out})"
         )
-        phys_n = numel(x.physical_shape())
         out_shard = shard
     else:
         phys_in = numel(x.physical_shape())
         phys_out = numel(tuple(shape))
         assert phys_in == phys_out, f"reshape size mismatch: physical {x.physical_shape()} ({phys_in}) -> {shape} ({phys_out})"
-        phys_n = phys_in
         out_shard = ShardSpec("replicated")
 
-    node = ShapeChangeOp(input_n=phys_n, output_n=phys_n, has_cost=False, kind="reshape", inputs=(x,))
+    phys_shape = x.physical_shape()
+    node = ShapeChangeOp(input_shape=phys_shape, output_shape=phys_shape, has_cost=False, kind="reshape", inputs=(x,))
     return Tensor(shape=tuple(shape), dtype=x.dtype, producer=node, requires_grad=x.requires_grad,
                   name=name, tp_group=x.tp_group, dp_group=x.dp_group,
                   shard=out_shard,
@@ -220,8 +241,8 @@ def transpose(x: Tensor, *, name: str | None = None) -> Tensor:
         new_shard = ShardSpec("sharded", axis=new_axis, parts=x.shard.parts)
     else:
         new_shard = x.shard
-    phys_n = numel(x.physical_shape())
-    node = ShapeChangeOp(input_n=phys_n, output_n=phys_n, has_cost=False, kind="reshape", inputs=(x,))
+    phys_shape = x.physical_shape()
+    node = ShapeChangeOp(input_shape=phys_shape, output_shape=phys_shape, has_cost=False, kind="reshape", inputs=(x,))
     return Tensor(shape=new_shape, dtype=x.dtype, producer=node, requires_grad=x.requires_grad,
                   name=name, tp_group=x.tp_group, dp_group=x.dp_group,
                   memory_category=MemoryCategory.NOT_MATERIALIZED, aliases=x,
@@ -230,9 +251,7 @@ def transpose(x: Tensor, *, name: str | None = None) -> Tensor:
 
 def reduction(x: Tensor, *, output_shape: Sequence[int], name: str | None = None) -> Tensor:
     """Reduction operation (sum, mean, max, etc.)."""
-    phys_in = numel(x.physical_shape())
-    phys_out = numel(tuple(output_shape))
-    node = ShapeChangeOp(input_n=phys_in, output_n=phys_out, has_cost=True, kind="reduction", inputs=(x,))
+    node = ShapeChangeOp(input_shape=x.physical_shape(), output_shape=tuple(output_shape), has_cost=True, kind="reduction", inputs=(x,))
     return Tensor(shape=tuple(output_shape), dtype=x.dtype, producer=node, requires_grad=x.requires_grad,
                   name=name, tp_group=x.tp_group, dp_group=x.dp_group)
 
@@ -249,16 +268,17 @@ class MatMulOp(ComputeOp):
     
     This is typically compute-bound on modern GPUs.
     """
-    m: int = 0
-    n: int = 0
-    k: int = 0
+    a_shape: tuple[int, ...] = ()  # physical shape of A: (m, k)
+    b_shape: tuple[int, ...] = ()  # physical shape of B: (k, n)
     kind: str = field(default="matmul", init=False)
 
     def get_cost_meta(self) -> CostMeta:
+        m, k = self.a_shape
+        _, n = self.b_shape
         return {
-            "flops": 2 * self.m * self.n * self.k,
-            "mem_read": self.m * self.k + self.k * self.n,
-            "mem_write": self.m * self.n,
+            "flops": 2 * m * n * k,
+            "mem_read": m * k + k * n,
+            "mem_write": m * n,
         }
 
     def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
@@ -274,12 +294,10 @@ class MatMulOp(ComputeOp):
 
 def matmul(a: Tensor, b: Tensor, *, name: str | None = None) -> Tensor:
     assert len(a.shape) == 2 and len(b.shape) == 2
-    # Use physical shapes for dimension matching and FLOPs
+    # Use physical shapes for dimension matching
     a_phys = a.physical_shape()
     b_phys = b.physical_shape()
-    m, k1 = a_phys
-    k2, n = b_phys
-    assert k1 == k2, f"matmul shape mismatch: physical {a_phys} x {b_phys} (logical {a.shape} x {b.shape})"
+    assert a_phys[1] == b_phys[0], f"matmul shape mismatch: physical {a_phys} x {b_phys} (logical {a.shape} x {b.shape})"
 
     # Output logical shape: derive from logical input shapes
     # For A[M_log, K_log] @ B[K_log, N_log] -> C[M_log, N_log]
@@ -299,7 +317,7 @@ def matmul(a: Tensor, b: Tensor, *, name: str | None = None) -> Tensor:
     elif b.shard.kind == "sharded" and b.shard.axis == 1:
         out_shard = b.shard
 
-    node = MatMulOp(m=m, n=n, k=k1, inputs=(a, b))
+    node = MatMulOp(a_shape=a_phys, b_shape=b_phys, inputs=(a, b))
     out = Tensor(
         shape=out_shape,
         dtype=a.dtype,
@@ -330,16 +348,13 @@ class AttentionOp(ComputeOp):
     
     Memory (FlashAttention): O(B*H*Sq*D) instead of O(B*H*Sq*Skv) - no attention matrix materialized.
     """
-    batch_size: int = 0
-    seq_len_q: int = 0
-    seq_len_kv: int = 0
-    num_heads: int = 0
-    head_dim: int = 0
+    q_shape: tuple[int, ...] = ()   # physical shape of Q: (B, Sq, H, D)
+    kv_shape: tuple[int, ...] = ()  # physical shape of K/V: (B, Skv, H, D)
     kind: str = field(default="attention", init=False)
 
     def get_cost_meta(self) -> CostMeta:
-        B, H, Sq, Skv, D = (self.batch_size, self.num_heads, 
-                            self.seq_len_q, self.seq_len_kv, self.head_dim)
+        B, Sq, H, D = self.q_shape
+        _, Skv, _, _ = self.kv_shape
         return {
             "flops": 4 * B * H * Sq * Skv * D,
             "mem_read": B * H * D * (Sq + 2 * Skv),
@@ -351,11 +366,8 @@ class AttentionOp(ComputeOp):
         
         # Create a single backward attention op with 2x cost
         bwd_node = AttentionBwdOp(
-            batch_size=self.batch_size,
-            seq_len_q=self.seq_len_q,
-            seq_len_kv=self.seq_len_kv,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
+            q_shape=self.q_shape,
+            kv_shape=self.kv_shape,
             inputs=(grad_output, q, k, v),
         )
         
@@ -377,16 +389,13 @@ class AttentionBwdOp(ComputeOp):
     
     Backward has 4 matmuls instead of 2 in forward, so ~2x forward cost.
     """
-    batch_size: int = 0
-    seq_len_q: int = 0
-    seq_len_kv: int = 0
-    num_heads: int = 0
-    head_dim: int = 0
+    q_shape: tuple[int, ...] = ()   # physical shape of Q: (B, Sq, H, D)
+    kv_shape: tuple[int, ...] = ()  # physical shape of K/V: (B, Skv, H, D)
     kind: str = field(default="attention_bwd", init=False)
 
     def get_cost_meta(self) -> CostMeta:
-        B, H, Sq, Skv, D = (self.batch_size, self.num_heads, 
-                            self.seq_len_q, self.seq_len_kv, self.head_dim)
+        B, Sq, H, D = self.q_shape
+        _, Skv, _, _ = self.kv_shape
         return {
             "flops": 2 * 4 * B * H * Sq * Skv * D,  # 2x forward
             "mem_read": B * H * D * (2 * Sq + 2 * Skv),  # dO, Q, K, V
@@ -419,26 +428,19 @@ def attention(
     assert len(k.shape) == 4, f"Expected 4D tensor for K, got {k.shape}"
     assert len(v.shape) == 4, f"Expected 4D tensor for V, got {v.shape}"
     
-    # Use physical shapes for dimension matching and cost model
+    # Use physical shapes for dimension matching
     q_phys = q.physical_shape()
     k_phys = k.physical_shape()
     v_phys = v.physical_shape()
     
-    batch, seq_q, num_heads, head_dim = q_phys
-    batch_k, seq_kv, num_heads_k, head_dim_k = k_phys
-    batch_v, seq_kv_v, num_heads_v, head_dim_v = v_phys
-    
-    assert batch == batch_k == batch_v, "Batch size mismatch"
-    assert num_heads == num_heads_k == num_heads_v, "Number of heads mismatch"
-    assert head_dim == head_dim_k == head_dim_v, "Head dimension mismatch"
-    assert seq_kv == seq_kv_v, "K and V sequence length mismatch"
+    assert q_phys[0] == k_phys[0] == v_phys[0], "Batch size mismatch"
+    assert q_phys[2] == k_phys[2] == v_phys[2], "Number of heads mismatch"
+    assert q_phys[3] == k_phys[3] == v_phys[3], "Head dimension mismatch"
+    assert k_phys[1] == v_phys[1], "K and V sequence length mismatch"
 
     node = AttentionOp(
-        batch_size=batch,
-        seq_len_q=seq_q,
-        seq_len_kv=seq_kv,
-        num_heads=num_heads,
-        head_dim=head_dim,
+        q_shape=q_phys,
+        kv_shape=k_phys,
         inputs=(q, k, v),
     )
     out = Tensor(
@@ -471,7 +473,7 @@ def adam_update_shard(param_full: Tensor, grad_shard: Tensor, *, name: str | Non
         Updated parameter shard
     """
     node = ElementwiseOp(
-        n=numel(grad_shard.physical_shape()),
+        shape=grad_shard.physical_shape(),
         num_inputs=4,  # reads: param, grad, momentum, variance
         num_outputs=3,  # writes: param, momentum, variance
         kind="adam_update",
@@ -506,7 +508,7 @@ def adam_update(param: Tensor, grad: Tensor, *, name: str | None = None) -> Tens
         Updated parameter tensor
     """
     node = ElementwiseOp(
-        n=numel(grad.physical_shape()),
+        shape=grad.physical_shape(),
         num_inputs=4,  # reads: param, grad, momentum, variance
         num_outputs=3,  # writes: param, momentum, variance
         kind="adam_update",

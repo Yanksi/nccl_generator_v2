@@ -26,7 +26,6 @@ from simple_sim import (
     get_graph, topo_sort, ExtractedGraph,
 )
 from simple_sim.tp_megatron import tp_column_linear, tp_row_linear
-from simple_sim.utils import bytes_of
 
 
 # ============================================================================
@@ -324,7 +323,6 @@ def build_pp_stage(
         )
         x = fill(
             placeholder, src=pp_prev,
-            bytes=bytes_of((batch_seq, H), "fp16"),
             tag=iteration * 1000 + pp_rank,
             name=f"iter{iteration}.pp_recv",
         )
@@ -374,7 +372,6 @@ def build_pp_stage(
         loss = send(
             x,
             dst=pp_next,
-            bytes=bytes_of((batch_seq, H), "fp16"),
             tag=iteration * 1000 + pp_rank + 1,
             name=f"iter{iteration}.pp_send",
         )
