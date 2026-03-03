@@ -6,10 +6,7 @@ from math import ceil
 from abc import ABC, abstractmethod
 from nccl_primitives import *
 from goal import GoalOp
-
-class CollAlgo(Enum):
-    TREE = 0
-    RING = 1
+from comm import Communicator, CollDevice, CommOp, CollAlgo
 
 class NCCLProto(Enum):
     LL = 0
@@ -26,15 +23,15 @@ class RingTopoNode:
     prev: GpuId
     nxt: GpuId
 
-class Communicator:
+class NCCLCommunicator(Communicator):
     def __init__(self, comm_id: str, gpu_ids: List[GpuId]):
-        self.comm_id: str = comm_id
-        self.rank2gpu_id: List[GpuId] = gpu_ids
-        self.gpu_id2rank: Dict[GpuId, int] = {gpu_id: i for i, gpu_id in enumerate(gpu_ids)}
-        self.n_ranks = len(gpu_ids)
+        super().__init__(comm_id, gpu_ids)
+        # for compatibility with the original interface
+        self.rank2gpu_id = self.rank2device_id
+        self.gpu_id2rank = self.device_id2rank
+        self.n_ranks = self.size
         self.tree_topo: Dict[GpuId, List[TreeTopoNode]] = {gpu_id: [] for gpu_id in gpu_ids}
         self.ring_topo: Dict[GpuId, List[RingTopoNode]] = {gpu_id: [] for gpu_id in gpu_ids}
-        self.rank2gpu_id.append(None) # when query rank -1, return None
     
     def add_tree_topo(self, gpu_rank: int, parent_rank: int, children_ranks: List[int]):
         gpu_id = self.rank2gpu_id[gpu_rank]
@@ -49,35 +46,34 @@ class Communicator:
         self.ring_topo[gpu_id].append(RingTopoNode(prev, nxt))
     
     def __repr__(self) -> str:
-        return f"Communicator(id={self.comm_id}, n_ranks={self.n_ranks})"
-
-
-class CommOp(ABC):
-    def __init__(self, gpu_id: GpuId, context: int):
-        self.gpu_id = gpu_id
-        self.context = context
-
+        return f"NCCLCommunicator(id={self.comm_id}, n_ranks={self.n_ranks})"
+    
+class NCCLCommOp(CommOp):
+    def __init__(self, gpu_id: GpuId, comm: NCCLCommunicator, context: int):
+        super().__init__(comm, context, gpu_id)
+        self.gpu_id = self.device_id # for compatibility with the original interface
+    
     @abstractmethod
     def to_primitives(self) -> NCCLPrimitiveComm:
         pass
-
-    def to_goal(self, gpu_id2goal_rank, starting_cpu_id, nic) -> GoalOp:
+    
+    def _to_goal(self, gpu_id2goal_rank, starting_cpu_id, nic) -> GoalOp:
         return self.to_primitives().to_goal(gpu_id2goal_rank, starting_cpu_id, nic)
 
-class CommGrouped(CommOp):
-    def __init__(self, gpu_id: GpuId, comm_ops: Union[List[CommOp], Generator[CommOp]], context: int):
-        super().__init__(gpu_id, context)
+
+class NCCLCommGrouped(NCCLCommOp):
+    def __init__(self, gpu_id: GpuId, comm_ops: Union[List[NCCLCommOp], Generator[NCCLCommOp]], context: int):
+        super().__init__(gpu_id, None, context)
         self.comm_ops = comm_ops
     
     def to_primitives(self) -> NCCLPrimitiveComm:
         result = NCCLPrimitiveParallel(self.gpu_id, False, (comm_op.to_primitives() for comm_op in self.comm_ops))
         return result
 
-class AllToAll(CommOp):
-    def __init__(self, gpu_id: GpuId, size_per_peer: int, comm: Communicator, chunk_size: int, context: int):
-        super().__init__(gpu_id, context)
+class NCCLAllToAll(NCCLCommOp):
+    def __init__(self, gpu_id: GpuId, size_per_peer: int, comm: NCCLCommunicator, chunk_size: int, context: int):
+        super().__init__(gpu_id, comm, context)
         self.size_per_peer = size_per_peer
-        self.comm = comm
         self.chunk_size = chunk_size
     
     def to_primitives(self) -> NCCLPrimitiveComm:
@@ -120,17 +116,17 @@ class AllToAll(CommOp):
         return result
 
 @dataclass
-class P2PChnlInfo:
+class NCCLP2PChnlInfo:
     Bytes: int
     proto: NCCLProto
     count: int
     chunk_size: int
     peer_rank: int
 
-class P2POp(CommOp, ABC):
-    def __init__(self, gpu_id: GpuId, comm: Communicator, chnl_infos: Union[List[P2PChnlInfo], Generator[P2PChnlInfo]], context: int):
-        super().__init__(gpu_id, context)
-        self.comm = comm
+class NCCLP2POp(NCCLCommOp, ABC):
+    def __init__(self, gpu_id: GpuId, comm: NCCLCommunicator, chnl_infos: Union[List[NCCLP2PChnlInfo], Generator[NCCLP2PChnlInfo]], context: int):
+        super().__init__(gpu_id, comm, context)
+        # self.comm = comm
         # self.peer_gpu_id = comm.rank2gpu_id[peer_rank]
         self.chnl_infos = chnl_infos
     
@@ -145,11 +141,11 @@ class P2POp(CommOp, ABC):
                 result.add(self._to_primitives_chnl(chnl_info))
             return result
 
-    def _to_primitives_chnl(self, chnl_info: P2PChnlInfo) -> NCCLPrimitiveComm:
+    def _to_primitives_chnl(self, chnl_info: NCCLP2PChnlInfo) -> NCCLPrimitiveComm:
         raise NotImplementedError()
 
-class Send(P2POp):
-    def _to_primitives_chnl(self, chnl_info: P2PChnlInfo) -> NCCLPrimitiveComm:
+class NCCLSend(NCCLP2POp):
+    def _to_primitives_chnl(self, chnl_info: NCCLP2PChnlInfo) -> NCCLPrimitiveComm:
         result = NCCLSend(self.context, self.gpu_id, target_gpu_id=self.comm.rank2gpu_id[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
         if chnl_info.proto == NCCLProto.LL:
             return result.proto_ll()
@@ -163,8 +159,8 @@ class Send(P2POp):
     #     return NCCLSend(self.context, self.gpu_id, target_gpu_id=self.comm.rank2gpu_id[self.peer_rank], size=self.size, chunk_size=self.chunk_size).proto_simple()
 
 
-class Recv(P2POp):
-    def _to_primitives_chnl(self, chnl_info: P2PChnlInfo) -> NCCLPrimitiveComm:
+class NCCLRecv(NCCLP2POp):
+    def _to_primitives_chnl(self, chnl_info: NCCLP2PChnlInfo) -> NCCLPrimitiveComm:
         result = NCCLRecv(self.context, self.gpu_id, source_gpu_id=self.comm.rank2gpu_id[chnl_info.peer_rank], size=chnl_info.count, chunk_size=chnl_info.chunk_size)
         if chnl_info.proto == NCCLProto.LL:
             return result.proto_ll()
@@ -176,7 +172,7 @@ class Recv(P2POp):
             raise ValueError(f"Unsupported proto: {chnl_info.proto}")
 
 @dataclass
-class CollInfo:
+class NCCLCollInfo:
     root_rank: int
     red_op: int
     algo: CollAlgo
@@ -190,7 +186,7 @@ class CollInfo:
     step_size: int
 
 @dataclass
-class CollChnlInfo:
+class NCCLCollChnlInfo:
     # n_warps: int
     count: int
     chunk_count: int
@@ -201,10 +197,10 @@ class CollChnlInfo:
     recv_buff: int
 
 
-class CollectiveOp(CommOp):
-    def __init__(self, gpu_id: GpuId, comm: Communicator, coll_info: CollInfo, coll_chnl_infos: Union[List[CollChnlInfo], Generator[CollChnlInfo]], context: int):
-        super().__init__(gpu_id, context)
-        self.comm = comm
+class NCCLCollectiveOp(NCCLCommOp):
+    def __init__(self, gpu_id: GpuId, comm: NCCLCommunicator, coll_info: NCCLCollInfo, coll_chnl_infos: Union[List[NCCLCollChnlInfo], Generator[NCCLCollChnlInfo]], context: int):
+        super().__init__(gpu_id, comm, context)
+        # self.comm = comm
         self.coll_info = coll_info
         self.coll_chnl_infos = coll_chnl_infos
 
@@ -247,7 +243,7 @@ class CollectiveOp(CommOp):
         return result
             
 
-class AllReduce(CollectiveOp):
+class NCCLAllReduce(NCCLCollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         n_ranks = comm.n_ranks
@@ -466,7 +462,7 @@ class AllReduce(CollectiveOp):
         return result
 
 
-class AllGather(CollectiveOp):
+class NCCLAllGather(NCCLCollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         n_ranks = comm.n_ranks
@@ -532,7 +528,7 @@ class AllGather(CollectiveOp):
         return chunk_comm
 
 
-class ReduceScatter(CollectiveOp):
+class NCCLReduceScatter(NCCLCollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         n_ranks = comm.n_ranks
@@ -586,7 +582,7 @@ class ReduceScatter(CollectiveOp):
         return chunk_comm
 
 
-class Reduce(CollectiveOp):
+class NCCLReduce(NCCLCollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         ring_topo_node = comm.ring_topo[self.gpu_id][chnl_id]
@@ -640,7 +636,7 @@ class Reduce(CollectiveOp):
         return result
 
 
-class Broadcast(CollectiveOp):
+class NCCLBroadcast(NCCLCollectiveOp):
     def _to_primitives_ring_chnl(self, chnl_id: int) -> NCCLPrimitiveComm:
         comm = self.comm
         ring_topo_node = comm.ring_topo[self.gpu_id][chnl_id]

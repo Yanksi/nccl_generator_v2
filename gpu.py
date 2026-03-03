@@ -29,16 +29,16 @@ class GPUStream:
         self.coll_ends.append(end)
     
     def __construct_collective(self, event_id: int):
-        from nccl_comm import P2POp, CollectiveOp
+        from nccl_comm import NCCLP2POp, NCCLCollectiveOp
         comm_data = self.self_gpu.dfs["comm_data"].loc[event_id]
         coll_class = comm_data["collective"]
-        if issubclass(coll_class, CollectiveOp):
-            from nccl_comm import CollInfo, CollChnlInfo
+        if issubclass(coll_class, NCCLCollectiveOp):
+            from nccl_comm import NCCLCollInfo, NCCLCollChnlInfo
             if event_id not in self.self_gpu.dfs["coll_info"].index:
                 logger.warning(f"Event ID {event_id} not found in coll_info for GPU {self.self_gpu.id}.")
                 return None
             coll_info_row = self.self_gpu.dfs["coll_info"].loc[event_id]
-            coll_info = CollInfo(
+            coll_info = NCCLCollInfo(
                 root_rank=int(coll_info_row["root"]),
                 red_op=int(coll_info_row["redOp"]),
                 algo=coll_info_row["algo"],
@@ -50,7 +50,7 @@ class GPUStream:
                 step_size=int(coll_info_row["stepSize"]),
             )
             coll_chnl_infos = self.self_gpu.dfs["coll_kernels"].get_group(event_id).apply(
-                lambda row: CollChnlInfo(
+                lambda row: NCCLCollChnlInfo(
                     count=int(row["count"]),
                     chunk_count=int(row["chunkCount"]),
                     work_count=int(row["workCount"]),
@@ -63,10 +63,10 @@ class GPUStream:
             )
             return coll_class(self.self_gpu.gpu_id, comm_data["communicator"], coll_info, coll_chnl_infos, comm_data["context_label"])
             
-        elif issubclass(coll_class, P2POp):
-            from nccl_comm import P2PChnlInfo
+        elif issubclass(coll_class, NCCLP2POp):
+            from nccl_comm import NCCLP2PChnlInfo
             p2p_chnl_infos = self.self_gpu.dfs["p2p_kernels"].get_group(event_id).apply(
-                lambda row: P2PChnlInfo(
+                lambda row: NCCLP2PChnlInfo(
                     Bytes=int(row["Bytes"]),
                     proto=row["proto"],
                     count=int(row["count"]),
@@ -83,14 +83,14 @@ class GPUStream:
         if self.self_gpu.dfs["comm_data"].loc[event_id]["groupId"] < 0:
             return self.__construct_collective(event_id)
         else:
-            from nccl_comm import CommGrouped
+            from nccl_comm import NCCLCommGrouped
             group_id = self.self_gpu.dfs["comm_data"].loc[event_id]["groupId"]
             if group_id in self.group_constructed:
                 return None
             self.group_constructed.add(group_id)
             grouped_event_ids = self.self_gpu.dfs["comm_data_grouped"].get_group(group_id)["eventId"].tolist()
             comm_ops = (self.__construct_collective(eid) for eid in grouped_event_ids)
-            return CommGrouped(self.self_gpu.gpu_id, comm_ops, self.self_gpu.dfs["comm_data"].loc[event_id]["context_label"])
+            return NCCLCommGrouped(self.self_gpu.gpu_id, comm_ops, self.self_gpu.dfs["comm_data"].loc[event_id]["context_label"])
 
     
     def generate_goal(self, starting_cpu_id: int, nic: int, gpu_id2goal_rank: Dict[GpuId, int]) -> Tuple[GoalOp, int]:

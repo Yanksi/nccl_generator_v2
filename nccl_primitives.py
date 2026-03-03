@@ -13,7 +13,7 @@ from scipy import interpolate
 from goal import GoalCalc, GoalOp, GoalParallel, GoalRecv, GoalSend, GoalSequential
 
 # GpuId is a tuple of (nodeId, pid) identifying a GPU
-GpuId = Tuple[str, int]
+GpuId = Union[Tuple[str, int], str]
 
 zero_price_reduction_copy = False
 zero_price_communication = False

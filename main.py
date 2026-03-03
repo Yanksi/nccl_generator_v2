@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 # %%
 def construct_communicators(
     comm_info: pd.DataFrame, comm_ring_info: pd.DataFrame, comm_tree_info: pd.DataFrame
-) -> Tuple[Dict[str, Communicator], Dict[Tuple[str, int], GPUDevice]]:
+) -> Tuple[Dict[str, NCCLCommunicator], Dict[Tuple[str, int], GPUDevice]]:
     logger.info("constructing communicator objects")
 
     # construct GPUDevice objects
@@ -49,7 +49,7 @@ def construct_communicators(
         .reset_index()
     )
     communicators = {
-        row["commId"]: Communicator(row["commId"], row["gpu_id"])
+        row["commId"]: NCCLCommunicator(row["commId"], row["gpu_id"])
         for _, row in comm_gpus_df.iterrows()
     }
 
@@ -358,13 +358,13 @@ if __name__ == "__main__":
     )
 
     comm_ops = {
-        "AllReduce": AllReduce,
-        "AllGather": AllGather,
-        "ReduceScatter": ReduceScatter,
-        "Broadcast": Broadcast,
-        "Reduce": Reduce,
-        "Send": Send,
-        "Recv": Recv,
+        "AllReduce": NCCLAllReduce,
+        "AllGather": NCCLAllGather,
+        "ReduceScatter": NCCLReduceScatter,
+        "Broadcast": NCCLBroadcast,
+        "Reduce": NCCLReduce,
+        "Send": NCCLSend,
+        "Recv": NCCLRecv,
     }
 
     comm_op_ids = {name: i for i, name in enumerate(comm_ops.keys())}
