@@ -538,9 +538,9 @@ class NCCLPrimitive(NCCLPrimitiveComm, ABC):
         return self._p_to_goal(gpu_id2goal_rank, cpu, nic, intra_send, intra_recv), cpu + 1
 
 
-class NCCLSend(NCCLPrimitive):
+class NCCLPSend(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLSend(target_gpu_id={self.target_gpu_id}, size={self.size})"
+        return f"NCCLPSend(target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
@@ -559,9 +559,9 @@ class NCCLSend(NCCLPrimitive):
             intra_node_send,
         )
 
-class NCCLCopySend(NCCLPrimitive):
+class NCCLPCopySend(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLCopySend(target_gpu_id={self.target_gpu_id}, size={self.size})"
+        return f"NCCLPCopySend(target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
@@ -587,9 +587,9 @@ class NCCLCopySend(NCCLPrimitive):
         )
 
 
-class NCCLRecv(NCCLPrimitive):
+class NCCLPRecv(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLRecv(source_gpu_id={self.source_gpu_id}, size={self.size})"
+        return f"NCCLPRecv(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
@@ -608,9 +608,9 @@ class NCCLRecv(NCCLPrimitive):
             intra_node_recv,
         )
 
-class NCCLReduce(NCCLPrimitive):
+class NCCLPReduce(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLReduce(source_gpu_id={self.source_gpu_id}, size={self.size})"
+        return f"NCCLPReduce(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
@@ -624,9 +624,9 @@ class NCCLReduce(NCCLPrimitive):
         return GoalCalc(reduction_time(self.size, self.__proto__), self_goal_rank, cpu)
 
 
-class NCCLCopy(NCCLPrimitive):
+class NCCLPCopy(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLCopy(size={self.size})"
+        return f"NCCLPCopy(size={self.size})"
 
     def _p_to_goal(
         self,
@@ -640,9 +640,9 @@ class NCCLCopy(NCCLPrimitive):
         return GoalCalc(copy_time(self.size, self.__proto__), self_goal_rank, cpu)
 
 
-class NCCLReduceCopy(NCCLPrimitive):
+class NCCLPReduceCopy(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLReduceCopy(size={self.size})"
+        return f"NCCLPReduceCopy(size={self.size})"
 
     def _p_to_goal(
         self,
@@ -661,9 +661,9 @@ class NCCLReduceCopy(NCCLPrimitive):
         )
 
 
-class NCCLRecvReduce(NCCLPrimitive):
+class NCCLPRecvReduce(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLRecvReduce(source_gpu_id={self.source_gpu_id}, size={self.size})"
+        return f"NCCLPRecvReduce(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
@@ -694,9 +694,9 @@ class NCCLRecvReduce(NCCLPrimitive):
         )
 
 
-class NCCLRecvReduceCopy(NCCLPrimitive):
+class NCCLPRecvReduceCopy(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLRecvReduceCopy(source_gpu_id={self.source_gpu_id}, size={self.size})"
+        return f"NCCLPRecvReduceCopy(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
@@ -730,9 +730,9 @@ class NCCLRecvReduceCopy(NCCLPrimitive):
         )
 
 
-class NCCLRecvCopySend(NCCLPrimitive):
+class NCCLPRecvCopySend(NCCLPrimitive):
     def __repr__(self) -> str:
-        return f"NCCLRecvCopySend(source_gpu_id={self.source_gpu_id}, target_gpu_id={self.target_gpu_id}, size={self.size})"
+        return f"NCCLPRecvCopySend(source_gpu_id={self.source_gpu_id}, target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
@@ -770,9 +770,9 @@ class NCCLRecvCopySend(NCCLPrimitive):
         )
 
 
-class NCCLRecvCopy(NCCLPrimitive):
+class NCCLPRecvCopy(NCCLPrimitive):
     def __repr__(self):
-        return f"NCCLRecvCopy(source_gpu_id={self.source_gpu_id}, size={self.size})"
+        return f"NCCLPRecvCopy(source_gpu_id={self.source_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
@@ -798,9 +798,9 @@ class NCCLRecvCopy(NCCLPrimitive):
         )
 
 
-class NCCLRecvReduceSend(NCCLPrimitive):
+class NCCLPRecvReduceSend(NCCLPrimitive):
     def __repr__(self):
-        return f"NCCLRecvReduceSend(source_gpu_id={self.source_gpu_id}, target_gpu_id={self.target_gpu_id}, size={self.size})"
+        return f"NCCLPRecvReduceSend(source_gpu_id={self.source_gpu_id}, target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
@@ -840,9 +840,9 @@ class NCCLRecvReduceSend(NCCLPrimitive):
         )
 
 
-class NCCLRecvReduceCopySend(NCCLPrimitive):
+class NCCLPRecvReduceCopySend(NCCLPrimitive):
     def __repr__(self):
-        return f"NCCLRecvReduceCopySend(source_gpu_id={self.source_gpu_id}, target_gpu_id={self.target_gpu_id}, size={self.size})"
+        return f"NCCLPRecvReduceCopySend(source_gpu_id={self.source_gpu_id}, target_gpu_id={self.target_gpu_id}, size={self.size})"
 
     def _p_to_goal(
         self,
