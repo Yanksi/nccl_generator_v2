@@ -57,7 +57,7 @@ class NCCLCommOp(CommOp):
     def to_primitives(self) -> NCCLPrimitiveComm:
         pass
     
-    def _to_goal(self, gpu_id2goal_rank, starting_cpu_id, nic) -> GoalOp:
+    def _to_goal(self, gpu_id2goal_rank, curr_device, starting_cpu_id, nic) -> GoalOp: # curr_device is ignored since NCCLCommOp always has an explicit gpu_id
         return self.to_primitives().to_goal(gpu_id2goal_rank, starting_cpu_id, nic)
 
 
