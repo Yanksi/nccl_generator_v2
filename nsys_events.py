@@ -38,12 +38,23 @@ from nsys_events_common import (
 )
 
 
+def _extract_node_id_from_trace_name(trace_name: str) -> str:
+    m = re.search(r"nid(\d+)", trace_name)
+    if m is not None:
+        return m.group(1)
+    # NCCL 2.28-style profile naming: profile_<jobid>_<node>_<rank>.sqlite
+    m = re.search(r"profile_(\d+)_(\d+)_(\d+)\.sqlite$", trace_name)
+    if m is not None:
+        return m.group(2)
+    return "0"
+
+
 def get_kernel_events(traces: List[os.PathLike]) -> pd.DataFrame:
     """Read kernel events from all trace files sequentially."""
     logger.info("querying for kernel events")
     kernel_dfs = []
     for trace_file in tqdm(traces):
-        node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
+        node_id = _extract_node_id_from_trace_name(trace_file.name)
         conn = sqlite3.connect(trace_file)
         df_tmp = pd.read_sql_query(
             "SELECT start, end, value, deviceId, streamId, globalPid / 0x1000000 % 0x1000000 AS pid FROM CUPTI_ACTIVITY_KIND_KERNEL cakk, StringIds si WHERE cakk.demangledName = si.id and si.value LIKE 'nccl%'",
@@ -72,7 +83,7 @@ def get_nvtx_events(traces: List[os.PathLike]) -> pd.DataFrame:
     logger.info("querying for nvtx events")
     nvtx_dfs = []
     for trace_file in tqdm(traces):
-        node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
+        node_id = _extract_node_id_from_trace_name(trace_file.name)
         conn = sqlite3.connect(trace_file)
         df_tmp = pd.read_sql_query(
             "SELECT start, end, text FROM NVTX_EVENTS",
@@ -305,10 +316,19 @@ def get_event_info(data: pd.DataFrame, comm_info: pd.DataFrame = None):
     )
     comm_data.drop(columns=["text"], inplace=True)
     comm_data["pid"] = comm_data["pid"].astype("Int64")
-    if comm_info is not None:
+    if comm_info is not None and len(comm_info) > 0:
+        # Include pid in the merge key to avoid duplicating events when multiple
+        # NCCL ranks share the same nodeId and commHash.
         comm_data = comm_data.merge(
-            comm_info[["nodeId", "commHash", "commId"]].drop_duplicates(), on=["nodeId", "commHash"], how="left"
+            comm_info[["nodeId", "pid", "commHash", "commId"]].drop_duplicates(),
+            on=["nodeId", "pid", "commHash"],
+            how="left",
         )
+    # Fallback for traces without "commHash ... commId ... rank ... nranks ..."
+    # markers: use commHash as communicator identifier.
+    if "commId" not in comm_data.columns:
+        comm_data["commId"] = pd.NA
+    comm_data["commId"] = comm_data["commId"].fillna(comm_data["commHash"])
         
     logger.info("extracting collective info events")
     coll_info_pattern = NVTX_PATTERNS["coll_info"]
