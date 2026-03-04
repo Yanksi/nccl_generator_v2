@@ -219,6 +219,8 @@ class NCCLPrimitiveParallel(NCCLPrimitiveComm):
         self.consumed = True and self.single_use
         if self.single_executer:
             ops = [p.to_goal(gpu_id2goal_rank, cpu, nic) for p in self.primitives]
+            if len(ops) == 0:
+                return GoalParallel([], gpu_id2goal_rank[self.gpu_id], cpu), cpu
             max_cpu = max(op[1] for op in ops)
             return GoalParallel(
                 list(op[0] for op in ops), gpu_id2goal_rank[self.gpu_id], cpu

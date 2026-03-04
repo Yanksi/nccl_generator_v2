@@ -343,7 +343,8 @@ def filter_time(
     logger.info("filtering events by profiling intervals")
     for gpu, gpu_df in tqdm(data.items(), total=len(data)):
         if gpu not in profiling_interval:
-            logger.warning(f"GPU {gpu} has no profiling interval, skipping filtering")
+            logger.warning(f"GPU {gpu} has no profiling interval, keeping unfiltered events")
+            result_dfs[gpu] = gpu_df.reset_index(drop=True)
             continue
         result_dfs[gpu] = filter_time_single(profiling_interval[gpu], gpu_df)
     return result_dfs
@@ -555,20 +556,20 @@ def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame, pro
         len(kernel_stream_collectives), len(nvtx_stream_collectives)
     ):
         logger.debug(f"nvtx_stream_collectives:\n{nvtx_stream_collectives}\nkernel_stream_collectives:\n{kernel_stream_collectives}")
-        raise ValueError(f"Mismatch in number of unique stream fingerprints {gpu}")
+        logger.warning(f"Mismatch in number of unique stream fingerprints {gpu}")
     
     unmatched_kernel_streams = stream_correspondence[
         stream_correspondence["stream"].isna()
     ]
     if len(unmatched_kernel_streams) != 0:
-        logger.error(
+        logger.warning(
             f"GPU {gpu}: unmatched kernel streams: {unmatched_kernel_streams['streamId'].tolist()}"
         )
         for row in unmatched_kernel_streams.itertuples():
-            logger.error(
+            logger.warning(
                 f"  kernel streamId: {row.streamId}, label: {row.label_kernel}, fingerprint: {row.fingerPrint}"
             )
-        raise ValueError("Unmatched kernel streams found")
+        stream_correspondence = stream_correspondence[~stream_correspondence["stream"].isna()]
 
     nvtxs["inStreamEventId"] = nvtxs.groupby("stream").cumcount()
     kernels["inStreamEventId"] = kernels.groupby("streamId").cumcount()

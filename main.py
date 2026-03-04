@@ -2,6 +2,9 @@
 import logging
 import multiprocessing
 import os
+import re
+import sys
+from collections import defaultdict
 
 # import aiofiles
 import pathlib
@@ -26,6 +29,7 @@ def construct_communicators(
     comm_info: pd.DataFrame, comm_ring_info: pd.DataFrame, comm_tree_info: pd.DataFrame
 ) -> Tuple[Dict[str, Communicator], Dict[Tuple[str, int], GPUDevice]]:
     logger.info("constructing communicator objects")
+    comm_info = comm_info.loc[:, ~comm_info.columns.duplicated()].copy()
 
     # construct GPUDevice objects
     gpus_df = comm_info[["nodeId", "pid"]].drop_duplicates()
@@ -33,15 +37,11 @@ def construct_communicators(
         (row["nodeId"], row["pid"]): GPUDevice(rank=i, node_id=row["nodeId"], pid=row["pid"])
         for i, (_, row) in enumerate(gpus_df.iterrows())
     }
-    comm_info = comm_info.copy()
     # Store gpu_id (nodeId, pid) tuples for Communicator construction
-    comm_info["gpu_id"] = comm_info.apply(
-        lambda row: (row["nodeId"], row["pid"]), axis=1
-    )
+    gpu_ids = [(row.nodeId, row.pid) for row in comm_info.itertuples(index=False)]
+    comm_info["gpu_id"] = gpu_ids
     # Also keep reference to GPUDevice for later use
-    comm_info["gpu"] = comm_info.apply(
-        lambda row: gpu_devices[(row["nodeId"], row["pid"])], axis=1
-    )
+    comm_info["gpu"] = [gpu_devices[gid] for gid in gpu_ids]
     comm_gpus_df = (
         comm_info.sort_values("rank")
         .groupby(["commId"])
@@ -71,6 +71,265 @@ def construct_communicators(
         )
 
     return communicators, gpu_devices
+
+
+def _infer_channels_by_comm(
+    comm_data: Dict[Tuple[str, int], pd.DataFrame],
+    coll_kernels: Dict[Tuple[str, int], pd.DataFrame],
+) -> Dict[str, int]:
+    ch_by_comm: Dict[str, int] = defaultdict(lambda: 1)
+    for gpu_id, gpu_coll_kernels in coll_kernels.items():
+        gpu_comm = comm_data.get(gpu_id)
+        if gpu_comm is None or len(gpu_comm) == 0 or len(gpu_coll_kernels) == 0:
+            continue
+        event_to_comm = (
+            gpu_comm[["eventId", "commId"]]
+            .dropna(subset=["eventId", "commId"])
+            .drop_duplicates()
+            .set_index("eventId")["commId"]
+            .astype(str)
+            .to_dict()
+        )
+        if len(event_to_comm) == 0:
+            continue
+        for event_id, ch_count in gpu_coll_kernels.groupby("association").size().items():
+            comm_id = event_to_comm.get(event_id)
+            if comm_id is None:
+                continue
+            ch_by_comm[comm_id] = max(ch_by_comm[comm_id], int(ch_count))
+    return ch_by_comm
+
+
+def synthesize_topology_from_comm_info(
+    comm_info: pd.DataFrame,
+    comm_data: Dict[Tuple[str, int], pd.DataFrame],
+    coll_kernels: Dict[Tuple[str, int], pd.DataFrame],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if len(comm_info) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    ch_by_comm = _infer_channels_by_comm(comm_data, coll_kernels)
+    ring_rows = []
+    tree_rows = []
+
+    for comm_id, group in comm_info.groupby("commId"):
+        group = (
+            group.dropna(subset=["rank", "nodeId", "pid"])
+            .copy()
+            .sort_values("rank")
+            .drop_duplicates(subset=["rank"], keep="first")
+        )
+        if len(group) == 0:
+            continue
+
+        group["rank"] = group["rank"].astype(int)
+        expected = list(range(len(group)))
+        if group["rank"].tolist() != expected:
+            logger.warning(
+                "Non-dense communicator ranks for %s in comm_info; reindexing to [0..%d].",
+                comm_id,
+                len(group) - 1,
+            )
+            group = group.reset_index(drop=True)
+            group["rank"] = np.arange(len(group), dtype=np.int64)
+
+        nranks = len(group)
+        nchannels = max(1, int(ch_by_comm.get(str(comm_id), 1)))
+        for row in group.itertuples(index=False):
+            rank = int(row.rank)
+            for ch in range(nchannels):
+                ring_rows.append(
+                    {
+                        "nodeId": row.nodeId,
+                        "commId": comm_id,
+                        "channelId": ch,
+                        "prevRank": (rank - 1) % nranks,
+                        "myRank": rank,
+                        "nextRank": (rank + 1) % nranks,
+                        "pid": int(row.pid),
+                    }
+                )
+                child1 = 2 * rank + 1
+                child2 = 2 * rank + 2
+                tree_rows.append(
+                    {
+                        "nodeId": row.nodeId,
+                        "commId": comm_id,
+                        "channelId": ch,
+                        "child1Rank": child1 if child1 < nranks else -1,
+                        "child2Rank": child2 if child2 < nranks else -1,
+                        "child3Rank": -1,
+                        "myRank": rank,
+                        "parentRank": (rank - 1) // 2 if rank > 0 else -1,
+                        "pid": int(row.pid),
+                    }
+                )
+
+    return pd.DataFrame(ring_rows), pd.DataFrame(tree_rows)
+
+
+def parse_nccl_log_communicators(
+    log_path: pathlib.Path,
+    gpu_ids: List[Tuple[str, int]],
+    allowed_comm_ids: set = None,
+) -> pd.DataFrame:
+    """
+    Parse communicator init lines from NCCL runtime logs.
+    """
+    if log_path is None or not log_path.exists():
+        return pd.DataFrame()
+
+    pid_to_node = {int(pid): node_id for node_id, pid in gpu_ids}
+    allowed_norm = None
+    canonical_comm_id = {}
+    if allowed_comm_ids:
+        allowed_norm = set()
+        for comm_id in allowed_comm_ids:
+            cid = str(comm_id)
+            allowed_norm.add(cid.lower())
+            canonical_comm_id[cid.lower()] = cid
+
+    init_re = re.compile(
+        r"^[^:\s]+:(?P<pid>\d+):\d+\s+\[\d+\]\s+NCCL INFO\s+ncclCommInitRankConfig\s+"
+        r"comm\s+\S+\s+rank\s+(?P<rank>\d+)\s+nranks\s+(?P<nranks>\d+).*?"
+        r"commId\s+(?P<commid>0x[0-9a-fA-F]+)"
+    )
+    rows = []
+    with open(log_path, "r", errors="ignore") as f:
+        for line in f:
+            m = init_re.search(line)
+            if m is None:
+                continue
+            pid = int(m.group("pid"))
+            node_id = pid_to_node.get(pid)
+            if node_id is None:
+                continue
+            comm_id_raw = m.group("commid")
+            comm_norm = comm_id_raw.lower()
+            if allowed_norm is not None and comm_norm not in allowed_norm:
+                continue
+            comm_id = canonical_comm_id.get(comm_norm, comm_id_raw)
+            rows.append(
+                {
+                    "nodeId": node_id,
+                    "commHash": comm_id,
+                    "commId": comm_id,
+                    "rank": int(m.group("rank")),
+                    "nRanks": int(m.group("nranks")),
+                    "pid": pid,
+                }
+            )
+
+    if len(rows) == 0:
+        return pd.DataFrame()
+
+    parsed = pd.DataFrame(rows).drop_duplicates(subset=["commId", "rank", "pid"], keep="first")
+    return parsed
+
+
+def compare_comm_membership(parsed_comm_info: pd.DataFrame, inferred_comm_info: pd.DataFrame) -> None:
+    if len(parsed_comm_info) == 0 or len(inferred_comm_info) == 0:
+        return
+
+    parsed_map = {
+        comm_id: set(group["pid"].astype(int).tolist())
+        for comm_id, group in parsed_comm_info.groupby("commId")
+    }
+    inferred_map = {
+        comm_id: set(group["pid"].astype(int).tolist())
+        for comm_id, group in inferred_comm_info.groupby("commId")
+    }
+    parsed_ids = set(parsed_map.keys())
+    inferred_ids = set(inferred_map.keys())
+    common = parsed_ids & inferred_ids
+    matched = sum(1 for cid in common if parsed_map[cid] == inferred_map[cid])
+    mismatched = len(common) - matched
+    logger.info(
+        "NCCL-log communicator comparison: common=%d matched=%d mismatched=%d missing_in_log=%d extra_in_log=%d",
+        len(common),
+        matched,
+        mismatched,
+        len(inferred_ids - parsed_ids),
+        len(parsed_ids - inferred_ids),
+    )
+
+
+def synthesize_communicators_from_events(
+    comm_data: Dict[Tuple[str, int], pd.DataFrame],
+    coll_kernels: Dict[Tuple[str, int], pd.DataFrame],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Build communicator/ring/tree tables when comm init NVTX markers are absent.
+    Uses observed commId membership from communication events.
+    """
+    members_by_comm: Dict[str, set] = defaultdict(set)
+    for gpu_id, gpu_comm in comm_data.items():
+        if "commId" not in gpu_comm.columns or len(gpu_comm) == 0:
+            continue
+        for comm_id in gpu_comm["commId"].dropna().astype(str).unique():
+            members_by_comm[comm_id].add(gpu_id)
+
+    if len(members_by_comm) == 0:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    ch_by_comm = _infer_channels_by_comm(comm_data, coll_kernels)
+
+    def _gpu_sort_key(gpu_id: Tuple[str, int]):
+        node_id, pid = gpu_id
+        node_sort = int(node_id) if str(node_id).isdigit() else str(node_id)
+        return (node_sort, int(pid))
+
+    comm_info_rows = []
+    ring_rows = []
+    tree_rows = []
+    for comm_id, members in members_by_comm.items():
+        members_sorted = sorted(members, key=_gpu_sort_key)
+        nranks = len(members_sorted)
+        nchannels = max(1, int(ch_by_comm.get(comm_id, 1)))
+
+        for rank, (node_id, pid) in enumerate(members_sorted):
+            comm_info_rows.append(
+                {
+                    "nodeId": node_id,
+                    "commHash": comm_id,
+                    "commId": comm_id,
+                    "rank": rank,
+                    "nRanks": nranks,
+                    "pid": int(pid),
+                }
+            )
+            for ch in range(nchannels):
+                ring_rows.append(
+                    {
+                        "nodeId": node_id,
+                        "commId": comm_id,
+                        "channelId": ch,
+                        "prevRank": (rank - 1) % nranks,
+                        "myRank": rank,
+                        "nextRank": (rank + 1) % nranks,
+                        "pid": int(pid),
+                    }
+                )
+                child1 = 2 * rank + 1
+                child2 = 2 * rank + 2
+                tree_rows.append(
+                    {
+                        "nodeId": node_id,
+                        "commId": comm_id,
+                        "channelId": ch,
+                        "child1Rank": child1 if child1 < nranks else -1,
+                        "child2Rank": child2 if child2 < nranks else -1,
+                        "child3Rank": -1,
+                        "myRank": rank,
+                        "parentRank": (rank - 1) // 2 if rank > 0 else -1,
+                        "pid": int(pid),
+                    }
+                )
+
+    comm_info = pd.DataFrame(comm_info_rows)
+    comm_ring_info = pd.DataFrame(ring_rows)
+    comm_tree_info = pd.DataFrame(tree_rows)
+    return comm_info, comm_ring_info, comm_tree_info
 
 
 algo_mapping = {
@@ -296,6 +555,12 @@ if __name__ == "__main__":
                         help="Write buffer size for goal file output (e.g., '1MB', '512KB', '8192'). "
                              "Larger buffers reduce I/O operations, useful for network storage.")
     parser.add_argument("--n_workers", "-w", type=int, default=os.cpu_count(), help="Maximum number of worker processes")
+    parser.add_argument(
+        "--nccl_log",
+        type=str,
+        default=None,
+        help="Optional NCCL runtime log file to recover communicator init metadata.",
+    )
 
     args = parser.parse_args()
     trace_dir = pathlib.Path(args.trace_dir).resolve()
@@ -314,6 +579,11 @@ if __name__ == "__main__":
 
     npkit_data_simple = args.npkit_data_simple
     npkit_data_ll = args.npkit_data_ll
+    nccl_log_path = pathlib.Path(args.nccl_log).resolve() if args.nccl_log else None
+    if nccl_log_path is None:
+        auto_logs = sorted(trace_dir.parent.glob("log-*.out"))
+        if auto_logs:
+            nccl_log_path = auto_logs[0].resolve()
     if parallel_generation:
         import dask
         dask.config.set(scheduler="processes", num_workers=n_workers)
@@ -334,10 +604,47 @@ if __name__ == "__main__":
     # (parallel I/O, regex categorization, field extraction, and type conversion already done)
 
     comm_info, comm_ring_info, comm_tree_info, nvtx_events = get_communicator_info(nvtx_events)
-    communicator_ids_numeric = [[i, comm_id] for i, comm_id in enumerate(comm_info["commId"].unique())]
-    communicator_ids_numeric_df = pd.DataFrame(communicator_ids_numeric, columns=["comm_num_id", "commId"])
     
     comm_data, coll_info, coll_kernels, p2p_kernels, nvtx_events = get_event_info(nvtx_events, comm_info)
+    if len(comm_info) == 0:
+        logger.warning("No communicator init markers found; synthesizing communicators from comm events.")
+        inferred_comm_info, inferred_ring_info, inferred_tree_info = synthesize_communicators_from_events(
+            comm_data, coll_kernels
+        )
+        comm_info, comm_ring_info, comm_tree_info = (
+            inferred_comm_info,
+            inferred_ring_info,
+            inferred_tree_info,
+        )
+        if nccl_log_path is not None and nccl_log_path.exists():
+            allowed_comm_ids = set(inferred_comm_info["commId"].dropna().astype(str).unique())
+            parsed_comm_info = parse_nccl_log_communicators(nccl_log_path, list(comm_data.keys()), allowed_comm_ids)
+            if len(parsed_comm_info) > 0:
+                compare_comm_membership(parsed_comm_info, inferred_comm_info)
+                parsed_ids = set(parsed_comm_info["commId"].dropna().astype(str).unique())
+                missing_ids = allowed_comm_ids - parsed_ids
+                if missing_ids:
+                    logger.warning(
+                        "NCCL-log communicator parse missing %d inferred communicators; falling back for missing IDs.",
+                        len(missing_ids),
+                    )
+                    comm_info = pd.concat(
+                        [
+                            parsed_comm_info,
+                            inferred_comm_info[
+                                inferred_comm_info["commId"].astype(str).isin(missing_ids)
+                            ],
+                        ],
+                        ignore_index=True,
+                    )
+                else:
+                    comm_info = parsed_comm_info
+                comm_ring_info, comm_tree_info = synthesize_topology_from_comm_info(
+                    comm_info, comm_data, coll_kernels
+                )
+                logger.info("Using NCCL log communicator metadata from %s", nccl_log_path)
+            else:
+                logger.warning("NCCL log parsing produced no communicator metadata: %s", nccl_log_path)
 
     profiling_interval, nvtx_events = get_profiling_interval(nvtx_events)
     
@@ -356,6 +663,8 @@ if __name__ == "__main__":
     communicators, gpu_devices = construct_communicators(
         comm_info, comm_ring_info, comm_tree_info
     )
+    communicator_ids_numeric = [[i, comm_id] for i, comm_id in enumerate(comm_info["commId"].unique())]
+    communicator_ids_numeric_df = pd.DataFrame(communicator_ids_numeric, columns=["comm_num_id", "commId"])
 
     comm_ops = {
         "AllReduce": AllReduce,
@@ -400,7 +709,12 @@ if __name__ == "__main__":
         p2p_kernel_gpu.drop(columns=["countHi32", "countLo32"], inplace=True)
         
         comm_data_gpu = comm_data[gpu_id].copy()
+        comm_data_gpu = comm_data_gpu.dropna(subset=["commId", "start", "end", "stream", "collective"])
         comm_data_gpu = comm_data_gpu.merge(communicator_ids_numeric_df, on="commId", how="left")
+        if comm_data_gpu["comm_num_id"].isna().any():
+            missing = comm_data_gpu.loc[comm_data_gpu["comm_num_id"].isna(), "commId"].dropna().astype(str).unique().tolist()
+            logger.warning(f"Dropping events with unknown communicator IDs on GPU {gpu_id}: {missing[:10]}")
+            comm_data_gpu = comm_data_gpu.loc[~comm_data_gpu["comm_num_id"].isna()].copy()
         comm_data_gpu = comm_data_gpu.sort_values(["start"])
         
         # Vectorized context_label calculation
@@ -409,7 +723,7 @@ if __name__ == "__main__":
         for commId, group in comm_data_gpu.groupby("commId"):
             stream_ids = group["stream"].unique()
             if len(stream_ids) > 1:
-                raise ValueError(f"Communicator {commId} used by multiple streams: {stream_ids}")
+                logger.warning(f"Communicator {commId} used by multiple streams: {stream_ids}")
         
         # prepare identifier tag
         comm_num_ids = comm_data_gpu["comm_num_id"].to_numpy(dtype=np.int64)

@@ -10,6 +10,7 @@ from tqdm import tqdm
 from functools import reduce
 import numba
 import logging
+import pandas as pd
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ class GPUStream:
                 logger.warning(f"Event ID {event_id} not found in coll_info for GPU {self.self_gpu.id}.")
                 return None
             coll_info_row = self.self_gpu.dfs["coll_info"].loc[event_id]
+            if isinstance(coll_info_row, pd.DataFrame):
+                coll_info_row = coll_info_row.iloc[0]
             coll_info = CollInfo(
                 root_rank=int(coll_info_row["root"]),
                 red_op=int(coll_info_row["redOp"]),
@@ -49,7 +52,11 @@ class GPUStream:
                 slice_steps=int(coll_info_row["sliceSteps"]),
                 step_size=int(coll_info_row["stepSize"]),
             )
-            coll_chnl_infos = self.self_gpu.dfs["coll_kernels"].get_group(event_id).apply(
+            coll_kernel_groups = self.self_gpu.dfs["coll_kernels"]
+            if event_id not in coll_kernel_groups.groups:
+                logger.warning(f"Event ID {event_id} not found in coll_kernels for GPU {self.self_gpu.id}.")
+                return None
+            coll_chnl_infos = coll_kernel_groups.get_group(event_id).apply(
                 lambda row: CollChnlInfo(
                     count=int(row["count"]),
                     chunk_count=int(row["chunkCount"]),
@@ -65,7 +72,11 @@ class GPUStream:
             
         elif issubclass(coll_class, P2POp):
             from nccl_comm import P2PChnlInfo
-            p2p_chnl_infos = self.self_gpu.dfs["p2p_kernels"].get_group(event_id).apply(
+            p2p_kernel_groups = self.self_gpu.dfs["p2p_kernels"]
+            if event_id not in p2p_kernel_groups.groups:
+                logger.warning(f"Event ID {event_id} not found in p2p_kernels for GPU {self.self_gpu.id}.")
+                return None
+            p2p_chnl_infos = p2p_kernel_groups.get_group(event_id).apply(
                 lambda row: P2PChnlInfo(
                     Bytes=int(row["Bytes"]),
                     proto=row["proto"],
@@ -89,7 +100,7 @@ class GPUStream:
                 return None
             self.group_constructed.add(group_id)
             grouped_event_ids = self.self_gpu.dfs["comm_data_grouped"].get_group(group_id)["eventId"].tolist()
-            comm_ops = (self.__construct_collective(eid) for eid in grouped_event_ids)
+            comm_ops = (op for op in (self.__construct_collective(eid) for eid in grouped_event_ids) if op is not None)
             return CommGrouped(self.self_gpu.gpu_id, comm_ops, self.self_gpu.dfs["comm_data"].loc[event_id]["context_label"])
 
     
