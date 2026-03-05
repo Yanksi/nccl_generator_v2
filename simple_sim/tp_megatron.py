@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Tuple
 
-from .ir import Group, ShardSpec, Tensor, tensor_replace
+from .ir import Group, Parallelism, ShardSpec, Tensor, tensor_replace
 from .ops_compute import activation, matmul
 from .ops_comm import allreduce, allgather, reduce_scatter
 
@@ -25,7 +25,7 @@ def tp_row_linear(x_part: Tensor, w_row: Tensor, *, tp_group: Group, name: str) 
     assert w_row.tp_group == tp_group, "w_row.tp_group must be set"
 
     z_partial = matmul(x_part, w_row, name=name + ".partial")
-    z, _tok = allreduce(z_partial, group=tp_group, name=name + ".allreduce")
+    z, _tok = allreduce(z_partial, group=tp_group, name=name + ".allreduce", parallelism=Parallelism.TP)
     return tensor_replace(z, tp_group=tp_group, shard=ShardSpec("replicated"))
 
 def megatron_mlp(x: Tensor, w1_col: Tensor, w2_row: Tensor, *, tp_group: Group, name: str = "mlp") -> Tensor:
@@ -75,7 +75,8 @@ def sp_column_linear(x_seq_shard: Tensor, w_col: Tensor, *, tp_group: Group, seq
     x_full, _tok = allgather(
         x_seq_shard, 
         group=tp_group, 
-        name=name + ".allgather"
+        name=name + ".allgather",
+        parallelism=Parallelism.TP,
     )
     x_full = tensor_replace(x_full, tp_group=tp_group, shard=ShardSpec("replicated"))
     
@@ -112,7 +113,8 @@ def sp_row_linear(x_part: Tensor, w_row: Tensor, *, tp_group: Group, seq_axis: i
         z_partial, 
         group=tp_group, 
         shard_axis=seq_axis,
-        name=name + ".reduce_scatter"
+        name=name + ".reduce_scatter",
+        parallelism=Parallelism.TP,
     )
     return tensor_replace(z_seq_shard, tp_group=tp_group, shard=ShardSpec("sharded", axis=seq_axis, parts=tp_group.size))
 

@@ -28,6 +28,21 @@ class MemoryCategory(enum.Enum):
     RECOMPUTED = "recomputed"              # inside checkpoint region, discarded then recomputed
 
 
+class Parallelism(enum.Enum):
+    """Parallelism strategy that triggered a communication operation.
+    
+    This identifies *why* a communication happened, which cannot always be
+    inferred from the communicator alone (e.g., TP and SP share the same group,
+    ZeRO and DP AllReduce share the same group).
+    """
+    TP = "tp"      # Tensor Parallelism (includes Sequence Parallelism)
+    DP = "dp"      # Data Parallelism (gradient AllReduce)
+    PP = "pp"      # Pipeline Parallelism (send/recv activations)
+    ZERO = "zero"  # ZeRO optimizer (reduce-scatter grads, all-gather params)
+    EP = "ep"      # Expert Parallelism (MoE)
+    CP = "cp"      # Context Parallelism (long context)
+
+
 # -------- parallel metadata --------
 
 @dataclass(frozen=True)

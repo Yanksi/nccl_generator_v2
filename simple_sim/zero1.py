@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .ir import Group, MemoryCategory, Tensor, Token, ShardSpec, tensor_replace
+from .ir import Group, MemoryCategory, Parallelism, Tensor, Token, ShardSpec, tensor_replace
 from .ops_comm import allgather, reduce_scatter, sink
 from .ops_compute import adam_update_shard
 
@@ -55,6 +55,7 @@ def zero1_optimizer_step(
             group=plan.dp_group,
             shard_axis=0,
             name=f"{name}.rs_grad.{p.name}",
+            parallelism=Parallelism.ZERO,
         )
         effect_tokens.append(tok_rs)
 
@@ -65,6 +66,7 @@ def zero1_optimizer_step(
                 p_shard_new,
                 group=plan.dp_group,
                 name=f"{name}.ag_param.{p.name}",
+                parallelism=Parallelism.ZERO,
             )
             effect_tokens.append(tok_ag)
             # Restore the original param's metadata (TP shard, groups, etc.)
@@ -136,6 +138,7 @@ def zero1_gather_params(
             p_shard,
             group=plan.dp_group,
             name=f"{name}.ag_param.{p_shard.name}",
+            parallelism=Parallelism.ZERO,
         )
         effect_tokens.append(tok_ag)
 

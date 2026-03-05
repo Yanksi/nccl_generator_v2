@@ -1,4 +1,4 @@
-from .ir import Tensor, Token, Group, ShardSpec, OpNode, ComputeOp, CommOp, CostMeta, MemoryCategory
+from .ir import Tensor, Token, Group, ShardSpec, OpNode, ComputeOp, CommOp, CostMeta, MemoryCategory, Parallelism
 from .ops_compute import (
     input_tensor,
     parameter,
@@ -41,6 +41,7 @@ from .autograd import backward
 from .tp_megatron import megatron_mlp, megatron_mlp_sp
 from .zero1 import Zero1Plan, zero1_optimizer_step, zero1_gather_params
 from .visualize import visualize_graph, to_dot, print_graph_summary
+from .pp_schedule import PPSchedule, ScheduleStep, GPipeSchedule, OneFOneBSchedule, InterleavedOneFOneBSchedule
 
 __all__ = [
     "Tensor",
@@ -51,6 +52,7 @@ __all__ = [
     "ComputeOp",
     "CommOp",
     "MemoryCategory",
+    "Parallelism",
     # constructors
     "input_tensor",
     "parameter",
@@ -95,6 +97,13 @@ __all__ = [
     "megatron_mlp_sp",
     "Zero1Plan",
     "zero1_optimizer_step",
+    "zero1_gather_params",
+    # PP scheduling
+    "PPSchedule",
+    "ScheduleStep",
+    "GPipeSchedule",
+    "OneFOneBSchedule",
+    "InterleavedOneFOneBSchedule",
     # visualization
     "visualize_graph",
     "to_dot",

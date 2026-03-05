@@ -116,6 +116,7 @@ class GoalSend(GoalTraffic):
         self.message_id = GoalSend.send_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
         assert(ndigits(self.message_id) <= MESSAGE_ID_WIDTH)
         GoalSend.send_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
+        GoalSend.send_message_id[(self.self_rank, self.peer_rank, self.context)] %= 10 ** MESSAGE_ID_WIDTH
 
     def generate_lines(self) -> Generator[str]:
         tag =  str(self.message_id).zfill(MESSAGE_ID_WIDTH) + str(self.context).zfill(MESSAGE_TAG_WIDTH)
@@ -128,6 +129,7 @@ class GoalRecv(GoalTraffic):
         self.message_id = GoalRecv.recv_message_id.setdefault((self.self_rank, self.peer_rank, self.context), 0)
         assert(ndigits(self.message_id) <= MESSAGE_ID_WIDTH)
         GoalRecv.recv_message_id[(self.self_rank, self.peer_rank, self.context)] += 1
+        GoalRecv.recv_message_id[(self.self_rank, self.peer_rank, self.context)] %= 10 ** MESSAGE_ID_WIDTH
     
     def generate_lines(self) -> Generator[str]:
         tag = str(self.message_id).zfill(MESSAGE_ID_WIDTH) + str(self.context).zfill(MESSAGE_TAG_WIDTH)

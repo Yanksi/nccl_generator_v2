@@ -5,7 +5,7 @@ from collections.abc import Hashable
 from abc import ABC, abstractmethod
 from contextlib import ContextDecorator
 import contextvars
-from goal import GoalOp, GoalParallel, GoalSequential, GoalSend, GoalRecv, GoalCalc
+from goal import GoalOp, GoalParallel, GoalSequential, GoalSend, GoalRecv, GoalCalc, GoalRank, GoalCPU
 
 RankId = Hashable  # e.g., "cpu", ("gpu", 0), ("nic", 0)
 
@@ -13,17 +13,6 @@ class CollAlgo(Enum):
     TREE = 0
     RING = 1
     RECURSIVE_DOUBLING = 2
-
-class Communicator:
-    def __init__(self, comm_id: str, device_ids: List[RankId]):
-        self.comm_id: str = comm_id
-        self.rank2device_id: List[RankId] = device_ids
-        self.device_id2rank: Dict[RankId, int] = {d: r for r, d in enumerate(device_ids)}
-        self.size: int = len(device_ids)
-        self.rank2device_id.append(None) # for invalid rank
-    
-    def __repr__(self):
-        return f"Communicator(id={self.comm_id}, ranks={self.rank2device_id[:-1]})"
 
 
 DEFAULT_COMM_DEVICE_ID: contextvars.ContextVar[Optional[RankId]] = contextvars.ContextVar("default_comm_device", default=None)
@@ -47,16 +36,39 @@ class CollDevice(ContextDecorator):
         if self._token_self is not None:
             DEFAULT_COMM_DEVICE_ID.reset(self._token_self)
         return False  # Don't suppress exceptions
+    
+    def __repr__(self):
+        return f"CollDevice({self.device_id})"
+    
+    def __hash__(self):
+        return hash(self.device_id)
+    
+    def __eq__(self, other):
+        if not isinstance(other, CollDevice):
+            return self.device_id == other
+        return self.device_id == other.device_id
 
 def _get_current_device() -> Optional[RankId]:
     """Get the current collective communication device context, if any."""
     return DEFAULT_COMM_DEVICE_ID.get()
 
+class Communicator:
+    def __init__(self, comm_id: str, devices: List[Union[RankId, CollDevice]]):
+        self.comm_id: str = comm_id
+        self.rank2device_id: List[RankId] = [device.device_id if isinstance(device, CollDevice) else device for device in devices]
+        self.device_id2rank: Dict[RankId, int] = {d: r for r, d in enumerate(self.rank2device_id)}
+        self.size: int = len(self.rank2device_id)
+        self.rank2device_id.append(None) # for invalid rank
+    
+    def __repr__(self):
+        return f"Communicator(id={self.comm_id}, ranks={self.rank2device_id[:-1]})"
 
 class CommOp(ABC):
-    def __init__(self, comm: Communicator, context: int, device_id: Optional[RankId] = None):
+    def __init__(self, comm: Communicator, context: int, device_id: Optional[Union[RankId, CollDevice]] = None):
         self.comm = comm
         self.context = context
+        if isinstance(device_id, CollDevice):
+            device_id = device_id.device_id
         if device_id is None:
             # If no explicit device_id is provided, use the current collective device context
             device_id = _get_current_device()
@@ -67,10 +79,11 @@ class CommOp(ABC):
         """Translate this CommOp into a GoalOp for scheduling."""
         pass
 
-    def to_goal(self, device_id2goal_rank: Dict[RankId, int], starting_cpu_id: int, nic: int) -> GoalOp:
+    def to_goal(self, device2goal_rank: Dict[Union[RankId, CollDevice], Union[int, GoalRank]], starting_cpu_id: int, nic: int) -> GoalOp:
         device_id = self.device_id if self.device_id is not None else _get_current_device()
         if device_id is None:
             raise ValueError("CommOp requires a device_id, but none was provided and no collective device context is set.")
+        device_id2goal_rank = {d.device_id if isinstance(d, CollDevice) else d: r.self_rank if isinstance(r, GoalRank) else r for d, r in device2goal_rank.items()}
         return self._to_goal(device_id2goal_rank, device_id, starting_cpu_id, nic)
 
     def __repr__(self):
@@ -115,7 +128,7 @@ class CollOp(CommOp):
         return [GoalParallel([
             GoalRecv(prev_goal_rank, chunk_size, nic, self.context, self_goal_rank, starting_cpu_id),
             GoalSend(next_goal_rank, chunk_size, nic, self.context, self_goal_rank, starting_cpu_id)
-        ]) for _ in range(n_steps)]
+        ], self_goal_rank, starting_cpu_id) for _ in range(n_steps)]
 
     def _recursive_steps(self, curr_rank, chunk_size, self_goal_rank, device_id2goal_rank, starting_cpu_id, nic, *, halving: bool):
         """Unified recursive halving/doubling steps.
@@ -135,7 +148,7 @@ class CollOp(CommOp):
                 result.append(GoalParallel([
                     GoalRecv(partner_goal_rank, curr_chunk_size, nic, self.context, self_goal_rank, starting_cpu_id),
                     GoalSend(partner_goal_rank, curr_chunk_size, nic, self.context, self_goal_rank, starting_cpu_id)
-                ]))
+                ], self_goal_rank, starting_cpu_id))
             curr_chunk_size = curr_chunk_size // 2 if halving else curr_chunk_size * 2
         return result
 
@@ -174,3 +187,17 @@ class AllReduce(CollOp):
             raise NotImplementedError(f"CollAlgo {self.algo} is not implemented yet")
         return GoalSequential(steps, self_goal_rank, starting_cpu_id)
 
+if __name__ == "__main__":
+    # some test code and examples of usage
+    devices = [CollDevice(("gpu", i)) for i in range(4)]
+    comm = Communicator("comm1", devices)
+    rs = ReduceScatter(comm, size=1024, context=0, algo=CollAlgo.RECURSIVE_DOUBLING)
+    test_file = "test_simple.goal"
+    device2goal_rank = {d: i for i, d in enumerate(devices)}
+    with open(test_file, "w") as f:
+        for device, rank in device2goal_rank.items():
+            with device:
+                goal_op = rs.to_goal(device2goal_rank, starting_cpu_id=0, nic=0)
+            f.write(f"rank {rank}: {{\n")
+            f.writelines(f"  {line}\n" for line in goal_op.generate_lines())
+            f.write("}\n")
