@@ -520,3 +520,420 @@ def _format_bytes(b: int) -> str:
     if b >= 1 << 10:
         return f"{b / (1 << 10):.2f} KiB"
     return f"{b} B"
+
+
+# -------- Multi-rank graph visualization --------
+
+# Rank-specific colors for subgraph backgrounds
+RANK_COLORS = [
+    "#E3F2FD",  # Light blue
+    "#E8F5E9",  # Light green
+    "#FFF3E0",  # Light orange
+    "#F3E5F5",  # Light purple
+    "#E0F7FA",  # Light cyan
+    "#FBE9E7",  # Light deep orange
+    "#E8EAF6",  # Light indigo
+    "#F1F8E9",  # Light light green
+]
+
+
+def multi_rank_to_dot(
+    multi_graph: "MultiRankGraph",
+    title: Optional[str] = None,
+    show_costs: bool = True,
+    show_tensors: bool = False,
+    rankdir: str = "TB",
+    merged_mode: bool = False,
+) -> str:
+    """
+    Generate DOT format string for a multi-rank aggregated graph.
+    
+    Each rank is shown as a subgraph (cluster), with cross-rank edges
+    for send→recv pairs and collective groupings.
+    
+    Args:
+        multi_graph: MultiRankGraph from aggregate_graphs()
+        title: Optional title for the graph
+        show_costs: If True, show cost metadata on nodes
+        show_tensors: If True, show tensor nodes; if False, only show ops
+        rankdir: Graph direction - "TB" (top to bottom) or "LR" (left to right)
+        merged_mode: If True, visualize merged cross-rank ops with proper data flow
+    
+    Returns:
+        DOT format string
+    """
+    from .aggregate import MultiRankGraph, MergedCollectiveOp
+    
+    lines = ["digraph G {"]
+    lines.append(f'    rankdir={rankdir};')
+    lines.append('    compound=true;')  # Allow edges between clusters
+    lines.append('    newrank=true;')   # Better ranking with cross-cluster edges
+    lines.append('    node [fontname="Helvetica", fontsize=10];')
+    lines.append('    edge [fontname="Helvetica", fontsize=9];')
+    
+    if title:
+        lines.append(f'    labelloc="t";')
+        lines.append(f'    label="{title}";')
+        lines.append('    fontsize=14;')
+    
+    # Build node ID mapping and collect all values
+    node_ids = {}
+    value_ids = {}  # id(v) -> "val_X"
+    value_objs = {}  # id(v) -> v
+    
+    for rank, g in multi_graph.graphs.items():
+        for node in g.nodes:
+            node_ids[node.id] = f"op_{node.id}"
+            # Collect input values
+            for v in node.inputs:
+                vid = id(v)
+                if vid not in value_ids:
+                    value_ids[vid] = f"val_{len(value_ids)}"
+                    value_objs[vid] = v
+            # Collect output values
+            for v in node.outputs:
+                vid = id(v)
+                if vid not in value_ids:
+                    value_ids[vid] = f"val_{len(value_ids)}"
+                    value_objs[vid] = v
+    
+    # Create subgraph for each rank
+    for rank in multi_graph.ranks:
+        g = multi_graph.graphs[rank]
+        color = RANK_COLORS[rank % len(RANK_COLORS)]
+        
+        lines.append("")
+        lines.append(f"    subgraph cluster_rank{rank} {{")
+        lines.append(f'        label="GPU {rank}";')
+        lines.append(f'        style="filled,rounded";')
+        lines.append(f'        fillcolor="{color}";')
+        lines.append(f'        color="#BDBDBD";')
+        lines.append('        fontsize=12;')
+        lines.append("")
+        
+        # Add nodes for this rank (filter by actual rank, skip MergedCollectiveOp)
+        for node in g.nodes:
+            # Skip MergedCollectiveOp - rendered separately outside clusters
+            if isinstance(node, MergedCollectiveOp):
+                continue
+            # Only include nodes that belong to this rank
+            # (skip nodes with rank=None or wrong rank)
+            if node.rank != rank:
+                continue
+                
+            nid = node_ids[node.id]
+            node_color = _get_node_color(node)
+            label = _get_node_label(node) if show_costs else f"<b>{_get_display_kind(node)}</b><br/>id={node.id}"
+            
+            # Add rank info to label
+            label = f"<b>{_get_display_kind(node)}</b><br/>id={node.id}"
+            if show_costs:
+                try:
+                    cost = node.get_cost_meta()
+                    if cost["flops"] > 0 or cost["mem_read"] > 0:
+                        label += f"<br/>flops={_format_num(cost['flops'])}"
+                except Exception:
+                    pass
+                if hasattr(node, 'bytes'):
+                    label += f"<br/>bytes={_format_num(node.bytes)}"
+            
+            # Comm info
+            if hasattr(node, 'group'):
+                label += f"<br/><i>{node.group.match_key}</i>"
+            if hasattr(node, 'dst'):
+                label += f"<br/>dst={node.dst}"
+            if hasattr(node, 'src') and node.src >= 0:
+                label += f"<br/>src={node.src}"
+            
+            # Determine shape
+            if isinstance(node, CommOp):
+                shape = "hexagon"
+            else:
+                shape = "box"
+            
+            lines.append(
+                f'        {nid} [label=<{label}>, shape={shape}, '
+                f'style="filled,rounded", fillcolor="{node_color}", fontcolor="white"];'
+            )
+        
+        # Add tensor nodes for this rank if requested
+        if show_tensors:
+            lines.append("")
+            lines.append("        // Value nodes (tensors/tokens)")
+            for vid, v in value_objs.items():
+                # Only include tensors that belong to this rank
+                tensor_rank = None
+                if hasattr(v, 'producer') and v.producer is not None:
+                    if isinstance(v.producer, MergedCollectiveOp):
+                        # Skip merged collective outputs - they'll be connected directly
+                        # from the merged op to consumers to avoid cross-cluster issues
+                        continue
+                    else:
+                        tensor_rank = v.producer.rank
+                else:
+                    # No producer (input/parameter) - find a consumer in this rank
+                    for node in g.nodes:
+                        if node.rank == rank and v in node.inputs:
+                            tensor_rank = rank
+                            break
+                
+                if tensor_rank != rank:
+                    continue
+                    
+                val_id = value_ids[vid]
+                label = _get_value_label(v)
+                
+                if isinstance(v, Tensor):
+                    has_producer_in_graph = (
+                        v.producer is not None and v.producer.id in node_ids
+                    )
+                    
+                    if not has_producer_in_graph:
+                        if v.requires_grad:
+                            fillcolor = '#BBDEFB'  # Light blue (parameter)
+                            border_color = '#1976D2'
+                        else:
+                            fillcolor = '#C8E6C9'  # Light green (input)
+                            border_color = '#388E3C'
+                    else:
+                        mc = v.memory_category
+                        is_grad = v.is_gradient
+                        if mc is MemoryCategory.MATERIALIZED:
+                            fillcolor = '#F5F5F5' if is_grad else '#E0E0E0'
+                            border_color = '#757575' if is_grad else '#9E9E9E'
+                        elif mc is MemoryCategory.NOT_MATERIALIZED:
+                            fillcolor = '#F3E5F5' if is_grad else '#EDE7F6'
+                            border_color = '#7B1FA2' if is_grad else '#9575CD'
+                        else:  # RECOMPUTED
+                            fillcolor = '#FFF8E1' if is_grad else '#FFF3E0'
+                            border_color = '#E65100'
+                    
+                    lines.append(
+                        f'        {val_id} [label="{label}", shape=ellipse, '
+                        f'style="filled", fillcolor="{fillcolor}", color="{border_color}", penwidth=2];'
+                    )
+                else:
+                    # Token
+                    lines.append(
+                        f'        {val_id} [label="{label}", shape=ellipse, '
+                        f'style="filled", fillcolor="#FFE0B2", color="#F57C00", penwidth=2];'
+                    )
+        
+        # Add intra-rank edges
+        lines.append("")
+        lines.append("        // Edges")
+        for node in g.nodes:
+            # Skip MergedCollectiveOp - handled separately
+            if isinstance(node, MergedCollectiveOp):
+                continue
+            # Skip nodes not belonging to this rank
+            if node.rank != rank:
+                continue
+                
+            nid = node_ids[node.id]
+            for inp in node.inputs:
+                if show_tensors:
+                    # Skip merged collective outputs - edges come from merged op directly
+                    if hasattr(inp, 'producer') and isinstance(inp.producer, MergedCollectiveOp):
+                        continue
+                    vid = id(inp)
+                    if vid in value_ids:
+                        # Determine which rank this tensor belongs to
+                        tensor_rank = None
+                        if hasattr(inp, 'producer') and inp.producer is not None:
+                            tensor_rank = inp.producer.rank
+                        else:
+                            # No producer (input/parameter) - belongs to the rank that consumes it
+                            tensor_rank = rank
+                        
+                        if tensor_rank == rank:
+                            val_id = value_ids[vid]
+                            lines.append(f'        {val_id} -> {nid};')
+                else:
+                    if hasattr(inp, 'producer') and inp.producer is not None:
+                        # Skip MergedCollectiveOp - edges drawn separately
+                        if isinstance(inp.producer, MergedCollectiveOp):
+                            continue
+                        if inp.producer.id in node_ids:
+                            src_id = node_ids[inp.producer.id]
+                            if merged_mode:
+                                # In merged mode, include cross-rank edges inline
+                                lines.append(f'        {src_id} -> {nid};')
+                            else:
+                                # Only add edge if producer is in same rank
+                                if inp.producer.rank == rank:
+                                    lines.append(f'        {src_id} -> {nid};')
+        
+        # Connect producers to values (if showing tensors)
+        if show_tensors:
+            for vid, v in value_objs.items():
+                val_id = value_ids[vid]
+                if isinstance(v, (Tensor, Token)) and v.producer is not None:
+                    # Skip MergedCollectiveOp - edges handled separately
+                    if isinstance(v.producer, MergedCollectiveOp):
+                        continue
+                    if v.producer.id in node_ids:
+                        if v.producer.rank == rank:
+                            src_id = node_ids[v.producer.id]
+                            lines.append(f'        {src_id} -> {val_id};')
+        
+        lines.append("    }")
+    
+    # Add merged collective nodes outside clusters (they span multiple ranks)
+    merged_collective_ids = set()
+    for coll in multi_graph.cross_collectives:
+        if hasattr(coll, 'merged_op') and coll.merged_op is not None and merged_mode:
+            merged_op = coll.merged_op
+            # Use consistent ID with node_ids
+            mid = node_ids[merged_op.id]
+            merged_collective_ids.add(mid)
+            
+            # Draw merged collective as a special node spanning ranks
+            ranks_str = ", ".join(str(r) for r in merged_op.participating_ranks)
+            label = f"<b>Merged {merged_op.kind}</b><br/>ranks: [{ranks_str}]"
+            if show_costs:
+                label += f"<br/>bytes={_format_num(merged_op.bytes)}"
+            
+            lines.append("")
+            lines.append(f'    {mid} [label=<{label}>, shape=octagon, ')
+            lines.append(f'        style="filled,bold", fillcolor="#7B1FA2", fontcolor="white", penwidth=3];')
+            
+            # Add edges from inputs to merged node
+            for inp in merged_op.inputs:
+                if show_tensors:
+                    # Connect through tensor node
+                    vid = id(inp)
+                    if vid in value_ids:
+                        lines.append(f'    {value_ids[vid]} -> {mid} [color="#9C27B0", penwidth=2, constraint=true];')
+                else:
+                    # Connect from producer op directly
+                    if hasattr(inp, 'producer') and inp.producer is not None:
+                        if inp.producer.id in node_ids:
+                            src_id = node_ids[inp.producer.id]
+                            lines.append(f'    {src_id} -> {mid} [color="#9C27B0", penwidth=2, constraint=true];')
+            
+            # Add edges from merged node to outputs' consumers
+            # Always connect directly to consumers (skip tensor nodes to avoid cross-cluster edge issues)
+            for out in merged_op.outputs:
+                # Find consumers of this output tensor and draw edges directly
+                for rank, g in multi_graph.graphs.items():
+                    for node in g.nodes:
+                        if isinstance(node, MergedCollectiveOp):
+                            continue
+                        if out in node.inputs:
+                            consumer_id = node_ids[node.id]
+                            lines.append(f'    {mid} -> {consumer_id} [color="#9C27B0", penwidth=2, constraint=true];')
+    
+    # Add cross-rank edges for send→recv pairs
+    if merged_mode:
+        # In merged mode, draw send→recv as data-flow edges (solid line)
+        lines.append("")
+        lines.append("    // Cross-rank send->recv edges (merged)")
+        for send_op, recv_op, src_rank, dst_rank in multi_graph.send_recv_pairs:
+            send_id = node_ids[send_op.id]
+            recv_id = node_ids[recv_op.id]
+            lines.append(
+                f'    {send_id} -> {recv_id} '
+                f'[color="#D32F2F", penwidth=2, '
+                f'label="data", fontcolor="#D32F2F"];'
+            )
+    else:
+        lines.append("")
+        lines.append("    // Cross-rank send->recv edges")
+        for send_op, recv_op, src_rank, dst_rank in multi_graph.send_recv_pairs:
+            send_id = node_ids[send_op.id]
+            recv_id = node_ids[recv_op.id]
+            lines.append(
+                f'    {send_id} -> {recv_id} '
+                f'[style="dashed", color="#D32F2F", penwidth=2, '
+                f'label="P2P", fontcolor="#D32F2F", constraint=true];'
+            )
+        
+        # Add visual grouping for collectives (connect them with invisible edges + label)
+        lines.append("")
+        lines.append("    // Collective groupings")
+        for coll in multi_graph.cross_collectives:
+            if len(coll.participants) > 1:
+                # Draw edges between participants to show they're synchronized
+                participants = sorted(coll.participants, key=lambda x: x[0])
+                for i in range(len(participants) - 1):
+                    rank1, op1 = participants[i]
+                    rank2, op2 = participants[i + 1]
+                    id1 = node_ids[op1.id]
+                    id2 = node_ids[op2.id]
+                    # Bidirectional edge to show sync
+                    lines.append(
+                        f'    {id1} -> {id2} '
+                        f'[style="dotted", color="#9C27B0", penwidth=2, '
+                        f'dir="both", label="{coll.kind}", fontcolor="#9C27B0", constraint=true];'
+                    )
+    
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def visualize_multi_rank_graph(
+    multi_graph: "MultiRankGraph",
+    output: Optional[str] = None,
+    format: str = "svg",
+    title: Optional[str] = None,
+    show_costs: bool = True,
+    show_tensors: bool = False,
+    merged_mode: bool = False,
+    rankdir: str = "TB",
+    view: bool = False,
+) -> Optional[str]:
+    """
+    Visualize an aggregated multi-rank computation graph.
+    
+    Each GPU rank is shown as a separate subgraph with cross-rank
+    edges for send→recv and collective synchronizations.
+    
+    Args:
+        multi_graph: MultiRankGraph from aggregate_graphs()
+        output: Output file path (without extension). If None, returns DOT string.
+        format: Output format - "svg", "png", "pdf", "dot"
+        title: Optional title for the graph
+        show_costs: If True, show cost metadata on op nodes
+        show_tensors: If True, show tensor nodes; if False, only show ops
+        merged_mode: If True, visualize with merged cross-rank ops (requires merge_cross_rank=True in aggregate_graphs)
+        rankdir: Graph direction - "TB" (top to bottom) or "LR" (left to right)
+        view: If True, open the rendered file
+    
+    Returns:
+        DOT string if output is None, otherwise None (writes to file)
+    """
+    dot_str = multi_rank_to_dot(
+        multi_graph,
+        title=title,
+        show_costs=show_costs,
+        show_tensors=show_tensors,
+        rankdir=rankdir,
+        merged_mode=merged_mode,
+    )
+    
+    if output is None:
+        return dot_str
+    
+    if format == "dot":
+        with open(output if output.endswith(".dot") else f"{output}.dot", "w") as f:
+            f.write(dot_str)
+        return None
+    
+    try:
+        import graphviz
+    except ImportError:
+        raise ImportError(
+            "graphviz package required for rendering. "
+            "Install with: pip install graphviz\n"
+            "Also ensure graphviz is installed on your system: "
+            "apt-get install graphviz (Ubuntu) or brew install graphviz (macOS)"
+        )
+    
+    if output.endswith(f".{format}"):
+        output = output[:-len(format)-1]
+    
+    source = graphviz.Source(dot_str)
+    source.render(output, format=format, cleanup=True, view=view)
+    
+    return None

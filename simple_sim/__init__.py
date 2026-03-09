@@ -1,4 +1,4 @@
-from .ir import Tensor, Token, Group, ShardSpec, OpNode, ComputeOp, CommOp, CostMeta, MemoryCategory, Parallelism
+from .ir import Tensor, Token, Group, ShardSpec, OpNode, ComputeOp, CommOp, CostMeta, MemoryCategory, Parallelism, build_rank, get_current_rank
 from .ops_compute import (
     input_tensor,
     parameter,
@@ -40,8 +40,10 @@ from .extract import get_graph, topo_sort, ExtractedGraph, get_activation_summar
 from .autograd import backward
 from .tp_megatron import megatron_mlp, megatron_mlp_sp
 from .zero1 import Zero1Plan, zero1_optimizer_step, zero1_gather_params
-from .visualize import visualize_graph, to_dot, print_graph_summary
+from .visualize import visualize_graph, to_dot, print_graph_summary, visualize_multi_rank_graph, multi_rank_to_dot
 from .pp_schedule import PPSchedule, ScheduleStep, GPipeSchedule, OneFOneBSchedule, InterleavedOneFOneBSchedule
+from .aggregate import aggregate_graphs, MultiRankGraph, CrossRankCollective, MergedCollectiveOp, save_graph, load_graph
+from .timeline_visualize import to_chrome_trace, to_chrome_trace_simple, schedule_multi_rank
 
 __all__ = [
     "Tensor",
@@ -108,4 +110,18 @@ __all__ = [
     "visualize_graph",
     "to_dot",
     "print_graph_summary",
+    "visualize_multi_rank_graph",
+    "multi_rank_to_dot",
+    # multi-rank support
+    "build_rank",
+    "get_current_rank",
+    "aggregate_graphs",
+    "MultiRankGraph",
+    "CrossRankCollective",
+    "save_graph",
+    "load_graph",
+    # timeline visualization
+    "to_chrome_trace",
+    "to_chrome_trace_simple",
+    "schedule_multi_rank",
 ]

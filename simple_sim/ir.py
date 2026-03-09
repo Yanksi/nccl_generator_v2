@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import contextlib
 import enum
 from dataclasses import dataclass, field, replace
-from typing import Dict, Optional, Tuple, TypedDict, Union
+from typing import Dict, FrozenSet, Optional, Tuple, TypedDict, Union
 import itertools
 
 _id_counter = itertools.count()
+_group_id_counter = itertools.count()
+
+# Current rank context for auto-tagging OpNodes during graph construction.
+# Set via the build_rank() context manager.
+_current_rank: int | None = None
 
 # Stack of active checkpoint region IDs.  Pushed / popped by the
 # ``checkpoint()`` context manager in ops_compute.  Used by
@@ -47,9 +53,32 @@ class Parallelism(enum.Enum):
 
 @dataclass(frozen=True)
 class Group:
+    """Represents a communicator group for collective operations.
+    
+    Attributes:
+        kind: Type of parallelism ("dp", "tp", "pp", etc.)
+        size: Number of ranks in this group
+        name: User-defined name for matching across ranks (e.g., "dp_world").
+              If None, auto-generated as "{kind}_{id}".
+        ranks: Optional explicit rank membership for this group.
+        _id: Internal auto-increment ID for object identity.
+    """
     kind: str  # "dp" | "tp" | "pp" | etc.
-    id: int
     size: int
+    name: str | None = None
+    ranks: FrozenSet[int] | None = None
+    _id: int = field(default_factory=lambda: next(_group_id_counter), compare=False, repr=False)
+    
+    @property
+    def match_key(self) -> str:
+        """Key used to match groups across ranks during aggregation."""
+        if self.name:
+            return self.name
+        # Fallback: kind + sorted ranks (if specified)
+        if self.ranks:
+            return f"{self.kind}:{','.join(map(str, sorted(self.ranks)))}"
+        # Last resort: kind + internal id
+        return f"{self.kind}_{self._id}"
 
 @dataclass(frozen=True)
 class ShardSpec:
@@ -157,9 +186,15 @@ class OpNode:
     inputs: Tuple[Value, ...] = ()
     outputs: Tuple[Value, ...] = ()
     id: int = field(default_factory=lambda: next(_id_counter))
+    rank: int | None = field(default=None)
     
     # Override in subclasses
     kind: str = field(default="op", init=False)
+    
+    def __post_init__(self) -> None:
+        # Auto-fill rank from context if not explicitly set
+        if self.rank is None and _current_rank is not None:
+            object.__setattr__(self, "rank", _current_rank)
     
     def vjp(self, grad_output: "Tensor") -> Dict["Tensor", "Tensor"]:
         """
@@ -197,3 +232,28 @@ def tensor_replace(t: Tensor, **kwargs) -> Tensor:
 
 def token_replace(tok: Token, **kwargs) -> Token:
     return replace(tok, **kwargs)
+
+
+# -------- rank context --------
+
+@contextlib.contextmanager
+def build_rank(rank: int):
+    """Context manager to auto-tag all OpNodes with the given GPU rank.
+    
+    Usage:
+        with build_rank(0):
+            # All ops created here will have node.rank == 0
+            g = build_model(...)
+    """
+    global _current_rank
+    old = _current_rank
+    _current_rank = rank
+    try:
+        yield
+    finally:
+        _current_rank = old
+
+
+def get_current_rank() -> int | None:
+    """Return the current rank context, or None if not set."""
+    return _current_rank

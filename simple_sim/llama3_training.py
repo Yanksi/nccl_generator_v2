@@ -452,8 +452,8 @@ def build_full_training(
     dp_size = 4
     pp_size = 2
     
-    tp_group = Group("tp", id=0, size=tp_size)
-    dp_group = Group("dp", id=0, size=dp_size)
+    tp_group = Group("tp", size=tp_size, name="tp")
+    dp_group = Group("dp", size=dp_size, name="dp")
     
     # Model configuration
     config = Llama3Config(

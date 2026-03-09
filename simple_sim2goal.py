@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Type
 
-from nccl_comm import CommOp as NCCLCommOp
+from comm import CommOp
 from nccl_primitives import GpuId
 
 from goal import GoalCalc, GoalGraph, GoalGraphNode, GoalOp
@@ -10,7 +10,7 @@ from simple_sim.extract import ExtractedGraph, topo_sort
 from simple_sim.ir import CommOp as SimCommOp, ComputeOp as SimComputeOp, OpNode, Tensor, Token
 
 
-def get_comm_op(sim_node: SimCommOp) -> Optional[NCCLCommOp]:
+def get_comm_op(sim_node: SimCommOp) -> Optional[CommOp]:
     """Translate a simple_sim CommOp into an nccl_comm CommOp.
 
     Returns ``None`` when the translation is not yet implemented – the

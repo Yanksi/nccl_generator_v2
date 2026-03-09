@@ -172,8 +172,8 @@ def build_distributed_single_gpu(
     clear_checkpoint_registry()
 
     # ---- group handles (this GPU's local view) ----
-    tp = Group("tp", id=0, size=tp_size)
-    dp = Group("dp", id=0, size=dp_size)
+    tp = Group("tp", size=tp_size, name="tp")
+    dp = Group("dp", size=dp_size, name="dp")
 
     prev_pp_rank = pp_stage - 1          # source for fwd activation
     next_pp_rank = pp_stage + 1          # dest   for fwd activation
@@ -197,6 +197,7 @@ def build_distributed_single_gpu(
     act_shard = ShardSpec("sharded", axis=0, parts=tp_size)  # seq-sharded
 
     all_deps = []
+    iter_start_tok = None  # set to opt_done_tok after each iteration
 
     for it in range(num_iterations):
         # ==============================================================
@@ -212,12 +213,17 @@ def build_distributed_single_gpu(
         
         # Backward dependencies (gradient sends to prev stage)
         bwd_deps: list[Tensor] = []
-        
+        # Forward send tokens — collected for end-of-iteration sink only
+        fwd_sends: list[Tensor] = []
+
         def do_forward(mb: int, after):
             """Execute forward pass for microbatch mb."""
             pp_label_fwd = f"iter{it}.mb{mb}.stage{pp_stage}.fwd"
 
-            # 1. Fill (recv) sequence-sharded activation from previous PP stage
+            # 1. Fill (recv) sequence-sharded activation from previous PP stage.
+            # Gate the recv on the iteration-start token only (coarse ordering)
+            # so the network recv can proceed independently of other microbatches'
+            # sends — not on the fine-grained per-microbatch schedule chain.
             placeholder = Tensor(
                 shape=act_shape, dtype="fp16",
                 memory_category=MemoryCategory.NOT_MATERIALIZED,
@@ -227,55 +233,75 @@ def build_distributed_single_gpu(
                 tp_group=tp,
             )
             inp = placeholder
-            if after is not None:
-                inp = wait_for(placeholder, after, name=f"iter{it}.mb{mb}.fwd.wait_prev")
+            if iter_start_tok is not None:
+                inp = wait_for(placeholder, iter_start_tok, name=f"iter{it}.mb{mb}.fwd.iter_start")
             x = fill(
                 inp, src=prev_pp_rank, tag=mb,
                 label=pp_label_fwd, name=f"iter{it}.mb{mb}.pp.recv_act",
             )
 
+            # Apply the per-microbatch schedule ordering to the compute, not the recv.
+            x_sched = x
+            if after is not None:
+                x_sched = wait_for(x, after, name=f"iter{it}.mb{mb}.fwd.wait_prev")
+
             # 2. Megatron MLP with Sequence Parallelism
-            y = megatron_mlp_sp(x, params[0], params[1], tp_group=tp, seq_axis=0,
+            y = megatron_mlp_sp(x_sched, params[0], params[1], tp_group=tp, seq_axis=0,
                                 name=f"iter{it}.mb{mb}.stage.mlp")
 
-            # 3. Send sequence-sharded activation to next PP stage
+            # 3. Send sequence-sharded activation to next PP stage.
+            # Collected in fwd_sends for the end-of-iteration sink; NOT included
+            # in the scheduling token so downstream microbatch compute doesn't
+            # wait on this network send completing.
             loss_mb = send(
                 y, dst=next_pp_rank, tag=mb,
                 label=pp_label_fwd, name=f"iter{it}.mb{mb}.pp.send_act",
             )
-            
+            fwd_sends.append(loss_mb)
+
             fwd_placeholders[mb] = placeholder
             fwd_losses[mb] = loss_mb
-            return completion(loss_mb, name=f"iter{it}.mb{mb}.fwd.done")
-        
+            # Return completion over compute output only (not the send).
+            return completion(y, name=f"iter{it}.mb{mb}.fwd.done")
+
         def do_backward(mb: int, after):
             """Execute backward pass for microbatch mb, accumulating gradients in-place."""
             placeholder = fwd_placeholders[mb]
             loss_mb = fwd_losses[mb]
-            
-            # Ensure backward computation waits on schedule ordering
-            # Gate the loss so all backward ops transitively depend on `after`
-            if after is not None:
-                loss_mb = wait_for(loss_mb, after, name=f"iter{it}.mb{mb}.bwd.wait_sched")
-            
+
+            # Run backward ungated — the grad-recv (SendOp.vjp) and grad-send
+            # (FillOp.vjp) are purely network-ordered; schedule ordering is
+            # applied below to param grads only, keeping sends/recvs out of the
+            # inter-microbatch dependency chain.
             grads_mb = backward(loss_mb, wrt=params + [placeholder])
-            
+
+            # Collect gradient send to prev stage for the end-of-iteration sink.
+            # Do NOT include it in the scheduling token.
+            if placeholder in grads_mb:
+                bwd_deps.append(grads_mb[placeholder])
+
+            # Apply schedule ordering gate to param grads only (not send/recv).
+            if after is not None:
+                gated_param_grads = {
+                    p: wait_for(grads_mb[p], after,
+                                name=f"iter{it}.mb{mb}.bwd.gate.{p.name}")
+                    for p in params if p in grads_mb
+                }
+            else:
+                gated_param_grads = {p: grads_mb[p] for p in params if p in grads_mb}
+
             # Accumulate parameter gradients in-place
             for p in params:
-                grad = grads_mb[p]
+                grad = gated_param_grads[p]
                 if p in accumulated_grads:
                     # Add to existing accumulated gradient
-                    accumulated_grads[p] = add(accumulated_grads[p], grad, 
+                    accumulated_grads[p] = add(accumulated_grads[p], grad,
                                                name=f"iter{it}.acc_grad.{p.name}.mb{mb}")
                 else:
                     # First microbatch: store gradient directly
                     accumulated_grads[p] = grad
-            
-            # Collect gradient send to prev stage (for PP backward)
-            if placeholder in grads_mb:
-                bwd_deps.append(grads_mb[placeholder])
-            
-            return completion(*grads_mb.values(), name=f"iter{it}.mb{mb}.bwd.done")
+
+            return completion(*gated_param_grads.values(), name=f"iter{it}.mb{mb}.bwd.done")
         
         # Execute schedule - scheduler handles ordering and creates dependency edges
         schedule.execute(num_microbatches, pp_stage, pp_size, do_forward, do_backward)
@@ -285,8 +311,13 @@ def build_distributed_single_gpu(
             params, accumulated_grads, plan=Zero1Plan(dp_group=dp), name=f"iter{it}.zero1",
         )
 
+        all_deps.extend(fwd_sends)
         all_deps.extend(bwd_deps)
         all_deps.append(opt_done_tok)
+
+        # Record iteration-end token so the next iteration's recvs are gated
+        # on this iteration completing (coarse ordering for PP recvs).
+        iter_start_tok = opt_done_tok
 
         # Detach params for next iteration
         params = [detach(p, name=p.name) for p in new_params]
@@ -345,7 +376,7 @@ def build_dp_gather_on_demand(
     """
     clear_checkpoint_registry()
 
-    dp = Group("dp", id=0, size=dp_size)
+    dp = Group("dp", size=dp_size, name="dp")
     plan = Zero1Plan(dp_group=dp, gather_policy="gather_on_demand")
 
     # ---- initial parameters ----

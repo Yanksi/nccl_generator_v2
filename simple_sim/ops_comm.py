@@ -43,9 +43,8 @@ class FillOp(CommOp):
 
     @property
     def display_kind(self) -> str:
-        """Return 'recv' when no source (network recv), 'fill' otherwise."""
-        has_source = sum(1 for v in self.inputs if isinstance(v, Tensor)) > 1
-        return "fill" if has_source else "recv"
+        """Return 'recv' when receiving from network (src >= 0), 'fill' otherwise."""
+        return "recv" if self.src >= 0 else "fill"
 
     def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
         tensors = [v for v in self.inputs if isinstance(v, Tensor)]
@@ -180,7 +179,7 @@ def sink(*deps: Token | Tensor, name: str | None = None) -> Token:
 
 @dataclass(frozen=True, eq=False)
 class AllReduceOp(CommOp):
-    group: Group = Group("tp", 0, 1)
+    group: Group = Group("tp", 1)
     parallelism: Parallelism | None = None
     kind: str = field(default="allreduce", init=False)
 
@@ -207,7 +206,7 @@ def allreduce(x: Tensor, *, group: Group, name: str | None = None, parallelism: 
 
 @dataclass(frozen=True, eq=False)
 class ReduceScatterOp(CommOp):
-    group: Group = Group("dp", 0, 1)
+    group: Group = Group("dp", 1)
     parallelism: Parallelism | None = None
     kind: str = field(default="reduce_scatter", init=False)
 
@@ -251,7 +250,7 @@ def reduce_scatter(x: Tensor, *, group: Group, shard_axis: int = 0, name: str | 
 
 @dataclass(frozen=True, eq=False)
 class AllGatherOp(CommOp):
-    group: Group = Group("dp", 0, 1)
+    group: Group = Group("dp", 1)
     shard_axis: int = 0
     parallelism: Parallelism | None = None
     kind: str = field(default="allgather", init=False)

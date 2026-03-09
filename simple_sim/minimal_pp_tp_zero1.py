@@ -11,8 +11,8 @@ from simple_sim import (
 )
 
 def build_rank_step(*, rank: int, tp_size: int, dp_size: int, pp_prev: int | None, pp_next: int | None):
-    tp = Group("tp", id=0, size=tp_size)
-    dp = Group("dp", id=0, size=dp_size)
+    tp = Group("tp", size=tp_size, name="tp")
+    dp = Group("dp", size=dp_size, name="dp")
 
     placeholder = None
 
