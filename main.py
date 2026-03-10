@@ -563,6 +563,11 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    init_generation_flags(
+        zero_price_reduction_copy_flag=False,
+        zero_price_communication_flag=False,
+        enable_intra_node_transfer_flag=False,
+    )
     trace_dir = pathlib.Path(args.trace_dir).resolve()
     output_dir = pathlib.Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
