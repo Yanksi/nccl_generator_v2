@@ -768,7 +768,7 @@ if __name__ == "__main__":
             # Shared array: 1 = merge success, 0 = merge failure (indexed by rank)
             merge_success_array = multiprocessing.Array('i', [0] * total_gpus)
             # Barrier to synchronize all workers after merge phase
-            merge_barrier = multiprocessing.Barrier(n_workers)
+            merge_barrier = multiprocessing.Barrier(min(n_workers, total_gpus))
         
         # Prepare all GPU data in main process - stored in dict for initializer
         gpu_data_dict = {}
@@ -805,14 +805,14 @@ if __name__ == "__main__":
         logger.info(f"Data preparation time: {time_finish_prep - script_start_time:.2f} seconds")
         
         # Now run init + goal generation in parallel processes
-        logger.info(f"initializing GPUs and generating goal files in parallel with {min(n_workers, len(gpu_chunks))} workers")
+        logger.info(f"initializing GPUs and generating goal files in parallel with {len(gpu_chunks)} workers")  ## len(gpu_chunks) = min(n_workers, total_gpus)
         logger.info(f"Total GPUs: {total_gpus}, chunked into {len(gpu_chunks)} chunks")
         if merged_streams:
             logger.info("Stream merging enabled: coordinated across all GPUs (all-or-none)")
         
         # Use initializer to set up shared data once per worker (copy-on-write friendly)
         with multiprocessing.Pool(
-            processes=min(n_workers, len(gpu_chunks)),
+            processes=len(gpu_chunks),  ## len(gpu_chunks) = min(n_workers, total_gpus)
             initializer=_init_worker,
             initargs=(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams, write_buffer_size,
                       merge_success_array, merge_barrier)
