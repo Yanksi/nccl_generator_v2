@@ -812,7 +812,7 @@ if __name__ == "__main__":
         
         # Use initializer to set up shared data once per worker (copy-on-write friendly)
         with multiprocessing.Pool(
-            processes=min(len(gpu_chunks)),  ## len(gpu_chunks) = min(n_workers, total_gpus)
+            processes=len(gpu_chunks),  ## len(gpu_chunks) = min(n_workers, total_gpus)
             initializer=_init_worker,
             initargs=(gpu_data_dict, gpu_id2goal_rank, output_dir, merged_streams, write_buffer_size,
                       merge_success_array, merge_barrier)
