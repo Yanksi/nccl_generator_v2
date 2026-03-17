@@ -1,4 +1,4 @@
-from .ir import Tensor, Token, Group, ShardSpec, OpNode, ComputeOp, CommOp, CostMeta, MemoryCategory, Parallelism, build_rank, get_current_rank
+from .ir import Tensor, Token, Group, ShardSpec, OpNode, ComputeOp, CommOp, CostMeta, MemoryCategory, build_rank, get_current_rank
 from .ops_compute import (
     input_tensor,
     parameter,
@@ -7,6 +7,7 @@ from .ops_compute import (
     activation,
     transpose,
     reshape,
+    slice_view,
     elementwise_binary,
     add,
     reduction,
@@ -19,6 +20,9 @@ from .ops_schedule import (
     detach,
     wait_for,
     completion,
+    recompute_trigger,
+    SinkOp,
+    sink,
     param_factory,
     input_factory,
 )
@@ -31,7 +35,6 @@ from .checkpoint import (
 from .ops_comm import (
     fill,
     send,
-    sink,
     allreduce,
     reduce_scatter,
     allgather,
@@ -44,6 +47,7 @@ from .visualize import visualize_graph, to_dot, print_graph_summary, visualize_m
 from .pp_schedule import PPSchedule, ScheduleStep, GPipeSchedule, OneFOneBSchedule, InterleavedOneFOneBSchedule
 from .aggregate import aggregate_graphs, MultiRankGraph, CrossRankCollective, MergedCollectiveOp, save_graph, load_graph
 from .timeline_visualize import to_chrome_trace, to_chrome_trace_simple, schedule_multi_rank
+from .pp_stage_builder import build_pp_stage_graph, ParallelDim
 
 __all__ = [
     "Tensor",
@@ -54,7 +58,6 @@ __all__ = [
     "ComputeOp",
     "CommOp",
     "MemoryCategory",
-    "Parallelism",
     # constructors
     "input_tensor",
     "parameter",
@@ -62,10 +65,14 @@ __all__ = [
     "detach",
     "wait_for",
     "completion",
+    "recompute_trigger",
+    "SinkOp",
+    "sink",
     "param_factory",
     "input_factory",
     "transpose",
     "reshape",
+    "slice_view",
     "add",
     "elementwise_unary",
     "elementwise_binary",
@@ -124,4 +131,7 @@ __all__ = [
     "to_chrome_trace",
     "to_chrome_trace_simple",
     "schedule_multi_rank",
+    # generalized PP stage builder
+    "build_pp_stage_graph",
+    "ParallelDim",
 ]

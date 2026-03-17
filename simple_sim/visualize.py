@@ -111,13 +111,13 @@ def _get_node_label(node: OpNode) -> str:
         g = node.group
         lines.append(f"<i>{g.kind.upper()} (size={g.size})</i>")
 
-    # PP send/recv: show label, src/dst, and tag
+    # PP send/recv: show label, src/dst
     if hasattr(node, 'label') and node.label:
         lines.append(f"<i>{node.label}</i>")
     if hasattr(node, 'src'):
-        lines.append(f"src={node.src}, tag={node.tag}")
+        lines.append(f"src={node.src}")
     elif hasattr(node, 'dst'):
-        lines.append(f"dst={node.dst}, tag={node.tag}")
+        lines.append(f"dst={node.dst}")
     
     return "<br/>".join(lines)
 

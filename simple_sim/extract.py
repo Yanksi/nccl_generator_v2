@@ -22,6 +22,9 @@ class ExtractedGraph:
     nodes: List[OpNode]
     roots: Tuple[Root, ...]
 
+    def __repr__(self) -> str:
+        return f"ExtractedGraph(num_nodes={len(self.nodes)}, roots={[r.name for r in self.roots]})"
+
 def get_graph(*roots: Root, stop_at_detach: bool = False) -> ExtractedGraph:
     """
     Extract computation graph from root tensors/tokens.
@@ -39,10 +42,7 @@ def get_graph(*roots: Root, stop_at_detach: bool = False) -> ExtractedGraph:
     DetachOp = _get_detach_op_class() if stop_at_detach else None
 
     def push_val(v: Root) -> None:
-        if isinstance(v, Tensor):
-            if v.producer is not None:
-                stack.append(v.producer)
-        else:
+        if v.producer is not None:
             stack.append(v.producer)
 
     for r in roots:
@@ -60,11 +60,7 @@ def get_graph(*roots: Root, stop_at_detach: bool = False) -> ExtractedGraph:
             continue
             
         for inp in n.inputs:
-            if isinstance(inp, Tensor):
-                if inp.producer is not None:
-                    stack.append(inp.producer)
-            else:
-                stack.append(inp.producer)
+            push_val(inp)
 
     out = [nodes[k] for k in sorted(nodes.keys())]
     return ExtractedGraph(nodes=out, roots=tuple(roots))

@@ -31,23 +31,6 @@ class MemoryCategory(enum.Enum):
     """How a tensor's memory is treated during execution."""
     MATERIALIZED = "materialized"          # actually allocated & stored
     NOT_MATERIALIZED = "not_materialized"  # zero-cost view / alias (reshape, ones_like)
-    RECOMPUTED = "recomputed"              # inside checkpoint region, discarded then recomputed
-
-
-class Parallelism(enum.Enum):
-    """Parallelism strategy that triggered a communication operation.
-    
-    This identifies *why* a communication happened, which cannot always be
-    inferred from the communicator alone (e.g., TP and SP share the same group,
-    ZeRO and DP AllReduce share the same group).
-    """
-    TP = "tp"      # Tensor Parallelism (includes Sequence Parallelism)
-    DP = "dp"      # Data Parallelism (gradient AllReduce)
-    PP = "pp"      # Pipeline Parallelism (send/recv activations)
-    ZERO = "zero"  # ZeRO optimizer (reduce-scatter grads, all-gather params)
-    EP = "ep"      # Expert Parallelism (MoE)
-    CP = "cp"      # Context Parallelism (long context)
-
 
 # -------- parallel metadata --------
 
@@ -65,6 +48,7 @@ class Group:
     """
     kind: str  # "dp" | "tp" | "pp" | etc.
     size: int
+    self_rank: int
     name: str | None = None
     ranks: FrozenSet[int] | None = None
     _id: int = field(default_factory=lambda: next(_group_id_counter), compare=False, repr=False)
@@ -79,6 +63,10 @@ class Group:
             return f"{self.kind}:{','.join(map(str, sorted(self.ranks)))}"
         # Last resort: kind + internal id
         return f"{self.kind}_{self._id}"
+    
+    def __hash__(self) -> int:
+        # Hash based on match_key for cross-rank consistency
+        return hash(self.match_key)
 
 @dataclass(frozen=True)
 class ShardSpec:
@@ -154,6 +142,12 @@ class Tensor:
         axis = self.shard.axis % len(s)  # normalize negative axes
         s[axis] //= self.shard.parts
         return tuple(s)
+    
+    def __repr__(self) -> str:
+        shard_str = f", shard={self.shard}" if self.shard.kind != "replicated" else ""
+        tp_str = f", tp_group={self.tp_group.match_key}" if self.tp_group else ""
+        dp_str = f", dp_group={self.dp_group.match_key}" if self.dp_group else ""
+        return f"Tensor(name={self.name}, shape={self.shape}, dtype={self.dtype}{shard_str}{tp_str}{dp_str})"
 
 @dataclass(frozen=True, eq=False)
 class Token:
@@ -210,6 +204,9 @@ class OpNode:
         Override in subclasses. Returns dict with flops, mem_read, mem_write.
         """
         return {"flops": 0, "mem_read": 0, "mem_write": 0}
+    
+    def __repr__(self) -> str:
+        return f"{self.kind}(id={self.id}, rank={self.rank}, inputs={[v.name for v in self.inputs]}, outputs={[v.name for v in self.outputs]})"
 
 
 @dataclass(frozen=True, eq=False)
@@ -218,11 +215,12 @@ class ComputeOp(OpNode):
     pass
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False, kw_only=True)
 class CommOp(OpNode):
     """Base class for communication operations (uses network/NVLink)."""
-    pass
-
+    group: Group         # communicator group for this operation
+    label: str           # tag for matching send/recv pairs across ranks; not necessarily preserved in Goal IR
+    context: str = ""    # for context information that need to be preserved
 
 # -------- helpers --------
 

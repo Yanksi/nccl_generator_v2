@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Tuple
 
-from .ir import Group, Parallelism, ShardSpec, Tensor, tensor_replace
+from .ir import Group, ShardSpec, Tensor, tensor_replace
 from .ops_compute import activation, matmul
 from .ops_comm import allreduce, allgather, reduce_scatter
 
@@ -25,7 +25,7 @@ def tp_row_linear(x_part: Tensor, w_row: Tensor, *, tp_group: Group, name: str) 
     assert w_row.tp_group == tp_group, "w_row.tp_group must be set"
 
     z_partial = matmul(x_part, w_row, name=name + ".partial")
-    z, _tok = allreduce(z_partial, group=tp_group, name=name + ".allreduce", parallelism=Parallelism.TP)
+    z, _tok = allreduce(z_partial, group=tp_group, label=name + ".allreduce", name=name + ".allreduce", context="tp")
     return tensor_replace(z, tp_group=tp_group, shard=ShardSpec("replicated"))
 
 def megatron_mlp(x: Tensor, w1_col: Tensor, w2_row: Tensor, *, tp_group: Group, name: str = "mlp") -> Tensor:
@@ -36,7 +36,7 @@ def megatron_mlp(x: Tensor, w1_col: Tensor, w2_row: Tensor, *, tp_group: Group, 
     Input/output activations are replicated across TP ranks.
     """
     h = tp_column_linear(x, w1_col, tp_group=tp_group, name=name + ".fc1")
-    h = activation(h, name=name + ".act")
+    # h = activation(h, name=name + ".act")
     y = tp_row_linear(h, w2_row, tp_group=tp_group, name=name + ".fc2")
     return y
 
@@ -73,10 +73,11 @@ def sp_column_linear(x_seq_shard: Tensor, w_col: Tensor, *, tp_group: Group, seq
     
     # AllGather to get full sequence on all ranks (just changes shard spec)
     x_full, _tok = allgather(
-        x_seq_shard, 
-        group=tp_group, 
+        x_seq_shard,
+        group=tp_group,
+        label=name + ".allgather",
         name=name + ".allgather",
-        parallelism=Parallelism.TP,
+        context="tp_sp",
     )
     x_full = tensor_replace(x_full, tp_group=tp_group, shard=ShardSpec("replicated"))
     
@@ -110,11 +111,12 @@ def sp_row_linear(x_part: Tensor, w_row: Tensor, *, tp_group: Group, seq_axis: i
     
     # ReduceScatter: sum across TP ranks AND shard along sequence dimension
     z_seq_shard, _tok = reduce_scatter(
-        z_partial, 
-        group=tp_group, 
+        z_partial,
+        group=tp_group,
         shard_axis=seq_axis,
+        label=name + ".reduce_scatter",
         name=name + ".reduce_scatter",
-        parallelism=Parallelism.TP,
+        context="tp_sp",
     )
     return tensor_replace(z_seq_shard, tp_group=tp_group, shard=ShardSpec("sharded", axis=seq_axis, parts=tp_group.size))
 
@@ -153,8 +155,8 @@ def megatron_mlp_sp(
     # AllGather + column-parallel matmul
     h = sp_column_linear(x, w1_col, tp_group=tp_group, seq_axis=seq_axis, name=name + ".fc1")
     
-    # Activation (on full sequence, sharded hidden)
-    h = activation(h, name=name + ".act")
+    # # Activation (on full sequence, sharded hidden)
+    # h = activation(h, name=name + ".act")
     
     # Row-parallel matmul + ReduceScatter
     y = sp_row_linear(h, w2_row, tp_group=tp_group, seq_axis=seq_axis, name=name + ".fc2")

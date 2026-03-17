@@ -10,9 +10,10 @@ from simple_sim import (
     get_graph,
 )
 
-def build_rank_step(*, rank: int, tp_size: int, dp_size: int, pp_prev: int | None, pp_next: int | None):
+def build_rank_step(*, rank: int, tp_size: int, dp_size: int, pp_size: int = 2, pp_prev: int | None, pp_next: int | None):
     tp = Group("tp", size=tp_size, name="tp")
     dp = Group("dp", size=dp_size, name="dp")
+    pp = Group("pp", size=pp_size, name="pp")
 
     placeholder = None
 
@@ -25,7 +26,7 @@ def build_rank_step(*, rank: int, tp_size: int, dp_size: int, pp_prev: int | Non
             memory_category=MemoryCategory.NOT_MATERIALIZED,
             requires_grad=True, name="pp.recv.placeholder",
         )
-        x = fill(placeholder, src=pp_prev, tag=123, name="pp.recv.x")
+        x = fill(placeholder, src=pp_prev, group=pp, label="pp.act.fwd", name="pp.recv.x")
 
     # TP MLP params (Megatron split) — full logical shapes with shard specs
     w1 = parameter((4096, 16384), name="w1", tp_group=tp, dp_group=dp, shard=ShardSpec("sharded", axis=1, parts=tp_size))
@@ -35,7 +36,7 @@ def build_rank_step(*, rank: int, tp_size: int, dp_size: int, pp_prev: int | Non
 
     # Pipeline send (returns NOT_MATERIALIZED Tensor, aliases y)
     if pp_next is not None:
-        loss = send(y, dst=pp_next, tag=456, name="pp.send.y")
+        loss = send(y, dst=pp_next, group=pp, label="pp.act.fwd", name="pp.send.y")
     else:
         loss = y
 

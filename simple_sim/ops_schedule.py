@@ -32,13 +32,6 @@ class DetachOp(ComputeOp):
     """
     kind: str = field(default="detach", init=False)
 
-    def get_cost_meta(self) -> CostMeta:
-        return {"flops": 0, "mem_read": 0, "mem_write": 0}
-
-    def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
-        # Stop gradient - return no gradients to input
-        return {}
-
 
 def detach(x: Tensor, *, name: str | None = None) -> Tensor:
     """
@@ -87,9 +80,6 @@ class WaitForOp(ComputeOp):
     """
     kind: str = field(default="wait_for", init=False)
 
-    def get_cost_meta(self) -> CostMeta:
-        return {"flops": 0, "mem_read": 0, "mem_write": 0}
-
     def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
         # Pass through gradient unchanged
         (x,) = [v for v in self.inputs if isinstance(v, Tensor)]
@@ -123,11 +113,8 @@ def wait_for(x: Tensor, after: "Token | Tensor", *, name: str | None = None) -> 
     )
     return out
 
-
-# -------- CompletionOp --------
-
 @dataclass(frozen=True, eq=False)
-class CompletionOp(ComputeOp):
+class TokenGenOp(ComputeOp):
     """
     Scheduling-only op that converts one or more tensors into a Token.
 
@@ -137,13 +124,7 @@ class CompletionOp(ComputeOp):
 
     Zero cost — pure scheduling primitive.
     """
-    kind: str = field(default="completion", init=False)
-
-    def get_cost_meta(self) -> CostMeta:
-        return {"flops": 0, "mem_read": 0, "mem_write": 0}
-
-    def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
-        return {}
+    kind: str = "token_gen"
 
 
 def completion(*tensors: Tensor, name: str | None = None) -> Token:
@@ -156,28 +137,8 @@ def completion(*tensors: Tensor, name: str | None = None) -> Token:
       completion
     - Any place where you need a "barrier" token derived from tensors
     """
-    node = CompletionOp(inputs=tuple(tensors))
+    node = TokenGenOp(inputs=tuple(tensors), kind="completion")
     return Token(producer=node, name=name)
-
-
-# -------- RecomputeTriggerOp --------
-
-@dataclass(frozen=True, eq=False)
-class RecomputeTriggerOp(ComputeOp):
-    """
-    Scheduling-only op that converts a gradient tensor into a Token.
-
-    Used during backward to create a dependency edge: the recomputed
-    forward sub-graph should not start until backward has actually
-    reached the checkpoint boundary (i.e. ``grad_output`` is available).
-    """
-    kind: str = field(default="recompute_trigger", init=False)
-
-    def get_cost_meta(self) -> CostMeta:
-        return {"flops": 0, "mem_read": 0, "mem_write": 0}
-
-    def vjp(self, grad_output: Tensor) -> Dict[Tensor, Tensor]:
-        return {}  # no gradient through a scheduling token
 
 
 def recompute_trigger(grad: Tensor, *, name: str | None = None) -> Token:
@@ -188,7 +149,7 @@ def recompute_trigger(grad: Tensor, *, name: str | None = None) -> Token:
     cloned forward ops depend on backward actually reaching the
     checkpoint boundary rather than being schedulable immediately.
     """
-    node = RecomputeTriggerOp(inputs=(grad,))
+    node = TokenGenOp(inputs=(grad,), kind="recompute_trigger")
     return Token(producer=node, name=name)
 
 
@@ -283,3 +244,22 @@ def input_factory(
     if after is not None:
         t = wait_for(t, after, name=t.name)
     return t
+
+
+# -------- SinkOp / sink --------
+
+@dataclass(frozen=True, eq=False)
+class SinkOp(ComputeOp):
+    """Barrier op: aggregates multiple Tokens/Tensors into a single Token.
+
+    Pure scheduling primitive — no computational cost.
+    Lives here (not in ops_comm) because it does not involve any actual
+    communication; it only expresses ordering/dependency constraints.
+    """
+    kind: str = field(default="sink", init=False)
+
+
+def sink(*deps: "Token | Tensor", name: str | None = None) -> Token:
+    """Create a barrier Token that depends on all *deps* (Tokens or Tensors)."""
+    node = SinkOp(inputs=tuple(deps))
+    return Token(producer=node, name=name)

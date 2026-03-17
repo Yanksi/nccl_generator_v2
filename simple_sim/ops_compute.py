@@ -227,6 +227,35 @@ def reshape(x: Tensor, *, shape: Sequence[int], shard: ShardSpec | None = None, 
                   memory_category=MemoryCategory.NOT_MATERIALIZED, aliases=x)
 
 
+def slice_view(x: Tensor, *, shape: Sequence[int], shard: ShardSpec | None = None, name: str | None = None) -> Tensor:
+    """Zero-cost slice view of a tensor.
+
+    Models a contiguous sub-slice of an existing tensor (e.g. splitting a
+    fused QKV projection into the Q, K, V components).  Unlike
+    :func:`reshape`, the output may contain *fewer* elements than the input
+    — no numel equality is checked.  The output is always marked
+    ``NOT_MATERIALIZED`` and aliases the input.
+
+    If ``shard`` is not provided the shard spec is inherited from ``x``.
+    """
+    out_shard = shard if shard is not None else x.shard
+    phys_in = x.physical_shape()
+    node = ShapeChangeOp(
+        input_shape=phys_in, output_shape=phys_in,
+        has_cost=False, kind="reshape", is_view=True,
+        inputs=(x,),
+    )
+    return Tensor(
+        shape=tuple(shape), dtype=x.dtype, producer=node,
+        requires_grad=x.requires_grad,
+        name=name,
+        tp_group=x.tp_group, dp_group=x.dp_group,
+        shard=out_shard,
+        memory_category=MemoryCategory.NOT_MATERIALIZED,
+        aliases=x,
+    )
+
+
 def transpose(x: Tensor, *, name: str | None = None) -> Tensor:
     """Transpose a 2D tensor. Zero-cost view.
 

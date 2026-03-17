@@ -34,9 +34,13 @@ from simple_sim import (
     PPSchedule,
     GPipeSchedule,
     OneFOneBSchedule,
+    # generalized PP stage builder
+    build_pp_stage_graph,
+    ParallelDim,
 )
-from simple_sim.ir import tensor_replace
+from simple_sim.ir import Token, tensor_replace
 from simple_sim.visualize import visualize_graph
+import pickle
 
 
 def build_training_iteration(x, w1, w2, w3, iteration, use_checkpoint=True):
@@ -123,7 +127,8 @@ def build_full_training(num_iterations=2, use_checkpoint=True):
 # ====================================================================
 
 def build_distributed_single_gpu(
-    pp_stage: int = 3,
+    # pp_stage: int = 3,
+    device_id: int = 0,
     tp_size: int = 4,
     dp_size: int = 4,
     pp_size: int = 8,
@@ -169,11 +174,23 @@ def build_distributed_single_gpu(
     if schedule is None:
         schedule = GPipeSchedule()
     
+    total_devices = tp_size * dp_size * pp_size
+    assert 0 <= device_id < total_devices, f"device_id must be in [0, {total_devices-1}]"
+    pp_stage = device_id // (tp_size * dp_size)
+    # Standard Megatron convention: TP is fastest-varying, then DP, then PP
+    local_id = device_id % (tp_size * dp_size)
+    tp_rank = local_id % tp_size   # TP rank within this GPU's TP group
+    dp_rank = local_id // tp_size  # DP rank within this GPU's DP group
+
     clear_checkpoint_registry()
 
     # ---- group handles (this GPU's local view) ----
-    tp = Group("tp", size=tp_size, name="tp")
-    dp = Group("dp", size=dp_size, name="dp")
+    # TP group: tp_size GPUs sharing the same pp_stage and dp_rank
+    tp = Group("tp", size=tp_size, name=f"pp{pp_stage}_dp{dp_rank}")
+    # DP group: dp_size GPUs sharing the same pp_stage and tp_rank
+    dp = Group("dp", size=dp_size, name=f"pp{pp_stage}_tp{tp_rank}")
+    # PP group: pp_size GPUs sharing the same tp_rank and dp_rank
+    pp = Group("pp", size=pp_size, name=f"tp{tp_rank}_dp{dp_rank}")
 
     prev_pp_rank = pp_stage - 1          # source for fwd activation
     next_pp_rank = pp_stage + 1          # dest   for fwd activation
@@ -197,7 +214,7 @@ def build_distributed_single_gpu(
     act_shard = ShardSpec("sharded", axis=0, parts=tp_size)  # seq-sharded
 
     all_deps = []
-    iter_start_tok = None  # set to opt_done_tok after each iteration
+    iter_start_tok = Token(producer=None, name="training_start")  # set to opt_done_tok after each iteration
 
     for it in range(num_iterations):
         # ==============================================================
@@ -236,7 +253,7 @@ def build_distributed_single_gpu(
             if iter_start_tok is not None:
                 inp = wait_for(placeholder, iter_start_tok, name=f"iter{it}.mb{mb}.fwd.iter_start")
             x = fill(
-                inp, src=prev_pp_rank, tag=mb,
+                inp, src=prev_pp_rank, group=pp,
                 label=pp_label_fwd, name=f"iter{it}.mb{mb}.pp.recv_act",
             )
 
@@ -254,7 +271,7 @@ def build_distributed_single_gpu(
             # in the scheduling token so downstream microbatch compute doesn't
             # wait on this network send completing.
             loss_mb = send(
-                y, dst=next_pp_rank, tag=mb,
+                y, dst=next_pp_rank, group=pp,
                 label=pp_label_fwd, name=f"iter{it}.mb{mb}.pp.send_act",
             )
             fwd_sends.append(loss_mb)
@@ -334,13 +351,13 @@ def build_distributed_single_gpu(
         tp_group=tp,
     )
     inf_x = fill(
-        inf_placeholder, src=prev_pp_rank, tag=100,
+        inf_placeholder, src=prev_pp_rank, group=pp,
         label="inf.fwd", name="inf.pp.recv_act",
     )
     inf_y = megatron_mlp_sp(inf_x, params[0], params[1], tp_group=tp, seq_axis=0,
                             name="inf.stage.mlp")
     inf_sent = send(
-        inf_y, dst=next_pp_rank, tag=100,
+        inf_y, dst=next_pp_rank, group=pp,
         label="inf.fwd", name="inf.pp.send_act",
     )
 
@@ -348,6 +365,87 @@ def build_distributed_single_gpu(
     done = sink(*all_deps, inf_sent, name="stage.done")
     g = get_graph(done)
     return g
+
+
+# ====================================================================
+# Generalized wrapper: Megatron MLP SP via build_pp_stage_graph
+# ====================================================================
+
+def build_distributed_megatron_sp(
+    device_id: int = 0,
+    tp_size: int = 4,
+    dp_size: int = 4,
+    pp_size: int = 8,
+    hidden: int = 1024,
+    inter: int = 4096,
+    seq: int = 2048,
+    batch: int = 8,
+    num_microbatches: int = 4,
+    num_iterations: int = 1,
+    schedule: PPSchedule | None = None,
+):
+    """
+    Wrapper around :func:`build_pp_stage_graph` that reproduces the exact
+    behaviour of :func:`build_distributed_single_gpu` using a Megatron-style
+    MLP with Sequence Parallelism (AllGather → column-parallel matmul →
+    row-parallel matmul → ReduceScatter).
+
+    All PP/TP/DP scheduling boilerplate lives in ``build_pp_stage_graph``.
+    This function only defines:
+
+    * ``model_spec`` — parameter factories for ``w1_col`` / ``w2_row`` and
+      the ``"_input"`` activation spec.
+    * ``forward_fn`` — a thin wrapper around :func:`megatron_mlp_sp`.
+
+    Args:
+        device_id: Global device index in [0, tp_size * dp_size * pp_size).
+        tp_size, dp_size, pp_size: Parallelism degrees.
+        hidden: Hidden dimension (full, unsharded).
+        inter: Intermediate (FFN) dimension (full, unsharded).
+        seq: Sequence length.
+        batch: Microbatch size.
+        num_microbatches: Microbatches per training iteration.
+        num_iterations: Number of training iterations to unroll.
+        schedule: Pipeline schedule. Defaults to GPipeSchedule.
+    """
+    tokens = seq * batch
+
+    # ---- model spec: activation shape + parameter factories ----
+    model_spec = {
+        "_input": lambda tp, dp: (
+            (tokens, hidden),
+            "fp16",
+            ShardSpec("sharded", axis=0, parts=tp.size),
+        ),
+        "w1_col": lambda tp, dp: parameter(
+            (hidden, inter), name="w1_col",
+            tp_group=tp,
+            shard=ShardSpec("sharded", axis=1, parts=tp.size),
+        ),
+        "w2_row": lambda tp, dp: parameter(
+            (inter, hidden), name="w2_row",
+            tp_group=tp,
+            shard=ShardSpec("sharded", axis=0, parts=tp.size),
+        ),
+    }
+
+    # ---- forward function: Megatron MLP with Sequence Parallelism ----
+    def forward_fn(x, params_dict, ctx, *, name):
+        return megatron_mlp_sp(
+            x, params_dict["w1_col"], params_dict["w2_row"],
+            tp_group=ctx["tp"].group, seq_axis=0, name=name,
+        )
+
+    return build_pp_stage_graph(
+        forward_fn, model_spec,
+        device_id=device_id,
+        tp_size=tp_size,
+        dp_size=dp_size,
+        pp_size=pp_size,
+        num_microbatches=num_microbatches,
+        num_iterations=num_iterations,
+        schedule=schedule,
+    )
 
 
 # ====================================================================
@@ -470,11 +568,14 @@ if __name__ == "__main__":
     print("=" * 60)
     gpipe_schedule = GPipeSchedule()
     print(f"Schedule steps: {gpipe_schedule.generate(4, pp_stage=1, pp_size=3)}")
-    g_gpipe = build_distributed_single_gpu(num_microbatches=4, num_iterations=1, schedule=gpipe_schedule, pp_stage=1, pp_size=3)
+    g_gpipe = build_distributed_single_gpu(num_microbatches=4, num_iterations=1, schedule=gpipe_schedule, device_id=16, pp_size=3)
     print(f"\nGraph has {len(g_gpipe.nodes)} nodes")
     print_graph_summary(g_gpipe)
     visualize_graph(g_gpipe, output='graph_distributed_gpipe', format='svg', show_tensors=True)
     print("\nSaved to graph_distributed_gpipe.svg")
+    with open('graph_distributed_gpipe.pkl', 'wb') as f:
+        pickle.dump(g_gpipe, f)
+        print("\nSaved graph object to graph_distributed_gpipe.pkl")
 
     print("\n" + "=" * 60)
     print("DISTRIBUTED (GPipe): TP=4, DP=4, PP=3  (single GPU, PP stage 1)")
@@ -483,11 +584,14 @@ if __name__ == "__main__":
     print("=" * 60)
     one_f_one_b_schedule = OneFOneBSchedule()
     print(f"Schedule steps: {one_f_one_b_schedule.generate(4, pp_stage=1, pp_size=3)}")
-    g_1f1b = build_distributed_single_gpu(num_microbatches=4, num_iterations=1, schedule=one_f_one_b_schedule, pp_stage=1, pp_size=3)
+    g_1f1b = build_distributed_single_gpu(num_microbatches=4, num_iterations=1, schedule=one_f_one_b_schedule, device_id=16, pp_size=3)
     print(f"\nGraph has {len(g_1f1b.nodes)} nodes")
     print_graph_summary(g_1f1b)
     visualize_graph(g_1f1b, output='graph_distributed_1f1b', format='svg', show_tensors=True)
     print("\nSaved to graph_distributed_1f1b.svg")
+    with open('graph_distributed_1f1b.pkl', 'wb') as f:
+        pickle.dump(g_1f1b, f)
+        print("\nSaved graph object to graph_distributed_1f1b.pkl")
 
     # # ================================================================
     # # DP-only with gather_on_demand ZeRO-1

@@ -6,7 +6,7 @@ from math import ceil
 from abc import ABC, abstractmethod
 from nccl_primitives import *
 from goal import GoalOp
-from comm import Communicator, CollDevice, CommOp, CollAlgo
+from communication import Communicator, CollDevice, CommOp, CollAlgo
 
 class NCCLProto(Enum):
     LL = 0
@@ -25,7 +25,7 @@ class RingTopoNode:
 
 class NCCLCommunicator(Communicator):
     def __init__(self, comm_id: str, gpu_ids: List[GpuId]):
-        super().__init__(comm_id, gpu_ids)
+        super().__init__(gpu_ids, comm_id)
         # for compatibility with the original interface
         self.rank2gpu_id = self.rank2device_id
         self.gpu_id2rank = self.device_id2rank
