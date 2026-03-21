@@ -314,8 +314,8 @@ if __name__ == "__main__":
         tree_viz.render_all()
 
     if node_topo_file_path is not None:
-        node_groups = get_node_groups(node_topo_file_path)
-        comm_info, comm_ring_info, comm_tree_info = update_topo_info(comm_info, comm_ring_info, comm_tree_info, node_groups)
+        last_level_swtich_radix_down = get_node_groups(node_topo_file_path)
+        comm_info, comm_ring_info, comm_tree_info = update_topo_info(comm_info, comm_ring_info, comm_tree_info, last_level_swtich_radix_down)
         if viz_virtual_topo:
             ring_viz = NCCLRingVisualizer(comm_info=comm_info, comm_ring_info=comm_ring_info, out_dir=trace_dir / "topo_figs", tag="updated")
             ring_viz.render_all()

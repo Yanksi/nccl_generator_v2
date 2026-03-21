@@ -6,29 +6,46 @@ from typing import Dict, Tuple
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-def get_node_groups(topo_file) -> pd.DataFrame:
-    Tier_to_RadixDown = []
-    cur_tier = None
+# def get_node_groups(topo_file) -> pd.DataFrame:
+#     Tier_to_RadixDown = []
+#     cur_tier = None
 
+#     with open(topo_file, "r") as f:
+#         for line in f:
+#             line = line.strip()
+#             if not line:
+#                 continue
+
+#             if line.startswith("Tier"):
+#                 _, tier_id = line.split()
+#                 cur_tier = int(tier_id)
+
+#             elif line.startswith("Radix_Down") and cur_tier is not None:
+#                 _, radix_down = line.split()
+#                 Tier_to_RadixDown.append({
+#                     "Tier": cur_tier,
+#                     "Radix_Down": int(radix_down)
+#                 })
+
+#     Tier_to_RadixDown_df = pd.DataFrame(Tier_to_RadixDown).sort_values("Tier").reset_index(drop=True)
+#     return Tier_to_RadixDown_df
+
+def get_node_groups(topo_file) -> int:
     with open(topo_file, "r") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
 
-            if line.startswith("Tier"):
-                _, tier_id = line.split()
-                cur_tier = int(tier_id)
+            if line.startswith("p"):  ## Dragonfly and Slim fly
+                _, p_val = line.split()
+                return int(p_val)
 
-            elif line.startswith("Radix_Down") and cur_tier is not None:
+            if line.startswith("Radix_Down"):
                 _, radix_down = line.split()
-                Tier_to_RadixDown.append({
-                    "Tier": cur_tier,
-                    "Radix_Down": int(radix_down)
-                })
+                return int(radix_down)
 
-    Tier_to_RadixDown_df = pd.DataFrame(Tier_to_RadixDown).sort_values("Tier").reset_index(drop=True)
-    return Tier_to_RadixDown_df
+    raise ValueError(f"Invalid topology file format: {topo_file}")
 
 def build_comm_tier0_groups(comm_info: pd.DataFrame, tier_0_groups: pd.DataFrame) -> pd.DataFrame:
     comm_nodes_df = comm_info[["commId", "nodeId"]].drop_duplicates().reset_index(drop=True)
@@ -53,10 +70,9 @@ def build_comm_tier0_groups(comm_info: pd.DataFrame, tier_0_groups: pd.DataFrame
 
     return res_df
 
-def update_topo_info(comm_info: pd.DataFrame, comm_ring_info: pd.DataFrame, comm_tree_info: pd.DataFrame, node_groups: pd.DataFrame) -> Tuple[pd.DataFrame]:
+def update_topo_info(comm_info: pd.DataFrame, comm_ring_info: pd.DataFrame, comm_tree_info: pd.DataFrame, last_level_swtich_radix_down: int) -> Tuple[pd.DataFrame]:
     node_ids = comm_info['nodeId'].drop_duplicates().reset_index(drop=True)
-    tier_0_Radix_Down = node_groups[node_groups["Tier"] == 0]["Radix_Down"].iloc[0]  ## get the radix down value of tier0 switches
-    tier_0_groups =  node_ids.to_frame(name="nodeId").assign(tier0_switch_id=lambda df: df.index // tier_0_Radix_Down)  ## assign a tier0 switch id to each node
+    tier_0_groups =  node_ids.to_frame(name="nodeId").assign(tier0_switch_id=lambda df: df.index * 4 // last_level_swtich_radix_down)  ## assign a tier0 switch id to each node
     tier_0_groups["nodeId_in_switch_group"] = tier_0_groups.groupby("tier0_switch_id").cumcount()
     tier_0_groups["num_nodes_in_switch_group"] = tier_0_groups.groupby("tier0_switch_id")["nodeId"].transform("nunique")
 
