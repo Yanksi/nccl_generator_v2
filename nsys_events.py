@@ -110,6 +110,8 @@ def get_communicator_info(data: pd.DataFrame):
     comm_info[["commHash", "commId", "rank", "nRanks", "pid"]] = comm_info[
         "text"
     ].str.extract(comm_info_pattern)
+    # If commId is missing (e.g. Init START format), use commHash as commId
+    comm_info["commId"] = comm_info["commId"].fillna(comm_info["commHash"])
     comm_info = convert_numeric(comm_info, [], ["rank", "nRanks", "pid"])
     comm_info = comm_info.drop(
         columns=["text", "start", "end", "eventId"]

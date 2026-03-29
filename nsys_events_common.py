@@ -38,7 +38,7 @@ def convert_numeric(
 
 # All NVTX regex patterns - defined once globally
 NVTX_PATTERNS = {
-    "comm_info": r"commHash (0x[0-9a-f]+) commId (0x[0-9a-f]+) rank (\d+) nranks (\d+) pid (\d+)",
+    "comm_info": r"(?:Init START )?commHash (0x[0-9a-f]+) (?:commId (0x[0-9a-f]+) )?rank (\d+) nranks (\d+) (?:ncclUniqueIdHash 0x[0-9a-f]+ )?pid (\d+)",
     "comm_ring": r"commHash (0x[0-9a-f]+) Rings \[(\d+)\] (\d+)->(\d+)->(\d+) pid (\d+)",
     "comm_tree": r"commHash (0x[0-9a-f]+) Trees \[(\d+)\] (-?\d+)/(-?\d+)/(-?\d+)->(-?\d+)->(-?\d+) pid (\d+)",
     "profile_start": r"nsys profiling start, pid: (\d+)",
@@ -123,6 +123,8 @@ def process_nvtx_by_category(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     comm_info = df[df["category"] == "comm_info"].copy()
     if len(comm_info) > 0:
         comm_info[["commHash", "commId", "rank", "nRanks", "pid"]] = comm_info["text"].str.extract(NVTX_PATTERNS["comm_info"])
+        # If commId is missing (e.g. Init START format), use commHash as commId
+        comm_info["commId"] = comm_info["commId"].fillna(comm_info["commHash"])
         comm_info[["rank", "nRanks", "pid"]] = comm_info[["rank", "nRanks", "pid"]].astype("UInt64")
         comm_info = comm_info.drop(columns=["text", "category"])
         result["comm_info"] = comm_info

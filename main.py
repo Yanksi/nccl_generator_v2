@@ -561,6 +561,13 @@ if __name__ == "__main__":
         default=None,
         help="Optional NCCL runtime log file to recover communicator init metadata.",
     )
+    parser.add_argument(
+        "--force-proto",
+        type=str,
+        default=None,
+        choices=["LL", "LL128", "Simple"],
+        help="Override the protocol for all collectives (e.g., when NCCL selects LL at runtime but traces show Simple).",
+    )
 
     args = parser.parse_args()
     trace_dir = pathlib.Path(args.trace_dir).resolve()
@@ -579,6 +586,10 @@ if __name__ == "__main__":
 
     npkit_data_simple = args.npkit_data_simple
     npkit_data_ll = args.npkit_data_ll
+    force_proto_str = args.force_proto
+    force_proto = {"LL": NCCLProto.LL, "LL128": NCCLProto.LL128, "Simple": NCCLProto.SIMPLE}.get(force_proto_str)
+    if force_proto is not None:
+        logger.info(f"Forcing protocol override: {force_proto_str} ({force_proto})")
     nccl_log_path = pathlib.Path(args.nccl_log).resolve() if args.nccl_log else None
     if nccl_log_path is None:
         auto_logs = sorted(trace_dir.parent.glob("log-*.out"))
@@ -697,6 +708,8 @@ if __name__ == "__main__":
         coll_info_gpu = coll_info[gpu_id].copy()
         coll_info_gpu["algo"] = coll_info_gpu["algo"].map(algo_mapping)
         coll_info_gpu["proto"] = coll_info_gpu["proto"].map(proto_mapping)
+        if force_proto is not None:
+            coll_info_gpu["proto"] = force_proto
         
         coll_kernel_gpu = coll_kernels[gpu_id].copy()
         

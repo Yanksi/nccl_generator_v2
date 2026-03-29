@@ -54,9 +54,25 @@ class GPUStream:
             )
             coll_kernel_groups = self.self_gpu.dfs["coll_kernels"]
             if event_id not in coll_kernel_groups.groups:
-                logger.warning(f"Event ID {event_id} not found in coll_kernels for GPU {self.self_gpu.id}.")
-                return None
-            coll_chnl_infos = coll_kernel_groups.get_group(event_id).apply(
+                # Synthesize coll_kernel data from coll_info when nWarps markers are missing
+                logger.info(f"Synthesizing coll_kernel for event {event_id} from coll_info (GPU {self.self_gpu.id})")
+                data_size = int(coll_info_row["data_size"])
+                type_size = int(coll_info_row["type_size"])
+                count = data_size // type_size
+                chunk_count = count  # single channel
+                work_count = 1
+                last_chunk_count = count
+                coll_chnl_infos = pd.Series([CollChnlInfo(
+                    count=count,
+                    chunk_count=chunk_count,
+                    work_count=work_count,
+                    last_chunk_count=last_chunk_count,
+                    work_offset=0,
+                    send_buff=0,
+                    recv_buff=0,
+                )])
+            else:
+                coll_chnl_infos = coll_kernel_groups.get_group(event_id).apply(
                 lambda row: CollChnlInfo(
                     count=int(row["count"]),
                     chunk_count=int(row["chunkCount"]),
@@ -68,6 +84,14 @@ class GPUStream:
                 ),
                 axis=1
             )
+            # When protocol is LL, scale chunk sizes: nWarps records Simple-protocol
+            # values (grainSize=512B), but LL uses grainSize=16B → ratio = 32
+            from nccl_comm import NCCLProto
+            if coll_info.proto == NCCLProto.LL:
+                SIMPLE_TO_LL_GRAIN_RATIO = 32  # 512 / 16
+                for cci in coll_chnl_infos:
+                    cci.chunk_count = max(1, cci.chunk_count // SIMPLE_TO_LL_GRAIN_RATIO)
+                    cci.last_chunk_count = max(1, cci.last_chunk_count // SIMPLE_TO_LL_GRAIN_RATIO)
             return coll_class(self.self_gpu.gpu_id, comm_data["communicator"], coll_info, coll_chnl_infos, comm_data["context_label"])
             
         elif issubclass(coll_class, P2POp):
