@@ -219,7 +219,7 @@ def get_event_info(data: Dict[str, pd.DataFrame], comm_info: pd.DataFrame = None
             coll_kernels = coll_kernels.sort_values(by="start").reset_index(drop=True)
 
             comm_starts = coll_comm["start"].to_numpy()
-            comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
+            comm_ends = np.concatenate([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
 
             coll_info_starts = coll_infos["start"].to_numpy()
             coll_infos["association"] = _associate_events(
@@ -251,7 +251,7 @@ def get_event_info(data: Dict[str, pd.DataFrame], comm_info: pd.DataFrame = None
                 curr_p2p_comm = p2p_comm[p2p_comm["collective"] == p2p_type].sort_values(by="start").reset_index(drop=True)
                 curr_p2p_kernels = p2p_kernels[p2p_kernels["p2pType"] == type_id].sort_values(by="start").reset_index(drop=True).copy()
                 comm_starts = curr_p2p_comm["start"].to_numpy()
-                comm_ends = np.concat([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
+                comm_ends = np.concatenate([comm_starts[1:], np.array([np.iinfo(np.int64).max])])
                 p2p_kernel_starts = curr_p2p_kernels["start"].to_numpy()
                 curr_p2p_kernels["association"] = _associate_events(
                     comm_starts,

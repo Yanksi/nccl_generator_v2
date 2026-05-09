@@ -499,9 +499,8 @@ def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame, pro
 
     first_nvtxs_in_group = grouped_nvtxs.groupby("groupId").first().reset_index()
     dropped_nvtxs = (
-        grouped_nvtxs.groupby("groupId")
-        .apply(lambda x: x.iloc[1:], include_groups=False)
-        .reset_index(level=0)
+        grouped_nvtxs.groupby("groupId", group_keys=False)
+        .apply(lambda x: x.iloc[1:])
         .reset_index(drop=True)
     )
 

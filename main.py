@@ -538,6 +538,180 @@ def concatenate_goal_files(output_dir: pathlib.Path, num_ranks: int, delete_part
     return output_file
 
 
+def _safe_int(value, default: int = 0) -> int:
+    if value is None or pd.isna(value):
+        return default
+    return int(value)
+
+
+def _collective_name(value) -> str:
+    if isinstance(value, type):
+        return value.__name__
+    return str(value)
+
+
+def _event_data_size(gpu: GPUDevice, event_id: int, event_row: pd.Series) -> int:
+    collective = _collective_name(event_row["collective"])
+    if collective in {"Send", "Recv"}:
+        p2p_kernel_groups = gpu.dfs["p2p_kernels"]
+        if event_id in p2p_kernel_groups.groups:
+            p2p_rows = p2p_kernel_groups.get_group(event_id)
+            if "Bytes" in p2p_rows.columns and len(p2p_rows) > 0:
+                return _safe_int(p2p_rows["Bytes"].max())
+        return _safe_int(event_row.get("data_size", 0), 0)
+
+    coll_info = gpu.dfs["coll_info"]
+    if event_id in coll_info.index:
+        coll_info_row = coll_info.loc[event_id]
+        if isinstance(coll_info_row, pd.DataFrame):
+            coll_info_row = coll_info_row.iloc[0]
+        if "data_size" in coll_info_row:
+            return _safe_int(coll_info_row["data_size"])
+    return _safe_int(event_row.get("data_size", 0), 0)
+
+
+def _profile_start(profiling_interval, gpu: GPUDevice) -> int:
+    if profiling_interval is None:
+        return 0
+    interval = profiling_interval.get(gpu.gpu_id)
+    if interval is None:
+        return 0
+    return _safe_int(interval[0], 0)
+
+
+def _iter_intermediate_groups(gpu: GPUDevice, stream: GPUStream):
+    buckets = {}
+    for start, end, coll in zip(stream.coll_starts, stream.coll_ends, stream.collectives):
+        if not isinstance(coll, int):
+            continue
+        event_row = gpu.dfs["comm_data"].loc[coll]
+        group_id = _safe_int(event_row.get("groupId", -1), -1)
+        key = ("group", group_id) if group_id >= 0 else ("event", coll)
+        bucket = buckets.setdefault(
+            key,
+            {
+                "start": _safe_int(start),
+                "end": _safe_int(end),
+                "events": [],
+            },
+        )
+        bucket["start"] = min(bucket["start"], _safe_int(start))
+        bucket["end"] = max(bucket["end"], _safe_int(end))
+        bucket["events"].append((coll, event_row))
+
+    for bucket in sorted(buckets.values(), key=lambda item: (item["start"], item["end"])):
+        bucket["events"].sort(
+            key=lambda event: (
+                _safe_int(event[1].get("start", bucket["start"])),
+                _safe_int(event[0]),
+            )
+        )
+        yield bucket["start"], bucket["end"], bucket["events"]
+
+
+def write_intermediate_goal_file(
+    gpu_devices: Dict[Tuple[str, int], GPUDevice],
+    gpu_id2goal_rank: Dict[Tuple[str, int], int],
+    output_file: pathlib.Path,
+    profiling_interval=None,
+) -> pathlib.Path:
+    """Write a V1-style intermediate GOAL file that keeps NCCL ops unexploded."""
+    ordered_gpus = sorted(gpu_devices.values(), key=lambda gpu: gpu_id2goal_rank[gpu.gpu_id])
+    with open(output_file, "w") as f:
+        f.write(f"num_ranks {len(ordered_gpus)}\n")
+        for gpu in ordered_gpus:
+            rank = gpu_id2goal_rank[gpu.gpu_id]
+            task_counter = 0
+            f.write(f"\nrank {rank} {{\n")
+
+            task_counter += 1
+            f.write(f"l{task_counter}: calc 0\n")
+            node_start_calc_id = task_counter
+
+            task_counter += 1
+            f.write(f"l{task_counter}: calc 0\n")
+            node_end_calc_id = task_counter
+
+            for stream_id, stream in gpu.streams_sorted():
+                groups = list(_iter_intermediate_groups(gpu, stream))
+                if len(groups) == 0:
+                    continue
+
+                last_group_event_end_time = _profile_start(profiling_interval, gpu)
+                last_group_event_end_id = node_start_calc_id
+                for group_index, (group_start, group_end, events) in enumerate(groups):
+                    task_counter += 1
+                    gap = max(0, group_start - last_group_event_end_time)
+                    f.write(f"l{task_counter}: calc {gap}\n")
+                    f.write(f"l{task_counter} requires l{last_group_event_end_id}\n")
+                    group_event_start_calc_id = task_counter
+
+                    task_counter += 1
+                    f.write(f"l{task_counter}: calc 0\n")
+                    group_event_end_calc_id = task_counter
+                    last_group_event_end_time = group_end
+                    last_group_event_end_id = task_counter
+
+                    task_counter += 1
+                    f.write(f"l{task_counter}: calc 0\n")
+                    f.write(f"l{task_counter} requires l{group_event_start_calc_id}\n")
+                    group_start_calc_id = task_counter
+
+                    task_counter += 1
+                    f.write(f"l{task_counter}: calc 0\n")
+                    f.write(f"l{group_event_end_calc_id} requires l{task_counter}\n")
+                    group_end_calc_id = task_counter
+
+                    for event_id, event_row in events:
+                        task_counter += 1
+                        collective = _collective_name(event_row["collective"])
+                        data_size = _event_data_size(gpu, event_id, event_row)
+                        comm_index = _safe_int(event_row.get("comm_index", 0), 0)
+                        seq = _safe_int(event_row.get("seq", 0), 0)
+                        f.write(
+                            f"l{task_counter}: {collective} {data_size} bytes comm {comm_index} "
+                            f"gpu {gpu.id} stream {stream_id} seq {seq} end\n"
+                        )
+                        f.write(f"l{task_counter} requires l{group_start_calc_id}\n")
+                        f.write(f"l{group_end_calc_id} requires l{task_counter}\n")
+
+                    if group_index == len(groups) - 1:
+                        f.write(f"l{node_end_calc_id} requires l{last_group_event_end_id}\n")
+
+            f.write("}\n")
+    return output_file
+
+
+def initialize_gpus_from_prepared_data(
+    gpu_data_dict: Dict[Tuple[str, int], dict],
+    gpu_id2goal_rank: Dict[Tuple[str, int], int],
+    merged_streams: bool,
+) -> Dict[Tuple[str, int], GPUDevice]:
+    initialized_gpus = {}
+    merged_streams_dict = {}
+    all_can_merge = True
+    for gpu_id, gpu_data in gpu_data_dict.items():
+        gpu = GPUDevice(rank=gpu_id2goal_rank[gpu_id], node_id=gpu_data["node_id"], pid=gpu_data["pid"])
+        gpu.init_from_dfs(
+            gpu_data["coll_info"],
+            gpu_data["coll_kernels"],
+            gpu_data["p2p_kernels"],
+            gpu_data["comm_data"],
+        )
+        initialized_gpus[gpu_id] = gpu
+        if merged_streams:
+            merged = gpu.merge_streams()
+            if merged is None:
+                all_can_merge = False
+            merged_streams_dict[gpu_id] = merged
+
+    if merged_streams and all_can_merge:
+        for gpu_id, gpu in initialized_gpus.items():
+            gpu.streams = {"stream_merged": merged_streams_dict[gpu_id]}
+
+    return initialized_gpus
+
+
 if __name__ == "__main__":
     # %%
     # get the path of the current script
@@ -556,6 +730,16 @@ if __name__ == "__main__":
                              "Larger buffers reduce I/O operations, useful for network storage.")
     parser.add_argument("--n_workers", "-w", type=int, default=os.cpu_count(), help="Maximum number of worker processes")
     parser.add_argument(
+        "--intermediate_goal",
+        action="store_true",
+        help="Write a V1-style Events_Dependency.goal file with NCCL collectives left unexploded.",
+    )
+    parser.add_argument(
+        "--intermediate_goal_only",
+        action="store_true",
+        help="Write only the V1-style Events_Dependency.goal file and skip final send/recv GOAL generation.",
+    )
+    parser.add_argument(
         "--nccl_log",
         type=str,
         default=None,
@@ -571,6 +755,7 @@ if __name__ == "__main__":
     n_workers = args.n_workers
     concatenate = args.concatenate
     delete_parts = args.delete_parts
+    intermediate_goal = args.intermediate_goal or args.intermediate_goal_only
     if delete_parts:
         concatenate = True  # must concatenate if deleting parts
     write_buffer_size = parse_buffer_size(args.write_buffer_size)
@@ -734,6 +919,8 @@ if __name__ == "__main__":
         comm_identifier = (np.array(hash_sequnces(comm_num_ids, comm_op_id, comm_seq_ids)) % 1000).astype(np.int64)
 
         comm_data_gpu["context_label"] = parallelism_vals.to_numpy() + comm_identifier * 100
+        comm_data_gpu["comm_index"] = comm_data_gpu["comm_num_id"].fillna(-1).astype(np.int64)
+        comm_data_gpu["seq"] = comm_seq_ids
 
         comm_data_gpu["collective"] = comm_data_gpu["collective"].map(comm_ops)
         comm_data_gpu["communicator"] = comm_data_gpu["commId"].map(communicators)
@@ -777,6 +964,24 @@ if __name__ == "__main__":
             gpu_data_dict[gpu_id] = prepare_gpu_data(gpu_id, gpu)
             rank = gpu_id2goal_rank[gpu.gpu_id]
             gpu_list.append((gpu_id, rank))
+
+        if intermediate_goal:
+            logger.info("writing V1-style intermediate GOAL file")
+            intermediate_gpus = initialize_gpus_from_prepared_data(
+                gpu_data_dict,
+                gpu_id2goal_rank,
+                merged_streams,
+            )
+            intermediate_goal_path = write_intermediate_goal_file(
+                intermediate_gpus,
+                gpu_id2goal_rank,
+                output_dir / "Events_Dependency.goal",
+                profiling_interval,
+            )
+            logger.info(f"Intermediate GOAL file written to: {intermediate_goal_path}")
+            if args.intermediate_goal_only:
+                logger.info(f"Total script time: {time.time() - script_start_time:.2f} seconds")
+                sys.exit(0)
         
         # Chunk GPUs into n_workers chunks (one chunk per worker)
         # This ensures coordinated stream merging across all GPUs
@@ -914,6 +1119,19 @@ if __name__ == "__main__":
                     gpu.streams = {"stream_merged": merged_streams_dict[gpu.gpu_id]}
             else:
                 logger.info("Stream merging: SKIPPED - not all GPUs could merge")
+
+        if intermediate_goal:
+            logger.info("writing V1-style intermediate GOAL file")
+            intermediate_goal_path = write_intermediate_goal_file(
+                gpu_devices,
+                gpu_id2goal_rank,
+                output_dir / "Events_Dependency.goal",
+                profiling_interval,
+            )
+            logger.info(f"Intermediate GOAL file written to: {intermediate_goal_path}")
+            if args.intermediate_goal_only:
+                logger.info(f"Total script time: {time.time() - script_start_time:.2f} seconds")
+                sys.exit(0)
 
         # Sequential write: single output file
         goal_path = output_dir / "output.goal"
