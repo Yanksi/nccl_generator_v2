@@ -1,10 +1,10 @@
 # Goal Trace Generator For NCCL
-This new goal generator provides a more modularized design. Thus user can easily add their own implementation of the colelctive algorithm and generate the corresponding traces.
+This new goal generator provides a more modularized design. Thus users can easily add their own implementation of the collective algorithm and generate the corresponding traces.
 
-Also, this new generator provides the funcationality of labeling each p2p communication with in the goal trace by letting user put some important information within the `tag` field of each `send` and `recv`.
+Also, this new generator provides the functionality of labeling each p2p communication in the goal trace by letting users put important information within the `tag` field of each `send` and `recv`.
 
-## Steps for generate a trace
-The dependencies used by this project is managed by `uv`, user may install `uv` first for easily installing all the required packages.
+## Steps for generating a trace
+The dependencies used by this project are managed by `uv`; users may install `uv` first for easily installing all the required packages.
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
@@ -22,7 +22,42 @@ For details of available flags, user may use `uv run main.py -h` to get it.
 
 Note: the `-p` flag is always recommended to be enabled, as it provides much faster generation speed and is generally more memory efficient.
 
-When user are trying to generate goal file for very large traces, user might encounter the following error:
+## NCCL 2.20 and NCCL 2.28 traces
+
+The generator supports the older full-annotation traces, such as NCCL 2.20 traces with communicator init, ring/tree, NVTX stream, and kernel annotations, and newer partial-annotation traces, such as NCCL 2.28 traces where some init or stream annotations may be missing.
+
+For full-annotation traces, kernel events are matched to NVTX events with the original stream-fingerprint logic. If stream matching proves that required annotations are missing, the generator falls back to time-based kernel/NVTX association for that GPU only. This preserves the old behavior for fully annotated traces while still allowing partial-annotation traces to be generated.
+
+If communicator init markers are missing, the generator synthesizes communicator membership from observed communication events. If an NCCL runtime log is available, pass it with `--nccl_log`; otherwise the generator automatically checks the parent directory of the trace directory for `log-*.out`.
+
+Supported sqlite filename formats include both `*nid<node>*sqlite` and NCCL 2.28-style `profile_<job>_<node>_<rank>.sqlite`.
+
+Example with an explicit NCCL log:
+```bash
+uv run main.py \
+  -i traces/Grok/sqlite \
+  -o traces/Grok/goal_merged \
+  -s npkit_benchmark_results/clariden/npkit_data_summary_Simple.json \
+  -l npkit_benchmark_results/clariden/npkit_data_summary_LL.json \
+  --nccl_log traces/Grok/log-0.out \
+  -m -r
+```
+
+## Intermediate collective GOAL
+
+Use `--intermediate_goal` to also emit `Events_Dependency.goal`, a V1-style intermediate GOAL file where NCCL operations remain unexploded as collective lines such as `AllGather`, `AllReduce`, and `ReduceScatter` instead of final `send`/`recv` traffic.
+
+Use `--intermediate_goal_only` to write only that intermediate file and skip final send/recv GOAL generation:
+```bash
+uv run main.py \
+  -i traces/Llama/sqlite \
+  -o traces/Llama/output_run_v2 \
+  -s npkit_benchmark_results/clariden/npkit_data_summary_Simple.json \
+  -l npkit_benchmark_results/clariden/npkit_data_summary_LL.json \
+  -m --intermediate_goal_only
+```
+
+When users are trying to generate a goal file for very large traces, they might encounter the following error:
 ```
 Traceback (most recent call last):
   ...

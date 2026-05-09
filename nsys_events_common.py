@@ -25,6 +25,17 @@ def find_all_traces(directory):
     return list(pathlib.Path(directory).rglob("*.sqlite"))
 
 
+def extract_node_id(trace_name: str) -> str:
+    """Extract node ID from supported NSYS sqlite filename formats."""
+    m = re.search(r"nid(\d+)", trace_name)
+    if m is not None:
+        return m.group(1)
+    m = re.search(r"profile_(\d+)_(\d+)_(\d+)\.sqlite$", trace_name)
+    if m is not None:
+        return m.group(2)
+    raise ValueError(f"Could not extract node ID from trace filename: {trace_name}")
+
+
 def convert_numeric(
     data_frame: pd.DataFrame, signed_columns: List[str], unsigned_columns: List[str]
 ) -> pd.DataFrame:
@@ -233,7 +244,7 @@ def process_nvtx_by_category(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
 def read_kernel_event_file(trace_file) -> pd.DataFrame:
     """Read NCCL kernel events from a single sqlite trace file."""
-    node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
+    node_id = extract_node_id(trace_file.name)
     conn = sqlite3.connect(trace_file)
     df_tmp = pd.read_sql_query(
         "SELECT start, end, value, deviceId, streamId, globalPid / 0x1000000 % 0x1000000 AS pid FROM CUPTI_ACTIVITY_KIND_KERNEL cakk, StringIds si WHERE cakk.demangledName = si.id and si.value LIKE 'nccl%'",
@@ -256,7 +267,7 @@ def read_kernel_event_file(trace_file) -> pd.DataFrame:
 
 def read_nvtx_event_file(trace_file) -> Dict[str, pd.DataFrame]:
     """Read NVTX events from a single sqlite trace file and categorize them."""
-    node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
+    node_id = extract_node_id(trace_file.name)
     try:
         conn = sqlite3.connect(trace_file)
         df_tmp = pd.read_sql_query(
@@ -477,23 +488,17 @@ def add_context_parallelism(
 # Kernel-to-NVTX association helpers
 # =============================================================================
 
-def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame, profiling_interval: Tuple[int, int] = None) -> Tuple[Tuple[str, int], pd.DataFrame]:
-    """
-    Process kernel events for a single GPU - matches kernels to NVTX events.
-    
-    Args:
-        gpu: The GPU key (nodeId, pid)
-        kernels: DataFrame of kernel events for this GPU
-        nvtxs: DataFrame of NVTX events for this GPU
-        profiling_interval: Tuple of (start, end) timestamps for filtering
-    Returns:
-        Tuple of (gpu, kernel_times DataFrame with eventId, start, end)
-    """
-    if profiling_interval is not None:
-        kernels = filter_time_single(profiling_interval, kernels)
-        nvtxs = filter_time_single(profiling_interval, nvtxs)
-    kernels = kernels.sort_values(by="start").reset_index(drop=True)
-    nvtxs = nvtxs.sort_values(by="start").reset_index(drop=True)
+def _empty_kernel_times() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "eventId": pd.Series(dtype="Int64"),
+            "start": pd.Series(dtype="Int64"),
+            "end": pd.Series(dtype="Int64"),
+        }
+    )
+
+
+def _split_grouped_nvtxs(nvtxs: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     non_grouped_nvtxs = nvtxs[nvtxs["groupId"] == -1]
     grouped_nvtxs = nvtxs[nvtxs["groupId"] != -1]
 
@@ -504,46 +509,83 @@ def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame, pro
         .reset_index(drop=True)
     )
 
-    nvtxs = (
+    first_nvtxs = (
         pd.concat([non_grouped_nvtxs, first_nvtxs_in_group], ignore_index=True)
         .sort_values(by="start")
         .reset_index(drop=True)
     )
+    return first_nvtxs, dropped_nvtxs
+
+
+def _add_dropped_group_times(
+    nvtxs: pd.DataFrame,
+    dropped_nvtxs: pd.DataFrame,
+    kernel_times: pd.DataFrame,
+) -> pd.DataFrame:
+    if len(dropped_nvtxs) == 0:
+        return kernel_times[["eventId", "start", "end"]]
+
+    first_event_times = nvtxs[nvtxs["groupId"] != -1][["eventId", "groupId"]].merge(
+        kernel_times[["eventId", "end"]], on="eventId", how="left"
+    )
+    group_end_times = first_event_times.groupby("groupId")["end"].first().reset_index()
+    dropped_times = dropped_nvtxs[["eventId", "groupId"]].merge(
+        group_end_times, on="groupId", how="left"
+    )
+    dropped_times["start"] = dropped_times["end"]
+    dropped_times = dropped_times[["eventId", "start", "end"]]
+
+    return pd.concat([kernel_times, dropped_times], ignore_index=True)[
+        ["eventId", "start", "end"]
+    ]
+
+
+def _process_one_gpu_kernels_by_stream(
+    gpu,
+    kernels: pd.DataFrame,
+    nvtxs: pd.DataFrame,
+) -> pd.DataFrame:
+    """Use full NVTX stream annotations to match kernel streams to NVTX streams."""
+    if len(kernels) == 0 or len(nvtxs) == 0:
+        return _empty_kernel_times()
+
+    nvtxs, dropped_nvtxs = _split_grouped_nvtxs(nvtxs)
+    kernels = kernels.copy()
+    nvtxs = nvtxs.copy()
     kernels["label"] = kernels["collective"].map(COLLECTIVE_LABELS_KERNEL)
     nvtxs["label"] = nvtxs["collective"].map(COLLECTIVE_LABELS_KERNEL)
+    if kernels["label"].isna().any() or nvtxs["label"].isna().any():
+        raise ValueError(f"Unknown collective label while matching GPU {gpu}")
 
     kernel_stream_collectives = (
         kernels.groupby(["streamId"])
-        .agg(
-            {
-                "label": lambda x: "".join(x),
-                "start": "first",
-            }
-        )
+        .agg({"label": lambda x: "".join(x), "start": "first"})
         .reset_index()
     )
-    kernel_stream_collectives["fingerPrint"] = kernel_stream_collectives[
-        "label"
-    ].map(lambda x: hex(hash(x) & 0xFFFFFFFFFFFFFFFF))
-    kernel_stream_collectives = kernel_stream_collectives.sort_values(by=["fingerPrint", "start"]).reset_index(drop=True)
-    kernel_stream_collectives["index"] = kernel_stream_collectives.groupby("fingerPrint").cumcount()
-    
+    kernel_stream_collectives["fingerPrint"] = kernel_stream_collectives["label"].map(
+        lambda x: hex(hash(x) & 0xFFFFFFFFFFFFFFFF)
+    )
+    kernel_stream_collectives = kernel_stream_collectives.sort_values(
+        by=["fingerPrint", "start"]
+    ).reset_index(drop=True)
+    kernel_stream_collectives["index"] = kernel_stream_collectives.groupby(
+        "fingerPrint"
+    ).cumcount()
 
     nvtx_stream_collectives = (
         nvtxs.groupby(["stream"])
-        .agg(
-            {
-                "label": lambda x: "".join(x),
-                "start": "first",
-            }
-        )
+        .agg({"label": lambda x: "".join(x), "start": "first"})
         .reset_index()
     )
     nvtx_stream_collectives["fingerPrint"] = nvtx_stream_collectives["label"].map(
         lambda x: hex(hash(x) & 0xFFFFFFFFFFFFFFFF)
     )
-    nvtx_stream_collectives = nvtx_stream_collectives.sort_values(by=["fingerPrint", "start"]).reset_index(drop=True)
-    nvtx_stream_collectives["index"] = nvtx_stream_collectives.groupby("fingerPrint").cumcount()
+    nvtx_stream_collectives = nvtx_stream_collectives.sort_values(
+        by=["fingerPrint", "start"]
+    ).reset_index(drop=True)
+    nvtx_stream_collectives["index"] = nvtx_stream_collectives.groupby(
+        "fingerPrint"
+    ).cumcount()
 
     stream_correspondence = kernel_stream_collectives.merge(
         nvtx_stream_collectives,
@@ -554,21 +596,26 @@ def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame, pro
     if len(stream_correspondence) != max(
         len(kernel_stream_collectives), len(nvtx_stream_collectives)
     ):
-        logger.debug(f"nvtx_stream_collectives:\n{nvtx_stream_collectives}\nkernel_stream_collectives:\n{kernel_stream_collectives}")
-        logger.warning(f"Mismatch in number of unique stream fingerprints {gpu}")
-    
+        logger.debug(
+            "nvtx_stream_collectives:\n%s\nkernel_stream_collectives:\n%s",
+            nvtx_stream_collectives,
+            kernel_stream_collectives,
+        )
+        raise ValueError(f"Mismatch in number of unique stream fingerprints {gpu}")
+
     unmatched_kernel_streams = stream_correspondence[
         stream_correspondence["stream"].isna()
     ]
     if len(unmatched_kernel_streams) != 0:
-        logger.warning(
-            f"GPU {gpu}: unmatched kernel streams: {unmatched_kernel_streams['streamId'].tolist()}"
-        )
         for row in unmatched_kernel_streams.itertuples():
             logger.warning(
-                f"  kernel streamId: {row.streamId}, label: {row.label_kernel}, fingerprint: {row.fingerPrint}"
+                "GPU %s: unmatched kernel streamId=%s label=%s fingerprint=%s",
+                gpu,
+                row.streamId,
+                row.label_kernel,
+                row.fingerPrint,
             )
-        stream_correspondence = stream_correspondence[~stream_correspondence["stream"].isna()]
+        raise ValueError(f"Unmatched kernel streams found for GPU {gpu}")
 
     nvtxs["inStreamEventId"] = nvtxs.groupby("stream").cumcount()
     kernels["inStreamEventId"] = kernels.groupby("streamId").cumcount()
@@ -586,26 +633,96 @@ def process_one_gpu_kernels(gpu, kernels: pd.DataFrame, nvtxs: pd.DataFrame, pro
         .drop(columns=["inStreamEventId", "stream", "label"])
         .rename(columns={"eventId": "association"})
     )
+    if kernels["association"].isna().any():
+        missing = int(kernels["association"].isna().sum())
+        raise ValueError(f"GPU {gpu}: {missing} kernels could not be stream-matched")
 
-    # Build kernel times mapping: eventId -> (start, end)
     kernel_times = kernels[["start", "end", "association"]].rename(
         columns={"association": "eventId"}
-    ).dropna(subset=["eventId"])
+    )
     kernel_times["eventId"] = kernel_times["eventId"].astype("Int64")
-    
-    # For dropped events in groups, they get the end time of the first event
-    if len(dropped_nvtxs) > 0:
-        first_event_times = nvtxs[nvtxs["groupId"] != -1][["eventId", "groupId"]].merge(
-            kernel_times[["eventId", "end"]], on="eventId", how="left"
+    return _add_dropped_group_times(nvtxs, dropped_nvtxs, kernel_times)
+
+
+def _process_one_gpu_kernels_by_time(
+    gpu,
+    kernels: pd.DataFrame,
+    nvtxs: pd.DataFrame,
+) -> pd.DataFrame:
+    """Fallback for partial annotations: associate kernels to NVTX intervals by time."""
+    if len(kernels) == 0 or len(nvtxs) == 0:
+        return _empty_kernel_times()
+
+    nvtxs, dropped_nvtxs = _split_grouped_nvtxs(nvtxs)
+    nvtx_starts = nvtxs["start"].to_numpy(dtype=np.int64)
+    nvtx_ends = nvtxs["end"].to_numpy(dtype=np.int64)
+    nvtx_event_ids = nvtxs["eventId"].to_numpy(dtype=np.int64)
+    kernel_starts = kernels["start"].to_numpy(dtype=np.int64)
+
+    kernels = kernels.copy()
+    kernels["association"] = _associate_events(
+        nvtx_starts,
+        nvtx_ends,
+        nvtx_event_ids,
+        kernel_starts,
+    )
+
+    unassociated_mask = kernels["association"] == -1
+    if unassociated_mask.any():
+        logger.warning(
+            "GPU %s: %d kernels needed partial-annotation time fallback",
+            gpu,
+            int(unassociated_mask.sum()),
         )
-        group_end_times = first_event_times.groupby("groupId")["end"].first().reset_index()
-        
-        dropped_times = dropped_nvtxs[["eventId", "groupId"]].merge(
-            group_end_times, on="groupId", how="left"
+        unassociated_times = kernels.loc[unassociated_mask, "start"].to_numpy(
+            dtype=np.int64
         )
-        dropped_times["start"] = dropped_times["end"]
-        dropped_times = dropped_times[["eventId", "start", "end"]]
-        
-        kernel_times = pd.concat([kernel_times, dropped_times], ignore_index=True)
-    
+        associations = np.searchsorted(
+            nvtx_starts, unassociated_times, side="right"
+        ) - 1
+        associations = np.clip(associations, 0, len(nvtx_event_ids) - 1)
+        kernels.loc[unassociated_mask, "association"] = nvtx_event_ids[associations]
+
+    kernel_times = (
+        kernels.groupby("association")
+        .agg(start=("start", "min"), end=("end", "max"))
+        .reset_index()
+        .rename(columns={"association": "eventId"})
+    )
+    kernel_times["eventId"] = kernel_times["eventId"].astype("Int64")
+    return _add_dropped_group_times(nvtxs, dropped_nvtxs, kernel_times)
+
+
+def process_one_gpu_kernels(
+    gpu,
+    kernels: pd.DataFrame,
+    nvtxs: pd.DataFrame,
+    profiling_interval: Tuple[int, int] = None,
+) -> Tuple[Tuple[str, int], pd.DataFrame]:
+    """
+    Process kernel events for a single GPU and return eventId/start/end times.
+
+    Full stream-fingerprint matching is used when all annotations are present.
+    The time-based partial-annotation fallback is used only when stream matching
+    proves that required stream annotations are missing.
+    """
+    if profiling_interval is not None:
+        kernels = filter_time_single(profiling_interval, kernels)
+        nvtxs = filter_time_single(profiling_interval, nvtxs)
+    kernels = kernels.sort_values(by="start").reset_index(drop=True)
+    nvtxs = nvtxs.sort_values(by="start").reset_index(drop=True)
+
+    try:
+        kernel_times = _process_one_gpu_kernels_by_stream(
+            gpu, kernels.copy(), nvtxs.copy()
+        )
+    except ValueError as exc:
+        logger.warning(
+            "Full NVTX/kernel stream association failed for GPU %s; "
+            "using partial-annotation fallback: %s",
+            gpu,
+            exc,
+        )
+        kernel_times = _process_one_gpu_kernels_by_time(gpu, kernels, nvtxs)
+
     return gpu, kernel_times[["eventId", "start", "end"]]
