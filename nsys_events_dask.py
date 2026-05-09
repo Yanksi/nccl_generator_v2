@@ -37,6 +37,7 @@ from nsys_events_common import (
     process_nvtx_by_category,
     read_kernel_event_file,
     read_nvtx_event_file,
+    extract_node_id,
     # Numba functions
     _associate_events,
     _associate_start_ends,
@@ -144,14 +145,17 @@ def get_event_info(data: Dict[str, pd.DataFrame], comm_info: pd.DataFrame = None
         [kernel_group_start_info, kernel_group_end_info]
     )
     
-    # Add comm_info mapping if provided
-    if comm_info is not None and len(comm_data) > 0:
-        comm_id_map = comm_info[["nodeId", "commHash", "commId"]].drop_duplicates()
+    # Add comm_info mapping if full communicator init markers are present.
+    if comm_info is not None and len(comm_info) > 0 and len(comm_data) > 0:
+        comm_id_map = comm_info[["nodeId", "pid", "commHash", "commId"]].drop_duplicates()
         comm_data = comm_data.merge(
             comm_id_map, 
-            on=["nodeId", "commHash"], 
+            on=["nodeId", "pid", "commHash"],
             how="left"
         )
+    if "commId" not in comm_data.columns:
+        comm_data["commId"] = pd.NA
+    comm_data["commId"] = comm_data["commId"].fillna(comm_data["commHash"])
 
     kernel_group_start_end = (
         kernel_group_start_end
@@ -297,7 +301,7 @@ def _process_trace_file(trace_file: os.PathLike) -> Dict[Tuple[str, int], pd.Dat
         return {}
     
     # Extract node ID from trace filename
-    node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
+    node_id = extract_node_id(trace_file.name)
     
     results = {}
     
@@ -355,7 +359,7 @@ def associate_kernel_to_nvtx(
     node_ids = {gpu_key[0] for gpu_key in comm_grouped.keys()}
     filtered_traces = []
     for trace_file in traces:
-        node_id = re.search(r"nid(\d+)", trace_file.name).group(1)
+        node_id = extract_node_id(trace_file.name)
         if node_id in node_ids:
             filtered_traces.append(trace_file)
     
